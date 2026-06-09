@@ -1,0 +1,6 @@
+# Fun-ASR-Nano CPU runtime
+# 用法:
+#   python -m pip install -r requirements-funasr-cpu.txt
+--index-url https://download.pytorch.org/whl/cpu
+torch
+torchaudio

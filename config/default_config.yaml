@@ -1,0 +1,71 @@
+asr:
+  backend: auto
+  beam_size: 5
+  compute_type: auto
+  device: auto
+  funasr_hub: ms
+  funasr_model: FunAudioLLM/Fun-ASR-Nano-2512
+  gaming_vocabulary: 线索 灰 红点 找线索 拿线索 放逐 驱逐 开始放逐 被放了 屠夫 蜘蛛 刺客 残喙 乌鸦 火男 沸血 钢铁 虫群 地狱犬
+    Boss 打Boss 蹲Boss 有人打Boss 抢Boss 猎人 蹲 冲 别冲 开枪 枪声 消音 脚步 有人 没人 那边 这边 在哪 看到了 标记 撤离
+    撤离点 马车 船 走 快走 回来 别走 等等 别动 蹲下 趴下 过来 跟我走 大包 小包 医疗包 打药 打针 弹药 子弹 特殊弹 换弹 没子弹了 燃烧弹 炸药
+    炸药束 破片 铁丝网 毒气 毒气弹 闪光 闪光弹 蜂巢 诱饵 一枪 爆头 打中了 残血 一丝 死了 倒了 被烧了 烧尸 红桶 黄桶 绿桶 乌鸦 狗 鸡 马
+    火把 陷阱 绊雷 长枪 短枪 喷子 猎象 莫辛 勒贝尔 克拉格 双枪 弓 弩 飞刀 飞斧 灰队 复活 救人 扶我 拉人 烧人 点烧 守尸 蹲尸 禁用手枪 禁用步枪
+    禁用霰弹 禁用爆炸物 禁用治疗 换点 绕后 绕路 走上面 走下面 走房子 中路 上路 下路 打野 辅助 射手 法师 坦克 战士 刺客 团战 开团 撤退 进攻
+    防守 补刀 推塔 打龙 大龙 小龙 远古龙 先锋 回城 装备 技能 大招 闪现 点燃 治疗 惩戒 传送 疾跑 屏障 净化 击杀 双杀 三杀 四杀 五杀 超神
+    团灭 复活 终结 一血 视野 草丛 河道 野区 高地 水晶 门牙 防御塔 兵线 集合 分散 埋伏 绕后 蹲人 抓人 反蹲 越塔 偷家 支援 我去 快走 小心
+    可以打 打不了 别上 等我 撤退 先撤 稳住 经济 等级 经验 金币 补刀 发育 压制 优势 劣势 翻盘 红buff 蓝buff 蓝爸爸 红爸爸 打buff
+    让buff 控龙 抢龙 Gank Push Mid Top Bot Jungle Baron Dragon Boss Clue Banish Extract
+    Extraction Respawn Revive Hunter Shotgun Mosin Lebel Uppercut Retreat Attack Defend
+    Go Back Help Heal Ult GG Nice Good Sorry Thanks Well played Wait Careful
+  local_model_priority:
+  - funasr
+  - whisper
+  model_size: small
+  noise_gate_threshold: 0.005
+  sample_rate: 16000
+  source_language: zh
+  target_language: en
+  vad_filter: true
+audio:
+  channels: 1
+  chunk_size: 1024
+  game_output_device: translator_virtual_sink.monitor
+  input_device: null
+  output_device: null
+  sample_rate: 16000
+translation:
+  backend: auto
+  baidu_app_id: ''
+  baidu_secret_key: ''
+  deepl_api_key: ''
+  free_backend_priority:
+  - baidu
+  - microsoft
+  - google
+  ollama_base_url: http://localhost:11434/v1
+  ollama_model: qwen2.5:7b
+  openai_api_key: ''
+  openai_base_url: ''
+  openai_model: gpt-4o-mini
+  proxy: ''
+  source_lang: zh
+  target_lang: en
+  timeout: 1
+  use_cloud_model: true
+  volc_access_token: ''
+  volc_app_id: 28b3c04b-01c4-43e3-874b-251cf788b4b1
+  volc_resource_id: volc.service_type.10053
+tts:
+  backend: edge-tts
+  rate: +0%
+  target_voice: en-US-JennyNeural
+  voice: zh-CN-XiaoxiaoNeural
+  volume: +0%
+ui:
+  always_on_top: true
+  font_size: 12
+  language: zh
+  max_subtitle_lines: 20
+  play_chinese_voice: false
+  show_subtitle_overlay: true
+  subtitle_opacity: 0.85
