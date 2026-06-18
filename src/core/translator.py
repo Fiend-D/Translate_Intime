@@ -100,7 +100,7 @@ class TranslationEngine:
             logger.info(f"翻译策略: {self._active_backend}"
                         + (f" (降级: {', '.join(self._fallback_backends)})"
                            if self._fallback_backends else ""))
-        elif backend in ("volc", "openai", "deepl", "baidu", "microsoft", "google", "local", "ollama"):
+        elif backend in ("volc", "openai", "deepl", "baidu", "microsoft", "google", "local", "ollama", "hunyuan"):
             # 用户指定后端
             b = "local" if backend == "ollama" else backend
             all_backends = [b] + [f for f in free if f != b]
@@ -221,6 +221,8 @@ class TranslationEngine:
             return await self._translate_google(text, src, tgt)
         elif backend == "local":
             return await self._translate_local(text, src, tgt)
+        elif backend == "hunyuan":
+            raise RuntimeError("腾讯混元后端由 pipeline 直接管理，不支持通过 TranslationEngine 调用")
         else:
             raise ValueError(f"不支持的后端: {backend}")
 

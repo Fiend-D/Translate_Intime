@@ -37,6 +37,9 @@ class ASREngine:
             if backend == "whisper" and self._load_whisper_model(model_dir):
                 self._backend = "whisper"
                 return True
+            if backend == "qwen3" and self._load_qwen3_model():
+                self._backend = "qwen3"
+                return True
 
         self._model = None
         logger.error("所有本地 ASR 模型均加载失败")
@@ -55,15 +58,15 @@ class ASREngine:
         requested = (self.config.backend or "auto").lower()
         priority = [
             item.lower()
-            for item in (self.config.local_model_priority or ["funasr", "whisper"])
-            if item.lower() in ("funasr", "whisper")
+            for item in (self.config.local_model_priority or ["qwen3", "funasr", "whisper"])
+            if item.lower() in ("funasr", "whisper", "qwen3")
         ]
         if not priority:
-            priority = ["funasr", "whisper"]
+            priority = ["qwen3", "funasr", "whisper"]
 
         if requested == "auto":
             return list(dict.fromkeys(priority))
-        if requested in ("funasr", "whisper"):
+        if requested in ("funasr", "whisper", "qwen3"):
             return list(dict.fromkeys([requested, *priority]))
         logger.warning(f"未知 ASR 后端 '{requested}'，按本地优先级尝试")
         return list(dict.fromkeys(priority))
@@ -170,7 +173,7 @@ class ASREngine:
     def _load_whisper_model(self, model_dir: Optional[str] = None) -> bool:
         """
         加载 Whisper 模型，返回是否成功。
-        优先级: 指定目录 > 项目 models/ > 网络下载
+        仅检测本地模型，不自动下载。
         """
         from faster_whisper import WhisperModel
 
@@ -221,30 +224,82 @@ class ASREngine:
                     logger.warning(f"  本地加载失败 ({ct}): {e}")
                     break  # 不是 compute_type 问题，跳过这个目录
 
-        # 网络下载
-        mirrors = ["https://hf-mirror.com", "https://huggingface.co"]
-        custom = os.environ.get("HF_ENDPOINT", "")
-        if custom:
-            mirrors.insert(0, custom)
+        logger.error(
+            "Whisper 本地模型未找到，请手动下载模型:\n"
+            "  1. 安装 modelscope: pip install modelscope\n"
+            "  2. 下载模型: python -c \"from modelscope import snapshot_download; "
+            "snapshot_download('systran/faster-whisper-small', cache_dir='./models')\"\n"
+            "  3. 重新启动应用"
+        )
+        self._model = None
+        return False
 
-        for mirror in mirrors:
-            try:
-                os.environ["HF_ENDPOINT"] = mirror
-                logger.info(f"  下载: {mirror}")
-                self._model = WhisperModel(
-                    self.config.model_size, device=device, compute_type=compute_type,
-                )
-                logger.info("Whisper 模型加载成功 ✓")
-                return True
-            except Exception:
+    def _load_qwen3_model(self) -> bool:
+        """
+        加载 Qwen3-ASR-0.6B 模型，返回是否成功。
+        使用官方 qwen-asr 包加载本地模型。
+        """
+        try:
+            import torch
+            from qwen_asr import Qwen3ASRModel
+        except ModuleNotFoundError:
+            logger.error(
+                "qwen-asr 未安装，无法加载 Qwen3-ASR。请运行: "
+                "pip install qwen-asr"
+            )
+            self._model = None
+            return False
+        except Exception as e:
+            logger.error(f"qwen-asr 导入失败: {e}")
+            self._model = None
+            return False
+
+        device = self.config.device
+        if device == "auto":
+            device = "cuda:0" if self._cuda_available() else "cpu"
+        elif device == "cuda":
+            device = "cuda:0"
+
+        # 候选本地目录
+        local_dirs = []
+        proj_models = Path(__file__).parent.parent.parent / "models"
+        for org in proj_models.iterdir():
+            if org.is_dir() and org.name.lower() in ("qwen",):
+                for candidate in org.glob("*Qwen3-ASR*"):
+                    if candidate.is_dir():
+                        local_dirs.append(str(candidate))
+        # ModelScope / HuggingFace 缓存
+        for cache_root in (Path.home() / ".cache" / "modelscope" / "hub",
+                           Path.home() / ".cache" / "huggingface" / "hub"):
+            if not cache_root.exists():
                 continue
+            for org in cache_root.iterdir():
+                if org.is_dir() and org.name.lower() in ("qwen", "models--qwen"):
+                    for candidate in org.rglob("*Qwen3-ASR*"):
+                        if candidate.is_dir() and (candidate / "config.json").exists():
+                            local_dirs.append(str(candidate))
+
+        dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+        for local_dir in local_dirs:
+            try:
+                logger.info(f"加载 Qwen3-ASR 模型: {local_dir}, device={device}")
+                self._model = Qwen3ASRModel.from_pretrained(
+                    local_dir,
+                    dtype=dtype,
+                    device_map=device,
+                )
+                logger.info("Qwen3-ASR 模型加载成功 ✓")
+                return True
+            except Exception as e:
+                logger.warning(f"Qwen3-ASR 加载失败: {e}")
+                self._model = None
 
         logger.error(
-            "模型下载失败。国内用户可用 ModelScope:\n"
-            "  pip install modelscope\n"
-            "  python -c \"from modelscope import snapshot_download; "
-            "snapshot_download('systran/faster-whisper-small', cache_dir='./models')\"\n"
-            "然后重新启动 python run.py"
+            "Qwen3-ASR 本地模型未找到，请手动下载模型:\n"
+            "  1. 安装 modelscope: pip install modelscope\n"
+            "  2. 下载模型: python -c \"from modelscope import snapshot_download; "
+            "snapshot_download('Qwen/Qwen3-ASR-0.6B', cache_dir='./models')\"\n"
+            "  3. 重新启动应用"
         )
         self._model = None
         return False
@@ -310,6 +365,8 @@ class ASREngine:
         """核心识别：根据 ASR 后端分发。"""
         if self._backend == "funasr":
             return self._transcribe_funasr(audio)
+        if self._backend == "qwen3":
+            return self._transcribe_qwen3(audio)
         return self._transcribe_whisper(audio)
 
     def _transcribe_whisper(self, audio: np.ndarray) -> str:
@@ -360,6 +417,58 @@ class ASREngine:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+    @staticmethod
+    def _qwen3_language(language: str) -> Optional[str]:
+        """将语言代码映射为 Qwen3-ASR 支持的语言名称。"""
+        lang_map = {
+            "zh": "Chinese",
+            "en": "English",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "ar": "Arabic",
+            "de": "German",
+            "fr": "French",
+            "es": "Spanish",
+            "pt": "Portuguese",
+            "id": "Indonesian",
+            "it": "Italian",
+            "ru": "Russian",
+            "th": "Thai",
+            "vi": "Vietnamese",
+            "tr": "Turkish",
+            "hi": "Hindi",
+            "ms": "Malay",
+            "nl": "Dutch",
+            "sv": "Swedish",
+            "da": "Danish",
+            "fi": "Finnish",
+            "pl": "Polish",
+            "cs": "Czech",
+            "fil": "Filipino",
+            "fa": "Persian",
+            "el": "Greek",
+            "ro": "Romanian",
+            "hu": "Hungarian",
+            "mk": "Macedonian",
+            "yue": "Cantonese",
+        }
+        return lang_map.get((language or "").lower().strip())
+
+    def _transcribe_qwen3(self, audio: np.ndarray) -> str:
+        """Qwen3-ASR 识别。直接传入 numpy 数组，避免磁盘 I/O。"""
+        try:
+            lang = None if self.language == "auto" else self._qwen3_language(self.language)
+            results = self._model.transcribe(
+                audio=(audio.astype(np.float32), self.config.sample_rate),
+                language=lang,
+            )
+            if results and hasattr(results[0], "text"):
+                return str(results[0].text).strip()
+            return ""
+        except Exception as e:
+            logger.error(f"Qwen3-ASR 识别失败: {e}")
+            return ""
 
     def transcribe(self) -> str:
         """执行语音识别，清空缓冲区并返回文本"""

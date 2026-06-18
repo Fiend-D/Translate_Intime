@@ -53,12 +53,14 @@ class VolcASREngine:
         access_token: str = "",
         resource_id: str = "",
         mode: str = "s2s",
+        enable_tts: bool = True,
     ):
         self.app_id = app_id or os.getenv("VOLC_APP_ID", "")
         self.access_token = access_token or os.getenv("VOLC_ACCESS_TOKEN", "")
         self.api_key = os.getenv("VOLC_APP_KEY", "") or os.getenv("VOLC_API_KEY", "")
         self.resource_id = resource_id or os.getenv("VOLC_RESOURCE_ID", "volc.service_type.10053")
         self.mode = mode
+        self.enable_tts = enable_tts  # 是否启用音频输出（节省token）
         self.session_id = str(uuid.uuid4())
         self.connection_id = str(uuid.uuid4())
         self.source_lang = "zh"
@@ -69,6 +71,9 @@ class VolcASREngine:
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
+        
+        # Token用量统计回调
+        self.on_usage_update: Optional[Callable[[dict], None]] = None
         
         # 回调
         self.on_source_text: Optional[Callable[[str], None]] = None   # 识别原文
@@ -131,7 +136,8 @@ class VolcASREngine:
         request.source_audio.bits = 16
         request.source_audio.channel = 1
 
-        if self.mode == "s2s":
+        # 仅在需要音频输出时设置 target_audio（节省token）
+        if self.mode == "s2s" and self.enable_tts:
             request.target_audio.format = "pcm"
             request.target_audio.rate = 16000
 
@@ -332,7 +338,51 @@ class VolcASREngine:
                 self.on_error(err)
         elif response.event == Type.SessionFinished:
             logger.info("火山引擎会话已结束")
+        
+        # 提取并上报用量信息
+        self._extract_usage(response)
+        
         return response.event
+    
+    def _extract_usage(self, response: TranslateResponse) -> None:
+        """从响应中提取token用量信息"""
+        try:
+            usage = {}
+            
+            # 尝试从响应元数据中提取用量
+            if hasattr(response, 'response_meta') and response.response_meta:
+                meta = response.response_meta
+                if hasattr(meta, 'usage') and meta.usage:
+                    usage_data = meta.usage
+                    if hasattr(usage_data, 'input_tokens'):
+                        usage['input_tokens'] = usage_data.input_tokens
+                    if hasattr(usage_data, 'output_tokens'):
+                        usage['output_tokens'] = usage_data.output_tokens
+                    if hasattr(usage_data, 'total_tokens'):
+                        usage['total_tokens'] = usage_data.total_tokens
+            
+            # 如果没有从元数据获取到，尝试估算
+            if not usage and response.event in (Type.SourceSubtitleEnd, Type.TranslationSubtitleEnd, Type.TTSResponse):
+                text = response.text if hasattr(response, 'text') else ''
+                audio_data = response.data if hasattr(response, 'data') else b''
+                
+                if text:
+                    # 文本token估算：中文约1字1token，英文约1词1token
+                    input_tokens = len(text)  # 粗略估算
+                    usage['input_tokens'] = input_tokens
+                    usage['output_tokens'] = input_tokens  # 翻译输出约等于输入
+                    
+                if audio_data:
+                    # 音频token估算：按音频时长估算，16kHz PCM16 约 32000 bytes/秒
+                    audio_duration_sec = len(audio_data) / 32000
+                    audio_tokens = int(audio_duration_sec * 16000)  # 约16000 tokens/秒音频
+                    usage['output_audio_tokens'] = audio_tokens
+            
+            if usage and self.on_usage_update:
+                self.on_usage_update(usage)
+                
+        except Exception as e:
+            logger.debug(f"提取用量信息失败: {e}")
 
     async def stop(self) -> None:
         """停止连接"""

@@ -1,5 +1,5 @@
 """
-应用入口 - Translator InTime
+应用入口 - 友译
 """
 import os
 import sys
@@ -38,7 +38,7 @@ def main() -> None:
     # 初始化日志
     setup_logger(level="INFO")
     logger.info("=" * 60)
-    logger.info("Translator InTime v0.1.0 启动")
+    logger.info("友译 v0.1.0 启动")
     logger.info("实时游戏语音双向翻译系统")
     logger.info("=" * 60)
 
@@ -48,7 +48,7 @@ def main() -> None:
 
     # 创建 Qt 应用
     app = QApplication(sys.argv)
-    app.setApplicationName("Translator InTime")
+    app.setApplicationName("友译")
     app.setApplicationVersion("0.1.0")
     app.setQuitOnLastWindowClosed(False)  # 关闭窗口不退出，最小化到托盘
 

@@ -9,11 +9,13 @@ import yaml
 
 class ASRConfig(BaseModel):
     """语音识别配置"""
-    backend: str = "auto"  # auto / funasr / whisper
-    local_model_priority: list[str] = Field(default_factory=lambda: ["funasr", "whisper"])
+    backend: str = "auto"  # auto / funasr / whisper / qwen3
+    local_model_priority: list[str] = Field(default_factory=lambda: ["funasr", "whisper", "qwen3"])
     model_size: str = "small"  # tiny/base/small/medium/large-v3
     funasr_model: str = "FunAudioLLM/Fun-ASR-Nano-2512"
     funasr_hub: str = "ms"  # ms / hf
+    qwen3_model: str = "Qwen/Qwen3-ASR-0.6B"
+    qwen3_hub: str = "ms"  # ms / hf
     device: str = "auto"  # auto / cpu / cuda
     compute_type: str = "auto"  # auto / float16 / int8
     source_language: str = "zh"  # 你说的语言（中文ASR用）
@@ -57,7 +59,7 @@ class ASRConfig(BaseModel):
 
 class TranslationConfig(BaseModel):
     """翻译配置"""
-    backend: str = "auto"  # auto(智能) / openai / deepl / baidu / microsoft / google / local
+    backend: str = "auto"  # auto(智能) / openai / deepl / baidu / microsoft / google / local / hunyuan
     use_cloud_model: bool = True  # 是否优先使用云端端到端模型（当前为火山 AST）
     source_lang: str = "zh"
     target_lang: str = "en"
@@ -82,6 +84,9 @@ class TranslationConfig(BaseModel):
     volc_app_id: str = ""
     volc_access_token: str = ""  # 兼容旧配置；新版控制台通常留空
     volc_resource_id: str = "volc.service_type.10053"
+    # 腾讯混元翻译模型（本地部署）
+    hunyuan_model: str = "HY-MT1.5-1.8B"  # 腾讯混元翻译模型
+    hunyuan_model_path: str = ""  # 本地模型路径，为空则自动搜索
 
 
 class TTSConfig(BaseModel):
@@ -103,6 +108,40 @@ class AudioConfig(BaseModel):
     sample_rate: int = 16000
 
 
+class VolcUsageConfig(BaseModel):
+    """火山引擎用量统计配置"""
+    total_input_tokens: int = 0      # 累计输入token数
+    total_output_text_tokens: int = 0  # 累计输出文本token数
+    total_output_audio_tokens: int = 0  # 累计输出音频token数
+    total_cost: float = 0.0          # 累计费用(元)
+    monthly_quota: int = 500000      # 月度配额(token数)
+    
+    @property
+    def total_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_text_tokens + self.total_output_audio_tokens
+    
+    @property
+    def usage_percent(self) -> float:
+        if self.monthly_quota <= 0:
+            return 0.0
+        return min(100.0, (self.total_tokens / self.monthly_quota) * 100)
+    
+    @property
+    def estimated_cost(self) -> float:
+        """估算费用：输入80元/百万token + 输出文本80元/百万token + 输出音频300元/百万token"""
+        input_cost = (self.total_input_tokens / 1_000_000) * 80
+        output_text_cost = (self.total_output_text_tokens / 1_000_000) * 80
+        output_audio_cost = (self.total_output_audio_tokens / 1_000_000) * 300
+        return input_cost + output_text_cost + output_audio_cost
+
+
+class AliyunConfig(BaseModel):
+    """阿里云百炼配置"""
+    api_key: str = ""  # DashScope API Key
+    voice: str = "Tina"  # 默认音色
+    enable_audio_output: bool = True  # 是否输出音频
+
+
 class UIConfig(BaseModel):
     """界面配置"""
     language: str = "zh"  # 界面语言
@@ -112,6 +151,12 @@ class UIConfig(BaseModel):
     subtitle_opacity: float = 0.85
     max_subtitle_lines: int = 20
     play_chinese_voice: bool = False  # 是否播报翻译后的中文语音
+    
+    # 悬浮窗显示选项
+    show_game_subtitle: bool = True  # 显示游戏语音翻译悬浮窗
+    show_mic_subtitle: bool = True   # 显示麦克风输入悬浮窗
+    # 语音输出选项
+    play_outbound_voice: bool = False  # 是否播报麦克风输入的翻译语音
 
 
 class AppConfig(BaseModel):
@@ -121,6 +166,8 @@ class AppConfig(BaseModel):
     tts: TTSConfig = Field(default_factory=TTSConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    volc_usage: VolcUsageConfig = Field(default_factory=VolcUsageConfig)
+    aliyun: AliyunConfig = Field(default_factory=AliyunConfig)
 
 
 class ConfigManager:

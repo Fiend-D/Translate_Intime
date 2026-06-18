@@ -58,13 +58,14 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(12, 16, 12, 12)
 
         self._asr_backend = QComboBox()
-        self._asr_backend.addItems(["auto", "funasr", "whisper"])
+        self._asr_backend.addItems(["auto", "funasr", "whisper", "qwen3"])
         self._asr_backend.setCurrentText(self.config.asr.backend)
         layout.addRow("ASR后端:", self._asr_backend)
 
         self._asr_local_priority = QComboBox()
-        self._asr_local_priority.addItem("Fun-ASR-Nano 优先，Whisper 兜底", "funasr")
-        self._asr_local_priority.addItem("Whisper 优先，Fun-ASR-Nano 兜底", "whisper")
+        self._asr_local_priority.addItem("Fun-ASR-Nano 优先", "funasr")
+        self._asr_local_priority.addItem("Whisper 优先", "whisper")
+        self._asr_local_priority.addItem("Qwen3-ASR 优先", "qwen3")
         first_local = (self.config.asr.local_model_priority or ["funasr"])[0]
         self._select_combo_by_data(self._asr_local_priority, first_local)
         layout.addRow("本地模型优先:", self._asr_local_priority)
@@ -72,11 +73,14 @@ class SettingsDialog(QDialog):
         self._asr_model = QComboBox()
         self._asr_model.addItems([
             "FunAudioLLM/Fun-ASR-Nano-2512",
+            "Qwen/Qwen3-ASR-0.6B",
             "tiny", "base", "small", "medium", "large-v3"
         ])
         self._asr_model.setCurrentText(self.config.asr.model_size)
         if self.config.asr.backend == "funasr":
             self._asr_model.setCurrentText(self.config.asr.funasr_model)
+        if self.config.asr.backend == "qwen3":
+            self._asr_model.setCurrentText(self.config.asr.qwen3_model)
         layout.addRow("ASR模型:", self._asr_model)
 
         self._asr_device = QComboBox()
@@ -132,14 +136,19 @@ class SettingsDialog(QDialog):
 
         self._trans_backend = QComboBox()
         self._trans_backend.addItems([
-            "auto", "volc", "openai", "deepl", "baidu", "microsoft", "google", "local"
+            "auto", "volc", "aliyun", "hunyuan", "openai", "deepl", "baidu", "microsoft", "google", "local"
         ])
         self._trans_backend.currentTextChanged.connect(self._on_backend_changed)
         form.addRow("翻译后端:", self._trans_backend)
 
-        self._trans_use_cloud = QCheckBox("使用云端模型（火山 AST，关闭后使用本地ASR+文本翻译）")
+        self._trans_use_cloud = QCheckBox("使用云端模型（火山 AST，关闭后使用本地 ASR+ 文本翻译）")
         self._trans_use_cloud.setChecked(self.config.translation.use_cloud_model)
         form.addRow(self._trans_use_cloud)
+
+        self._trans_hunyuan_path = QLineEdit()
+        self._trans_hunyuan_path.setPlaceholderText("留空则自动搜索 ./models 目录")
+        self._trans_hunyuan_path.setText(self.config.translation.hunyuan_model_path)
+        form.addRow("腾讯混元模型路径:", self._trans_hunyuan_path)
 
         self._trans_src = QComboBox()
         self._trans_src.addItems(["zh", "en", "ja", "ko", "fr", "de", "es", "ru"])
@@ -331,33 +340,69 @@ class SettingsDialog(QDialog):
     def _create_ui_tab(self) -> QWidget:
         """界面设置页"""
         w = QWidget()
-        layout = QFormLayout(w)
-        layout.setSpacing(10)
+        layout = QVBoxLayout(w)
+        layout.setSpacing(14)
         layout.setContentsMargins(12, 16, 12, 12)
+
+        # 基础设置
+        basic_group = QGroupBox("基础设置")
+        basic_layout = QFormLayout(basic_group)
+        basic_layout.setSpacing(8)
+        basic_layout.setContentsMargins(14, 14, 14, 14)
 
         self._ui_font_size = QSpinBox()
         self._ui_font_size.setRange(8, 24)
         self._ui_font_size.setValue(self.config.ui.font_size)
-        layout.addRow("字体大小:", self._ui_font_size)
+        basic_layout.addRow("字体大小:", self._ui_font_size)
 
         self._ui_always_top = QCheckBox("窗口置顶")
         self._ui_always_top.setChecked(self.config.ui.always_on_top)
-        layout.addRow(self._ui_always_top)
-
-        self._ui_subtitle_lines = QSpinBox()
-        self._ui_subtitle_lines.setRange(5, 100)
-        self._ui_subtitle_lines.setValue(self.config.ui.max_subtitle_lines)
-        layout.addRow("最大字幕行数:", self._ui_subtitle_lines)
-
-        self._ui_play_chinese = QCheckBox("播放中文语音播报（游戏声音翻译后）")
-        self._ui_play_chinese.setChecked(self.config.ui.play_chinese_voice)
-        layout.addRow(self._ui_play_chinese)
+        basic_layout.addRow(self._ui_always_top)
 
         self._ui_subtitle_opacity = QDoubleSpinBox()
         self._ui_subtitle_opacity.setRange(0.1, 1.0)
         self._ui_subtitle_opacity.setSingleStep(0.05)
         self._ui_subtitle_opacity.setValue(self.config.ui.subtitle_opacity)
-        layout.addRow("字幕透明度:", self._ui_subtitle_opacity)
+        basic_layout.addRow("字幕透明度:", self._ui_subtitle_opacity)
+
+        layout.addWidget(basic_group)
+
+        # 悬浮字幕设置
+        overlay_group = QGroupBox("悬浮字幕")
+        overlay_layout = QFormLayout(overlay_group)
+        overlay_layout.setSpacing(8)
+        overlay_layout.setContentsMargins(14, 14, 14, 14)
+
+        self._ui_show_game_subtitle = QCheckBox("显示游戏语音翻译悬浮窗")
+        self._ui_show_game_subtitle.setChecked(self.config.ui.show_game_subtitle)
+        overlay_layout.addRow(self._ui_show_game_subtitle)
+
+        self._ui_show_mic_subtitle = QCheckBox("显示麦克风输入悬浮窗")
+        self._ui_show_mic_subtitle.setChecked(self.config.ui.show_mic_subtitle)
+        overlay_layout.addRow(self._ui_show_mic_subtitle)
+
+        self._ui_subtitle_lines = QSpinBox()
+        self._ui_subtitle_lines.setRange(2, 10)
+        self._ui_subtitle_lines.setValue(min(self.config.ui.max_subtitle_lines, 10))
+        overlay_layout.addRow("悬浮窗最大行数:", self._ui_subtitle_lines)
+
+        layout.addWidget(overlay_group)
+
+        # 语音输出设置
+        tts_group = QGroupBox("语音输出")
+        tts_layout = QFormLayout(tts_group)
+        tts_layout.setSpacing(8)
+        tts_layout.setContentsMargins(14, 14, 14, 14)
+
+        self._ui_play_chinese = QCheckBox("播放游戏语音翻译（中文）")
+        self._ui_play_chinese.setChecked(self.config.ui.play_chinese_voice)
+        tts_layout.addRow(self._ui_play_chinese)
+
+        self._ui_play_outbound = QCheckBox("播放麦克风翻译输出（外语）")
+        self._ui_play_outbound.setChecked(self.config.ui.play_outbound_voice)
+        tts_layout.addRow(self._ui_play_outbound)
+
+        layout.addWidget(tts_group)
 
         return w
 
@@ -458,17 +503,21 @@ class SettingsDialog(QDialog):
             asr_backend = self._asr_backend.currentText()
             asr_model = self._asr_model.currentText()
             first_local = self._asr_local_priority.currentData()
-            local_priority = (
-                ["funasr", "whisper"]
-                if first_local == "funasr"
-                else ["whisper", "funasr"]
-            )
+            if first_local == "funasr":
+                local_priority = ["funasr", "whisper", "qwen3"]
+            elif first_local == "whisper":
+                local_priority = ["whisper", "funasr", "qwen3"]
+            else:
+                local_priority = ["qwen3", "funasr", "whisper"]
             whisper_models = {"tiny", "base", "small", "medium", "large-v3"}
+            funasr_models = {"FunAudioLLM/Fun-ASR-Nano-2512"}
+            qwen3_models = {"Qwen/Qwen3-ASR-0.6B"}
             mgr.update("asr",
                 backend=asr_backend,
                 local_model_priority=local_priority,
                 model_size=asr_model if asr_model in whisper_models else self.config.asr.model_size,
-                funasr_model=asr_model if asr_model not in whisper_models else self.config.asr.funasr_model,
+                funasr_model=asr_model if asr_model in funasr_models else self.config.asr.funasr_model,
+                qwen3_model=asr_model if asr_model in qwen3_models else self.config.asr.qwen3_model,
                 device=self._asr_device.currentText(),
                 compute_type=self._asr_compute.currentText(),
                 source_language=self._asr_lang_src.currentText(),
@@ -496,6 +545,7 @@ class SettingsDialog(QDialog):
                 ollama_base_url=self._ollama_url.text(),
                 volc_app_id=self._volc_app_id.text(),
                 volc_access_token=self._volc_token.text(),
+                hunyuan_model_path=self._trans_hunyuan_path.text(),
             )
 
             # 保存 TTS 配置
@@ -513,7 +563,10 @@ class SettingsDialog(QDialog):
                 always_on_top=self._ui_always_top.isChecked(),
                 max_subtitle_lines=self._ui_subtitle_lines.value(),
                 play_chinese_voice=self._ui_play_chinese.isChecked(),
+                play_outbound_voice=self._ui_play_outbound.isChecked(),
                 subtitle_opacity=self._ui_subtitle_opacity.value(),
+                show_game_subtitle=self._ui_show_game_subtitle.isChecked(),
+                show_mic_subtitle=self._ui_show_mic_subtitle.isChecked(),
             )
 
             # 保存音频设备选择

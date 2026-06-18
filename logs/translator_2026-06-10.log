@@ -1,0 +1,417 @@
+2026-06-10 08:55:07.565 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 08:55:07.565 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 08:55:07.565 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 08:55:07.566 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 08:55:07.566 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 08:55:07.798 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 08:55:32.631 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 08:55:32.631 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 08:55:32.631 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 08:55:32.631 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 08:55:32.631 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 08:55:32.868 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 08:57:46.390 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 08:57:46.390 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 08:57:46.390 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 08:57:46.390 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 08:57:46.390 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 08:57:46.635 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 09:00:34.560 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 09:00:34.560 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 09:00:34.560 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 09:00:34.560 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 09:00:34.560 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 09:00:34.796 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 09:00:40.671 | INFO     | src.core.pipeline:__init__:58 | 火山引擎配置: use_cloud=True, requested=False, configured=True
+2026-06-10 09:00:40.671 | INFO     | src.core.translator:_init_client:100 | 翻译策略: volc (降级: microsoft, google)
+2026-06-10 09:00:40.671 | INFO     | src.core.pipeline:initialize:159 | 初始化翻译管道...
+2026-06-10 09:00:40.682 | INFO     | src.audio.virtual_device:_linux_create_speaker:60 | 虚拟音频设备 'translator_virtual' 已存在
+2026-06-10 09:00:40.682 | INFO     | src.audio.virtual_device:_linux_create_mic_monitor:84 | Monitor 源自动可用: translator_virtual_sink.monitor
+2026-06-10 09:00:40.682 | INFO     | src.core.pipeline:initialize:165 | 火山引擎可用，跳过本地 ASR 模型加载
+2026-06-10 09:00:40.682 | INFO     | src.core.pipeline:initialize:175 | TTS输出: 系统默认扬声器
+2026-06-10 09:00:40.682 | INFO     | src.core.pipeline:initialize:177 | 翻译管道初始化完成
+2026-06-10 09:00:40.696 | INFO     | src.audio.stream:_open_sounddevice_input:252 | 音频输入流已打开 (device=None, sr=16000)
+2026-06-10 09:00:40.697 | INFO     | src.audio.stream:_open_pulse_input:301 | PulseAudio输入流已打开 (source=translator_virtual_sink.monitor, sr=16000)
+2026-06-10 09:00:40.697 | INFO     | src.core.pipeline:start:229 | 游戏声音捕获已开启
+2026-06-10 09:00:40.697 | INFO     | src.core.pipeline:start:246 | ✅ 火山引擎双向管道已启动（出站 + 系统音频入站）
+2026-06-10 09:00:40.697 | INFO     | src.core.pipeline:_volc_outbound_loop:288 | 火山引擎管道启动
+2026-06-10 09:00:40.697 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 09:00:40.697 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 09:00:40.698 | INFO     | src.core.pipeline:_volc_inbound_loop:361 | 火山引擎入站管道启动（系统音频→字幕）
+2026-06-10 09:00:40.699 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 09:00:40.699 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 09:00:40.960 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=20260610090040AB44324BEE9BCD45C288
+2026-06-10 09:00:40.974 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=20260610090040C9FAF92270531E400C7C
+2026-06-10 09:00:41.008 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: f6c5f275-9eb2-4e89-856f-150e1a086825
+2026-06-10 09:00:41.008 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (en→zh)
+2026-06-10 09:00:42.687 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: d04be63a-40c1-4a67-818c-7a8dc9cffa9b
+2026-06-10 09:00:42.688 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (zh→en)
+2026-06-10 09:00:43.093 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2047ms
+2026-06-10 09:00:43.093 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2033ms
+2026-06-10 09:00:44.118 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 3071ms
+2026-06-10 09:00:44.119 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 3053ms
+2026-06-10 09:00:45.099 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 4054ms
+2026-06-10 09:00:45.100 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 4040ms
+2026-06-10 09:00:46.123 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 5078ms
+2026-06-10 09:00:46.123 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 5058ms
+2026-06-10 09:00:47.104 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 6050ms
+2026-06-10 09:00:47.105 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 6035ms
+2026-06-10 09:00:48.129 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 7078ms
+2026-06-10 09:00:48.129 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 7064ms
+2026-06-10 09:00:49.109 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 8053ms
+2026-06-10 09:00:49.109 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 8038ms
+2026-06-10 09:00:50.135 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 9065ms
+2026-06-10 09:00:51.115 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 10062ms
+2026-06-10 09:00:51.115 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 10047ms
+2026-06-10 09:00:51.457 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 09:00:51.458 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 09:02:02.356 | INFO     | src.gui.main_window:_reset_volc_usage:1100 | 火山引擎用量统计已重置
+2026-06-10 09:02:06.874 | INFO     | src.gui.main_window:_reset_volc_usage:1100 | 火山引擎用量统计已重置
+2026-06-10 13:42:12.872 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 13:42:12.872 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 13:42:12.873 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 13:42:12.873 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 13:42:12.873 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 13:42:13.128 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 13:44:19.966 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 13:44:19.967 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 13:44:19.967 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 13:44:19.967 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 13:44:19.967 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 13:44:20.198 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 14:11:57.000 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 14:11:57.000 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 14:11:57.000 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 14:11:57.000 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 14:11:57.000 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 14:11:57.268 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 14:53:05.373 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 14:53:05.374 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 14:53:05.374 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 14:53:05.374 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 14:53:05.374 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 14:53:05.650 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 14:53:48.121 | INFO     | src.core.pipeline:__init__:116 | 使用火山引擎云端模型
+2026-06-10 14:53:48.122 | INFO     | src.core.translator:_init_client:100 | 翻译策略: volc (降级: microsoft, google)
+2026-06-10 14:53:48.122 | INFO     | src.core.pipeline:initialize:215 | 初始化翻译管道...
+2026-06-10 14:53:48.131 | INFO     | src.audio.virtual_device:_linux_create_speaker:60 | 虚拟音频设备 'translator_virtual' 已存在
+2026-06-10 14:53:48.131 | INFO     | src.audio.virtual_device:_linux_create_mic_monitor:84 | Monitor 源自动可用: translator_virtual_sink.monitor
+2026-06-10 14:53:48.131 | INFO     | src.core.pipeline:initialize:221 | volc 云端引擎可用，跳过本地 ASR 模型加载
+2026-06-10 14:53:48.131 | INFO     | src.core.pipeline:initialize:231 | TTS输出: 系统默认扬声器
+2026-06-10 14:53:48.131 | INFO     | src.core.pipeline:initialize:233 | 翻译管道初始化完成
+2026-06-10 14:53:48.148 | INFO     | src.audio.stream:_open_sounddevice_input:252 | 音频输入流已打开 (device=None, sr=16000)
+2026-06-10 14:53:48.149 | INFO     | src.audio.stream:_open_pulse_input:301 | PulseAudio输入流已打开 (source=translator_virtual_sink.monitor, sr=16000)
+2026-06-10 14:53:48.149 | INFO     | src.core.pipeline:start:293 | 游戏声音捕获已开启
+2026-06-10 14:53:48.149 | INFO     | src.core.pipeline:start:310 | ✅ volc 云端双向管道已启动（出站 + 系统音频入站）
+2026-06-10 14:53:48.149 | INFO     | src.core.pipeline:_cloud_outbound_loop:352 | volc 云端出站管道启动
+2026-06-10 14:53:48.149 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 14:53:48.149 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 14:53:48.150 | INFO     | src.core.pipeline:_cloud_inbound_loop:425 | volc 云端入站管道启动（系统音频→字幕）
+2026-06-10 14:53:48.151 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 14:53:48.151 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 14:53:48.414 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=2026061014534895D15948C6AFD7963128
+2026-06-10 14:53:48.419 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=202606101453489F6C9DE5ECE18A54543F
+2026-06-10 14:53:48.473 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: 42d39df0-eabb-4f09-95a1-f0195e30190e
+2026-06-10 14:53:48.474 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (zh→en)
+2026-06-10 14:53:48.476 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: 015d7f01-6796-4ca9-9267-e9d1a6346ad3
+2026-06-10 14:53:48.477 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (en→zh)
+2026-06-10 14:53:50.547 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2041ms
+2026-06-10 14:53:50.547 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2043ms
+2026-06-10 14:53:51.321 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 14:53:51.322 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 14:53:56.966 | INFO     | src.core.pipeline:__init__:116 | 使用火山引擎云端模型
+2026-06-10 14:53:56.966 | INFO     | src.core.translator:_init_client:100 | 翻译策略: volc (降级: microsoft, google)
+2026-06-10 14:53:56.967 | INFO     | src.core.pipeline:initialize:215 | 初始化翻译管道...
+2026-06-10 14:53:56.986 | INFO     | src.audio.virtual_device:_linux_create_speaker:60 | 虚拟音频设备 'translator_virtual' 已存在
+2026-06-10 14:53:56.986 | INFO     | src.audio.virtual_device:_linux_create_mic_monitor:84 | Monitor 源自动可用: translator_virtual_sink.monitor
+2026-06-10 14:53:56.986 | INFO     | src.core.pipeline:initialize:221 | volc 云端引擎可用，跳过本地 ASR 模型加载
+2026-06-10 14:53:56.986 | INFO     | src.core.pipeline:initialize:231 | TTS输出: 系统默认扬声器
+2026-06-10 14:53:56.986 | INFO     | src.core.pipeline:initialize:233 | 翻译管道初始化完成
+2026-06-10 14:53:56.998 | INFO     | src.audio.stream:_open_sounddevice_input:252 | 音频输入流已打开 (device=None, sr=16000)
+2026-06-10 14:53:56.999 | INFO     | src.audio.stream:_open_pulse_input:301 | PulseAudio输入流已打开 (source=translator_virtual_sink.monitor, sr=16000)
+2026-06-10 14:53:56.999 | INFO     | src.core.pipeline:start:293 | 游戏声音捕获已开启
+2026-06-10 14:53:56.999 | INFO     | src.core.pipeline:start:310 | ✅ volc 云端双向管道已启动（出站 + 系统音频入站）
+2026-06-10 14:53:57.000 | INFO     | src.core.pipeline:_cloud_outbound_loop:352 | volc 云端出站管道启动
+2026-06-10 14:53:57.000 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 14:53:57.000 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 14:53:57.001 | INFO     | src.core.pipeline:_cloud_inbound_loop:425 | volc 云端入站管道启动（系统音频→字幕）
+2026-06-10 14:53:57.001 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 14:53:57.001 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 14:53:57.151 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=2026061014535749B79BBF3CEBBC4BD314
+2026-06-10 14:53:57.161 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=202606101453570D062085911F644D032C
+2026-06-10 14:53:57.206 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: c272df16-ac37-42ea-aecf-85a47a292869
+2026-06-10 14:53:57.206 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (en→zh)
+2026-06-10 14:53:59.023 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: 4919cd11-6e5f-4ba7-96f5-e108f8f07a6d
+2026-06-10 14:53:59.023 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (zh→en)
+2026-06-10 14:53:59.250 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2001ms
+2026-06-10 14:53:59.250 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2014ms
+2026-06-10 14:54:00.274 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 3036ms
+2026-06-10 14:54:00.274 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 3023ms
+2026-06-10 14:54:01.256 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 4007ms
+2026-06-10 14:54:01.257 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 4021ms
+2026-06-10 14:54:01.258 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 14:54:01.259 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 14:54:35.639 | INFO     | src.core.pipeline:__init__:116 | 使用火山引擎云端模型
+2026-06-10 14:54:35.640 | INFO     | src.core.translator:_init_client:100 | 翻译策略: volc (降级: microsoft, google)
+2026-06-10 14:54:35.640 | INFO     | src.core.pipeline:initialize:215 | 初始化翻译管道...
+2026-06-10 14:54:35.673 | INFO     | src.audio.virtual_device:_linux_create_speaker:60 | 虚拟音频设备 'translator_virtual' 已存在
+2026-06-10 14:54:35.673 | INFO     | src.audio.virtual_device:_linux_create_mic_monitor:84 | Monitor 源自动可用: translator_virtual_sink.monitor
+2026-06-10 14:54:35.674 | INFO     | src.core.pipeline:initialize:221 | volc 云端引擎可用，跳过本地 ASR 模型加载
+2026-06-10 14:54:35.674 | INFO     | src.core.pipeline:initialize:231 | TTS输出: 系统默认扬声器
+2026-06-10 14:54:35.674 | INFO     | src.core.pipeline:initialize:233 | 翻译管道初始化完成
+2026-06-10 14:54:35.709 | INFO     | src.audio.stream:_open_sounddevice_input:252 | 音频输入流已打开 (device=None, sr=16000)
+2026-06-10 14:54:35.710 | INFO     | src.audio.stream:_open_pulse_input:301 | PulseAudio输入流已打开 (source=translator_virtual_sink.monitor, sr=16000)
+2026-06-10 14:54:35.710 | INFO     | src.core.pipeline:start:293 | 游戏声音捕获已开启
+2026-06-10 14:54:35.711 | INFO     | src.core.pipeline:start:310 | ✅ volc 云端双向管道已启动（出站 + 系统音频入站）
+2026-06-10 14:54:35.711 | INFO     | src.core.pipeline:_cloud_outbound_loop:352 | volc 云端出站管道启动
+2026-06-10 14:54:35.711 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 14:54:35.711 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 14:54:35.712 | INFO     | src.core.pipeline:_cloud_inbound_loop:425 | volc 云端入站管道启动（系统音频→字幕）
+2026-06-10 14:54:35.712 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 14:54:35.713 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 14:54:35.882 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=20260610145435BE10347C359067519A06
+2026-06-10 14:54:35.889 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=202606101454359341AC2CF8D0FA5EEB72
+2026-06-10 14:54:35.936 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: f16b0ecc-88b2-4e12-9c4b-b1395bf414a7
+2026-06-10 14:54:35.936 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (zh→en)
+2026-06-10 14:54:36.028 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: 32c7818a-6feb-4fe2-a047-357367dbaa20
+2026-06-10 14:54:36.028 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (en→zh)
+2026-06-10 14:54:38.034 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2065ms
+2026-06-10 14:54:38.035 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2054ms
+2026-06-10 14:54:38.378 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 14:54:38.379 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 15:02:14.752 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 15:02:14.752 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 15:02:14.753 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 15:02:14.753 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 15:02:14.753 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 15:02:15.022 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 15:02:35.922 | INFO     | src.core.pipeline:__init__:123 | 使用火山引擎云端模型
+2026-06-10 15:02:35.922 | INFO     | src.core.translator:_init_client:100 | 翻译策略: volc (降级: microsoft, google)
+2026-06-10 15:02:35.927 | INFO     | src.core.pipeline:initialize:222 | 初始化翻译管道...
+2026-06-10 15:02:35.936 | INFO     | src.audio.virtual_device:_linux_create_speaker:60 | 虚拟音频设备 'translator_virtual' 已存在
+2026-06-10 15:02:35.936 | INFO     | src.audio.virtual_device:_linux_create_mic_monitor:84 | Monitor 源自动可用: translator_virtual_sink.monitor
+2026-06-10 15:02:35.937 | INFO     | src.core.pipeline:initialize:228 | volc 云端引擎可用，跳过本地 ASR 模型加载
+2026-06-10 15:02:35.937 | INFO     | src.core.pipeline:initialize:238 | TTS输出: 系统默认扬声器
+2026-06-10 15:02:35.937 | INFO     | src.core.pipeline:initialize:240 | 翻译管道初始化完成
+2026-06-10 15:02:35.954 | INFO     | src.audio.stream:_open_sounddevice_input:252 | 音频输入流已打开 (device=None, sr=16000)
+2026-06-10 15:02:35.955 | INFO     | src.audio.stream:_open_pulse_input:301 | PulseAudio输入流已打开 (source=translator_virtual_sink.monitor, sr=16000)
+2026-06-10 15:02:35.955 | INFO     | src.core.pipeline:start:300 | 游戏声音捕获已开启
+2026-06-10 15:02:35.955 | INFO     | src.core.pipeline:start:317 | ✅ volc 云端双向管道已启动（出站 + 系统音频入站）
+2026-06-10 15:02:35.955 | INFO     | src.core.pipeline:_cloud_outbound_loop:359 | volc 云端出站管道启动
+2026-06-10 15:02:35.955 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 15:02:35.955 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 15:02:35.956 | INFO     | src.core.pipeline:_cloud_inbound_loop:432 | volc 云端入站管道启动（系统音频→字幕）
+2026-06-10 15:02:35.957 | INFO     | src.core.volc_engine:_build_header_candidates:112 | 火山引擎鉴权模式: 新版 API Key
+2026-06-10 15:02:35.957 | INFO     | src.core.volc_engine:connect:209 | 尝试火山引擎鉴权头: 新版 API Key
+2026-06-10 15:02:36.189 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=20260610150236095ADBA2278BF751D9AF
+2026-06-10 15:02:36.193 | INFO     | src.core.volc_engine:connect:218 | 火山引擎已连接，X-Tt-Logid=20260610150236213FFCB3B85F2D511E53
+2026-06-10 15:02:36.229 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: 6bb994cb-339e-4f7a-bae7-704f124fdb90
+2026-06-10 15:02:36.230 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (zh→en)
+2026-06-10 15:02:36.303 | INFO     | src.core.volc_engine:_handle_response:312 | 火山引擎会话已启动: 0b5817bf-a4ce-456e-852c-92dc379e72df
+2026-06-10 15:02:36.303 | INFO     | src.core.volc_engine:connect:238 | 火山引擎会话已就绪 (en→zh)
+2026-06-10 15:02:38.351 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2016ms
+2026-06-10 15:02:38.351 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 2065ms
+2026-06-10 15:02:39.289 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 3003ms
+2026-06-10 15:02:39.375 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 3038ms
+2026-06-10 15:02:40.356 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 4065ms
+2026-06-10 15:02:40.356 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 4021ms
+2026-06-10 15:02:41.295 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 5009ms
+2026-06-10 15:02:41.380 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 5044ms
+2026-06-10 15:02:42.361 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 6075ms
+2026-06-10 15:02:42.362 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 6030ms
+2026-06-10 15:02:43.300 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 7015ms
+2026-06-10 15:02:43.385 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 7052ms
+2026-06-10 15:02:44.281 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 8006ms
+2026-06-10 15:02:44.623 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 8033ms
+2026-06-10 15:02:45.305 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 9021ms
+2026-06-10 15:02:45.391 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 9054ms
+2026-06-10 15:02:46.287 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 10002ms
+2026-06-10 15:02:46.372 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 10037ms
+2026-06-10 15:02:47.311 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 11025ms
+2026-06-10 15:02:47.396 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 11059ms
+2026-06-10 15:02:48.292 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 12010ms
+2026-06-10 15:02:48.377 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 12043ms
+2026-06-10 15:02:49.316 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 13032ms
+2026-06-10 15:02:49.401 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 13065ms
+2026-06-10 15:02:50.383 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 14049ms
+2026-06-10 15:02:50.553 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 14021ms
+2026-06-10 15:02:51.321 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 15036ms
+2026-06-10 15:02:51.407 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 15073ms
+2026-06-10 15:02:52.303 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 16021ms
+2026-06-10 15:02:52.644 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 16052ms
+2026-06-10 15:02:53.327 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 17043ms
+2026-06-10 15:02:53.412 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 17079ms
+2026-06-10 15:02:54.351 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 18015ms
+2026-06-10 15:02:54.351 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 18065ms
+2026-06-10 15:02:55.289 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 19006ms
+2026-06-10 15:02:55.375 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 19039ms
+2026-06-10 15:02:56.356 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 20020ms
+2026-06-10 15:02:56.356 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 20071ms
+2026-06-10 15:02:57.295 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 21010ms
+2026-06-10 15:02:57.380 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 21043ms
+2026-06-10 15:02:58.361 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 22027ms
+2026-06-10 15:02:58.361 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 22076ms
+2026-06-10 15:02:59.302 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 23013ms
+2026-06-10 15:02:59.385 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 23050ms
+2026-06-10 15:03:00.367 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 24082ms
+2026-06-10 15:03:00.367 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 24032ms
+2026-06-10 15:03:01.305 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 25018ms
+2026-06-10 15:03:01.390 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 25057ms
+2026-06-10 15:03:02.290 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 26002ms
+2026-06-10 15:03:02.372 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 26038ms
+2026-06-10 15:03:03.310 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 27027ms
+2026-06-10 15:03:03.396 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 27062ms
+2026-06-10 15:03:04.292 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 28017ms
+2026-06-10 15:03:04.377 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 28041ms
+2026-06-10 15:03:05.316 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 29030ms
+2026-06-10 15:03:05.401 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 29065ms
+2026-06-10 15:03:06.297 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 30012ms
+2026-06-10 15:03:06.382 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 30048ms
+2026-06-10 15:03:07.321 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 31038ms
+2026-06-10 15:03:07.407 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 31069ms
+2026-06-10 15:03:08.302 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 32018ms
+2026-06-10 15:03:08.388 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 32052ms
+2026-06-10 15:03:09.327 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 33043ms
+2026-06-10 15:03:09.412 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 33076ms
+2026-06-10 15:03:10.350 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 34016ms
+2026-06-10 15:03:10.351 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 34064ms
+2026-06-10 15:03:11.289 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 35002ms
+2026-06-10 15:03:11.374 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 35039ms
+2026-06-10 15:03:12.356 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 36070ms
+2026-06-10 15:03:12.356 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 36020ms
+2026-06-10 15:03:13.294 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 37009ms
+2026-06-10 15:03:13.380 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 37045ms
+2026-06-10 15:03:14.361 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 38024ms
+2026-06-10 15:03:14.361 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 38075ms
+2026-06-10 15:03:15.300 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 39015ms
+2026-06-10 15:03:15.385 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 39049ms
+2026-06-10 15:03:16.367 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 40030ms
+2026-06-10 15:03:16.367 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 40081ms
+2026-06-10 15:03:17.305 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 41020ms
+2026-06-10 15:03:17.390 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 41053ms
+2026-06-10 15:03:18.286 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 42001ms
+2026-06-10 15:03:18.372 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 42036ms
+2026-06-10 15:03:19.310 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 43024ms
+2026-06-10 15:03:19.396 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 43060ms
+2026-06-10 15:03:20.292 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 44007ms
+2026-06-10 15:03:20.377 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 44040ms
+2026-06-10 15:03:21.316 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 45031ms
+2026-06-10 15:03:21.401 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 45063ms
+2026-06-10 15:03:22.297 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 46011ms
+2026-06-10 15:03:22.382 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 46045ms
+2026-06-10 15:03:23.321 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 47033ms
+2026-06-10 15:03:23.406 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 47073ms
+2026-06-10 15:03:24.303 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 48033ms
+2026-06-10 15:03:24.388 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 48054ms
+2026-06-10 15:03:25.326 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 49043ms
+2026-06-10 15:03:25.326 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 49009ms
+2026-06-10 15:03:26.350 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 50016ms
+2026-06-10 15:03:26.350 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 50066ms
+2026-06-10 15:03:27.289 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 51004ms
+2026-06-10 15:03:27.374 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 51056ms
+2026-06-10 15:03:28.270 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 52003ms
+2026-06-10 15:03:28.356 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 52022ms
+2026-06-10 15:03:29.294 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 53008ms
+2026-06-10 15:03:29.380 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 53045ms
+2026-06-10 15:03:30.361 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 54026ms
+2026-06-10 15:03:31.300 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 55017ms
+2026-06-10 15:03:31.385 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 55051ms
+2026-06-10 15:03:32.366 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 56030ms
+2026-06-10 15:03:32.366 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 56082ms
+2026-06-10 15:03:33.305 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 57019ms
+2026-06-10 15:03:33.390 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 57056ms
+2026-06-10 15:03:34.286 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 58000ms
+2026-06-10 15:03:34.371 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 58035ms
+2026-06-10 15:03:35.310 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 59024ms
+2026-06-10 15:03:35.396 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 59064ms
+2026-06-10 15:03:36.291 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 60006ms
+2026-06-10 15:03:36.377 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 60043ms
+2026-06-10 15:03:37.316 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 61030ms
+2026-06-10 15:03:37.401 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 61066ms
+2026-06-10 15:03:38.297 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 62010ms
+2026-06-10 15:03:38.382 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 62045ms
+2026-06-10 15:03:39.321 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 63035ms
+2026-06-10 15:03:39.406 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 63070ms
+2026-06-10 15:03:40.302 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 64016ms
+2026-06-10 15:03:40.388 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 64051ms
+2026-06-10 15:03:41.326 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 65040ms
+2026-06-10 15:03:41.411 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 65076ms
+2026-06-10 15:03:42.350 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 66015ms
+2026-06-10 15:03:42.350 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 66070ms
+2026-06-10 15:03:43.289 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 67005ms
+2026-06-10 15:03:43.374 | DEBUG    | src.core.volc_engine:_handle_response:333 | 火山引擎静音片段: 67043ms
+2026-06-10 15:03:44.100 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 15:03:44.100 | INFO     | src.core.volc_engine:stop:399 | 火山引擎已断开
+2026-06-10 15:08:17.940 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 15:08:17.940 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 15:08:17.941 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 15:08:17.941 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 15:08:17.941 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 15:08:18.475 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 15:08:41.321 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 15:08:41.322 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 15:08:41.322 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 15:08:41.322 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 15:08:41.322 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 15:08:41.707 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 16:19:33.973 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 16:19:33.973 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 16:19:33.974 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 16:19:33.974 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 16:19:33.974 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 16:19:34.382 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 16:19:51.560 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 16:19:51.560 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 16:19:51.560 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 16:19:51.560 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 16:19:51.560 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 16:19:51.833 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 16:19:56.617 | INFO     | src.core.pipeline:__init__:91 | 使用腾讯混元 HY-MT1.5-1.8B 本地翻译模型
+2026-06-10 16:20:01.497 | INFO     | src.core.hunyuan_engine:load_model:72 | 加载 HY-MT1.5-1.8B 模型：/home/fiend/WorkSpace/python/translator_intime/models/HY-MT1.5-1.8B
+2026-06-10 16:20:02.429 | WARNING  | src.core.hunyuan_engine:load_model:88 | 模型加载失败 (/home/fiend/WorkSpace/python/translator_intime/models/HY-MT1.5-1.8B): Unrecognized configuration class <class 'transformers.models.hunyuan_v1_dense.configuration_hunyuan_v1_dense.HunYuanDenseV1Config'> for this kind of AutoModel: AutoModelForSeq2SeqLM.
+Model type should be one of AudioFlamingo3Config, BartConfig, BigBirdPegasusConfig, BlenderbotConfig, BlenderbotSmallConfig, EncoderDecoderConfig, FSMTConfig, GlmAsrConfig, GraniteSpeechConfig, GraniteSpeechPlusConfig, LEDConfig, LongT5Config, M2M100Config, MarianConfig, MBartConfig, MT5Config, MusicFlamingoConfig, MvpConfig, NllbMoeConfig, PegasusConfig, PegasusXConfig, PLBartConfig, ProphetNetConfig, Qwen2AudioConfig, SeamlessM4TConfig, SeamlessM4Tv2Config, SwitchTransformersConfig, T5Config, T5GemmaConfig, T5Gemma2Config, UMT5Config, VibeVoiceAsrConfig, VoxtralConfig, VoxtralRealtimeConfig.
+2026-06-10 16:20:02.429 | INFO     | src.core.hunyuan_engine:load_model:72 | 加载 HY-MT1.5-1.8B 模型：/home/fiend/WorkSpace/python/translator_intime/models/models--tencent--HY-MT1.5-1.8B
+2026-06-10 16:20:02.432 | WARNING  | src.core.hunyuan_engine:load_model:88 | 模型加载失败 (/home/fiend/WorkSpace/python/translator_intime/models/models--tencent--HY-MT1.5-1.8B): Couldn't instantiate the backend tokenizer from one of: 
+(1) a `tokenizers` library serialization file, 
+(2) a slow tokenizer instance to convert or 
+(3) an equivalent slow tokenizer class to instantiate and convert. 
+You need to have sentencepiece or tiktoken installed to convert a slow tokenizer to a fast one.
+2026-06-10 16:20:02.432 | ERROR    | src.core.hunyuan_engine:load_model:92 | HY-MT1.5-1.8B 本地模型未找到，请手动下载模型:
+  方式 1 - Hugging Face:
+    python -c "from huggingface_hub import snapshot_download; snapshot_download('tencent/HY-MT1.5-1.8B', cache_dir='./models')"
+  方式 2 - 直接克隆:
+    git clone https://huggingface.co/tencent/HY-MT1.5-1.8B ./models/HY-MT1.5-1.8B
+  方式 3 - ModelScope:
+    python -c "from modelscope import snapshot_download; snapshot_download('iic/HY-MT1.5-1.8B', cache_dir='./models')"
+  然后重新启动应用
+2026-06-10 16:20:02.432 | ERROR    | src.core.pipeline:__init__:98 | 腾讯混元模型加载失败，无法启动翻译
+2026-06-10 16:20:02.433 | WARNING  | src.core.translator:_init_client:113 | 未知翻译后端 'hunyuan'，使用智能模式
+2026-06-10 16:20:02.433 | INFO     | src.core.pipeline:initialize:222 | 初始化翻译管道...
+2026-06-10 16:20:02.441 | INFO     | src.audio.virtual_device:_linux_create_speaker:60 | 虚拟音频设备 'translator_virtual' 已存在
+2026-06-10 16:20:02.441 | INFO     | src.audio.virtual_device:_linux_create_mic_monitor:84 | Monitor 源自动可用: translator_virtual_sink.monitor
+2026-06-10 16:36:02.047 | INFO     | src.utils.logger:setup_logger:31 | 日志系统初始化完成
+2026-06-10 16:36:02.047 | INFO     | src.main:main:40 | ============================================================
+2026-06-10 16:36:02.048 | INFO     | src.main:main:41 | 友译 v0.1.0 启动
+2026-06-10 16:36:02.048 | INFO     | src.main:main:42 | 实时游戏语音双向翻译系统
+2026-06-10 16:36:02.048 | INFO     | src.main:main:43 | ============================================================
+2026-06-10 16:36:02.329 | INFO     | src.main:main:67 | GUI 已启动
+2026-06-10 16:36:06.513 | INFO     | src.core.pipeline:__init__:91 | 使用腾讯混元 HY-MT1.5-1.8B 本地翻译模型
+2026-06-10 16:36:10.755 | INFO     | src.core.hunyuan_engine:load_model:72 | 加载 HY-MT1.5-1.8B 模型：/home/fiend/WorkSpace/python/translator_intime/models/HY-MT1.5-1.8B
+2026-06-10 16:36:11.951 | WARNING  | src.core.hunyuan_engine:load_model:89 | 模型加载失败 (/home/fiend/WorkSpace/python/translator_intime/models/HY-MT1.5-1.8B): Error while deserializing header: header too large
+2026-06-10 16:36:11.952 | INFO     | src.core.hunyuan_engine:load_model:72 | 加载 HY-MT1.5-1.8B 模型：/home/fiend/WorkSpace/python/translator_intime/models/models--tencent--HY-MT1.5-1.8B
+2026-06-10 16:36:11.956 | WARNING  | src.core.hunyuan_engine:load_model:89 | 模型加载失败 (/home/fiend/WorkSpace/python/translator_intime/models/models--tencent--HY-MT1.5-1.8B): Couldn't instantiate the backend tokenizer from one of: 
+(1) a `tokenizers` library serialization file, 
+(2) a slow tokenizer instance to convert or 
+(3) an equivalent slow tokenizer class to instantiate and convert. 
+You need to have sentencepiece or tiktoken installed to convert a slow tokenizer to a fast one.
+2026-06-10 16:36:11.956 | ERROR    | src.core.hunyuan_engine:load_model:93 | HY-MT1.5-1.8B 本地模型加载失败，请检查:
+  1. 模型是否已下载:
+    git clone https://huggingface.co/tencent/HY-MT1.5-1.8B ./models/HY-MT1.5-1.8B
+  2. 依赖是否已安装:
+    pip install transformers torch sentencepiece tiktoken
+  然后重新启动应用
+2026-06-10 16:36:11.956 | ERROR    | src.core.pipeline:__init__:98 | 腾讯混元模型加载失败，无法启动翻译
+2026-06-10 16:36:11.956 | WARNING  | src.core.translator:_init_client:113 | 未知翻译后端 'hunyuan'，使用智能模式
+2026-06-10 16:36:11.956 | INFO     | src.core.pipeline:initialize:222 | 初始化翻译管道...
+2026-06-10 16:36:11.964 | INFO     | src.audio.virtual_device:_linux_create_speaker:60 | 虚拟音频设备 'translator_virtual' 已存在
+2026-06-10 16:36:11.964 | INFO     | src.audio.virtual_device:_linux_create_mic_monitor:84 | Monitor 源自动可用: translator_virtual_sink.monitor

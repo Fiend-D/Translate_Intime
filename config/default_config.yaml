@@ -1,5 +1,9 @@
+aliyun:
+  api_key: ''
+  enable_audio_output: true
+  voice: Tina
 asr:
-  backend: auto
+  backend: qwen3
   beam_size: 5
   compute_type: auto
   device: auto
@@ -20,8 +24,10 @@ asr:
   local_model_priority:
   - funasr
   - whisper
-  model_size: small
+  model_size: Qwen/Qwen3-ASR-0.6B
   noise_gate_threshold: 0.005
+  qwen3_hub: ms
+  qwen3_model: Qwen/Qwen3-ASR-0.6B
   sample_rate: 16000
   source_language: zh
   target_language: en
@@ -34,7 +40,7 @@ audio:
   output_device: null
   sample_rate: 16000
 translation:
-  backend: auto
+  backend: hunyuan
   baidu_app_id: ''
   baidu_secret_key: ''
   deepl_api_key: ''
@@ -42,6 +48,8 @@ translation:
   - baidu
   - microsoft
   - google
+  hunyuan_model: HY-MT1.5-1.8B
+  hunyuan_model_path: ''
   ollama_base_url: http://localhost:11434/v1
   ollama_model: qwen2.5:7b
   openai_api_key: ''
@@ -65,7 +73,16 @@ ui:
   always_on_top: true
   font_size: 12
   language: zh
-  max_subtitle_lines: 20
+  max_subtitle_lines: 10
   play_chinese_voice: false
+  play_outbound_voice: false
+  show_game_subtitle: true
+  show_mic_subtitle: true
   show_subtitle_overlay: true
   subtitle_opacity: 0.85
+volc_usage:
+  monthly_quota: 500000
+  total_cost: 0.0
+  total_input_tokens: 0
+  total_output_audio_tokens: 0
+  total_output_text_tokens: 0
