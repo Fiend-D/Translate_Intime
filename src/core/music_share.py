@@ -114,12 +114,15 @@ class MusicSharePlayer:
         self._sr = 44100
         self._pos = 0
         self._device: int | str | None = None
-        self._volume = 0.7
+        self._dev_sr: int | None = None
+        self._dev_ch: int = 2
+        self._volume = 1.0
         self._loop = False
         self._paused = False
         self._stream: sd.OutputStream | None = None
         self._lock = threading.Lock()
         self._path: Path | None = None
+        self._play_data: np.ndarray | None = None  # 重采样后的播放数据
 
     @property
     def is_playing(self) -> bool:
@@ -141,7 +144,8 @@ class MusicSharePlayer:
 
     @property
     def position_sec(self) -> float:
-        return float(self._pos) / float(self._sr) if self._sr else 0.0
+        sr = self._dev_sr if (self._play_data is not None and self._dev_sr) else self._sr
+        return float(self._pos) / float(sr) if sr else 0.0
 
     def load(self, path: Path | str) -> tuple[str, float]:
         """Load file; returns (display_name, duration_sec). Stops current playback."""
@@ -157,9 +161,18 @@ class MusicSharePlayer:
 
     def set_device(self, device_id: int | str | None) -> None:
         self._device = device_id
+        self._dev_sr = None
+        self._dev_ch = 2
+        try:
+            if isinstance(device_id, int):
+                info = sd.query_devices(device_id)
+                self._dev_sr = int(info.get("default_samplerate", 0))
+                self._dev_ch = min(max(int(info.get("max_output_channels", 2)), 1), 2)
+        except Exception:
+            pass
 
     def set_volume(self, volume: float) -> None:
-        self._volume = max(0.0, min(1.0, float(volume)))
+        self._volume = max(0.0, min(2.0, float(volume)))
 
     def set_loop(self, loop: bool) -> None:
         self._loop = bool(loop)
@@ -171,7 +184,33 @@ class MusicSharePlayer:
             self._paused = False
             return
 
-        channels = int(self._data.shape[1])
+        # 准备播放数据：重采样到设备采样率 + 匹配声道数
+        play_data = self._data
+        play_sr = self._sr
+        if self._dev_sr and self._dev_sr != self._sr:
+            from src.utils.audio_utils import resample as _resample
+
+            mono = play_data.shape[1] == 1
+            ch_data = []
+            for c in range(play_data.shape[1]):
+                ch_data.append(_resample(play_data[:, c], self._sr, self._dev_sr))
+            play_data = np.column_stack(ch_data) if not mono else ch_data[0].reshape(-1, 1)
+            play_sr = self._dev_sr
+
+        # 统一到设备声道数
+        target_ch = self._dev_ch
+        cur_ch = int(play_data.shape[1])
+        if cur_ch != target_ch:
+            if cur_ch == 1 and target_ch == 2:
+                play_data = np.column_stack([play_data[:, 0], play_data[:, 0]])
+            elif cur_ch > target_ch:
+                play_data = play_data[:, :target_ch]
+            elif cur_ch < target_ch:
+                # 补零到目标声道数
+                pad = np.zeros((play_data.shape[0], target_ch - cur_ch), dtype=np.float32)
+                play_data = np.column_stack([play_data, pad])
+
+        channels = target_ch
         device = self._device
         if isinstance(device, str):
             import os
@@ -180,32 +219,33 @@ class MusicSharePlayer:
             device = None
 
         self._paused = False
+        self._play_data = play_data
 
         def callback(outdata, frames, _time, status) -> None:  # noqa: ANN001
             if status:
                 logger.debug(f"music share stream status: {status}")
             with self._lock:
-                if self._paused or self._data is None:
+                if self._paused or self._play_data is None:
                     outdata.fill(0)
                     return
                 end = self._pos + frames
-                chunk = self._data[self._pos : end]
+                chunk = self._play_data[self._pos : end]
                 n = chunk.shape[0]
                 if n < frames:
-                    outdata[:n] = chunk * self._volume
-                    if self._loop and self._data.shape[0] > 0:
+                    outdata[:n] = np.clip(chunk * self._volume, -1.0, 1.0)
+                    if self._loop and self._play_data.shape[0] > 0:
                         need = frames - n
-                        wrap = self._data[:need]
-                        outdata[n : n + wrap.shape[0]] = wrap * self._volume
+                        wrap = self._play_data[:need]
+                        outdata[n : n + wrap.shape[0]] = np.clip(wrap * self._volume, -1.0, 1.0)
                         if wrap.shape[0] < need:
                             outdata[n + wrap.shape[0] :].fill(0)
                         self._pos = wrap.shape[0]
                     else:
                         outdata[n:].fill(0)
-                        self._pos = self._data.shape[0]
+                        self._pos = self._play_data.shape[0]
                         raise sd.CallbackStop
                 else:
-                    outdata[:] = chunk * self._volume
+                    outdata[:] = np.clip(chunk * self._volume, -1.0, 1.0)
                     self._pos = end
                 if self.on_progress:
                     with contextlib.suppress(Exception):
@@ -213,7 +253,7 @@ class MusicSharePlayer:
 
         try:
             self._stream = sd.OutputStream(
-                samplerate=self._sr,
+                samplerate=play_sr,
                 channels=channels,
                 dtype="float32",
                 device=device,
@@ -223,7 +263,7 @@ class MusicSharePlayer:
             self._stream.start()
             logger.info(
                 f"Music share playing: {self._path} → device={self._device!r} "
-                f"sr={self._sr} ch={channels}"
+                f"sr={play_sr} ch={channels}"
             )
         except Exception as exc:
             self._stream = None
@@ -243,6 +283,7 @@ class MusicSharePlayer:
         self._stream = None
         self._paused = False
         self._pos = 0
+        self._play_data = None
         if stream is not None:
             with contextlib.suppress(Exception):
                 stream.abort()
@@ -253,8 +294,8 @@ class MusicSharePlayer:
         self._stream = None
         self._paused = False
         finished = (
-            self._data is not None
-            and self._pos >= self._data.shape[0]
+            self._play_data is not None
+            and self._pos >= self._play_data.shape[0]
             and not self._loop
         )
         if finished and self.on_finished:

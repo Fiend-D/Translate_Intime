@@ -54,26 +54,38 @@ class AudioCapture:
 
     @staticmethod
     def list_input_devices() -> list[dict[str, Any]]:
-        """Return PortAudio input devices (integer indices)."""
-        import pyaudio
+        """Return deduplicated capture devices (integer indices).
 
-        audio = pyaudio.PyAudio()
+        Collapses PortAudio's MME/DirectSound/WASAPI/WDM-KS duplicates and keeps
+        the longest (untruncated) name so Voicemeeter/VB-Cable labels are
+        readable.  Falls back to plain PyAudio enumeration on import errors.
+        """
         try:
-            devices = []
-            for i in range(audio.get_device_count()):
-                info = audio.get_device_info_by_index(i)
-                if info.get("maxInputChannels", 0) > 0:
-                    devices.append(
-                        {
-                            "index": i,
-                            "name": info.get("name", ""),
-                            "channels": info.get("maxInputChannels", 0),
-                            "sample_rate": int(info.get("defaultSampleRate", 16000)),
-                        }
-                    )
-            return devices
-        finally:
-            audio.terminate()
+            from src.audio.device_listing import list_input_devices
+
+            return list_input_devices()
+        except Exception:
+            import pyaudio
+
+            audio = pyaudio.PyAudio()
+            try:
+                devices: list[dict[str, Any]] = []
+                for i in range(audio.get_device_count()):
+                    info = audio.get_device_info_by_index(i)
+                    if info.get("maxInputChannels", 0) > 0:
+                        devices.append(
+                            {
+                                "index": i,
+                                "name": info.get("name", ""),
+                                "channels": info.get("maxInputChannels", 0),
+                                "sample_rate": int(
+                                    info.get("defaultSampleRate", 16000)
+                                ),
+                            }
+                        )
+                return devices
+            finally:
+                audio.terminate()
 
     def start(self) -> None:
         """Start the capture stream."""

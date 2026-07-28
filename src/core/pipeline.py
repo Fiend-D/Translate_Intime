@@ -572,17 +572,8 @@ class TranslationPipeline(QObject):
         if self._ducker is not None:
             with contextlib.suppress(Exception):
                 self._ducker.pulse()
-        try:
-            import numpy as np
-            import sounddevice as sd
-
-            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            device = self._player.device_id if self._player is not None else None
-            sd.play(samples, samplerate=16000, device=device, blocking=False)
-        except Exception as exc:
-            logger.debug(f"Volc TTS playback failed: {exc}")
-            if self._player is not None:
-                self._player.play(data)
+        if self._player is not None:
+            self._player.play(data)
 
     def _on_volc_error(self, message: str) -> None:
         self.log_message.emit(message)
