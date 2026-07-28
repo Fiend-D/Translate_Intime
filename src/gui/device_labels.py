@@ -32,9 +32,16 @@ def classify_device(name: str, device_id: Any = None) -> str:
         return "system_monitor"
     if "translator_virtual_sink" in raw:
         return "app_virtual"
-    if "cable input" in raw or "vb-audio" in raw and "input" in raw:
+    if "cable input" in raw or ("vb-audio" in raw and "input" in raw):
+        return "vb_to_game"
+    if re.search(
+        r"voicemeeter\s+(aux\s+)?input\b|voicemeeter\s+vaio3\s+input|voicemeeter\s+in\s+\d",
+        raw,
+    ):
         return "vb_to_game"
     if "cable output" in raw or ("vb-audio" in raw and "output" in raw):
+        return "vb_capture"
+    if re.search(r"voicemeeter\s+out\b", raw):
         return "vb_capture"
     if "null" in raw:
         return "null_sink"

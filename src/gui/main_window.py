@@ -538,9 +538,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._lbl_music_time)
 
         self._sld_music_vol = QSlider(Qt.Orientation.Horizontal)
-        self._sld_music_vol.setRange(0, 100)
-        self._sld_music_vol.setValue(70)
-        self._sld_music_vol.setToolTip("音量")
+        self._sld_music_vol.setRange(0, 200)
+        self._sld_music_vol.setValue(100)
+        self._sld_music_vol.setToolTip("音量（100=原始音量，>100=增益，虚拟线缆建议 120-150）")
         self._sld_music_vol.valueChanged.connect(self._on_music_volume)
         vol_row = QHBoxLayout()
         vol_row.addWidget(self._field_label("音量"))
@@ -967,6 +967,27 @@ class MainWindow(QMainWindow):
             short = message if len(message) <= 80 else message[:77] + "…"
             side.setText(short)
 
+    @staticmethod
+    def _is_preferred_virtual_output(name: str) -> bool:
+        """True for VB-Cable / Voicemeeter virtual inputs that the app's TTS
+        should feed into so teammates hear the translation.
+
+        Covers:
+          - CABLE Input (classic VB-Cable)
+          - Voicemeeter Input (VAIO main input)
+          - Voicemeeter AUX Input / VAIO3 Input / Voicemeeter In N
+        """
+        t = (name or "").lower()
+        # Classic Cable + any "VB-Audio ... Input"
+        if "cable" in t and "input" in t:
+            return True
+        if "voicemeeter" in t and ("vaio" in t or "aux" in t) and "input" in t:
+            return True
+        # Voicemeeter In 1/2/3/4/5
+        if "voicemeeter in " in t:
+            return True
+        return False
+
     def _populate_devices(self) -> None:
         from src.gui.device_labels import format_device_label, role_default_label, role_hint
 
@@ -981,14 +1002,13 @@ class MainWindow(QMainWindow):
             logger.warning(f"列举输出设备失败: {exc}")
             outputs = []
 
-        rich_inputs: list[dict[str, Any]] = []
-        rich_outputs: list[dict[str, Any]] = []
+        # Soundcard / WASAPI-process-exclude 等附加设备（Loopback 捕获用）
+        extra_capture: list[dict[str, Any]] = []
         try:
             from src.audio.stream import list_audio_devices
 
             devices = list_audio_devices()
-            rich_inputs = list(devices.get("input", []))
-            rich_outputs = list(devices.get("output", []))
+            extra_capture = list(devices.get("input", []))
         except Exception as exc:
             logger.debug(f"补充音频设备失败: {exc}")
 
@@ -1006,15 +1026,6 @@ class MainWindow(QMainWindow):
             seen_mic.add(idx)
             label = format_device_label("mic", name, idx)
             self._cmb_input.addItem(label, idx)
-        for dev in rich_inputs:
-            idx = dev.get("id")
-            name = str(dev.get("name", ""))
-            if idx in seen_mic:
-                continue
-            if is_virtual_or_loopback_input(name, idx):
-                continue
-            seen_mic.add(idx)
-            self._cmb_input.addItem(format_device_label("mic", name, idx), idx)
         self._cmb_input.setToolTip(role_hint("mic") + "\n" + vb_cable_setup_hint())
 
         # ---- 译文播放到 ----
@@ -1028,28 +1039,19 @@ class MainWindow(QMainWindow):
             if idx in seen_out:
                 continue
             seen_out.add(idx)
-            label = format_device_label("output", str(dev["name"]), idx)
-            if "cable" in str(dev["name"]).lower() and "input" in str(dev["name"]).lower():
-                preferred_out.append((idx, label))
-            else:
-                other_out.append((idx, label))
-        for dev in rich_outputs:
-            idx = dev.get("id")
-            name = str(dev.get("name", ""))
-            if idx in seen_out:
-                continue
-            seen_out.add(idx)
+            name = str(dev["name"])
             label = format_device_label("output", name, idx)
-            if "cable" in name.lower() and "input" in name.lower():
+            if self._is_preferred_virtual_output(name):
                 preferred_out.append((idx, label))
             else:
                 other_out.append((idx, label))
         for idx, label in preferred_out + other_out:
             self._cmb_output.addItem(label, idx)
         self._cmb_output.setToolTip(
-            role_hint("output") + "\n队友听翻译：选 CABLE Input（需安装 VB-Cable）"
+            role_hint("output")
+            + "\n队友听翻译：选 CABLE Input 或 Voicemeeter Input（需安装虚拟声卡）"
         )
-        # 首次未选输出：优先 CABLE Input
+        # 首次未选输出：优先 CABLE / Voicemeeter Input
         if self._config.output_device is None:
             if preferred_out:
                 self._select_combo_data(self._cmb_output, preferred_out[0][0])
@@ -1069,11 +1071,17 @@ class MainWindow(QMainWindow):
         seen_lb: set[Any] = set()
         advanced = bool(getattr(self, "_chk_advanced", None) and self._chk_advanced.isChecked())
 
-        for dev in rich_inputs:
+        # 先放额外的 WASAPI / process-exclude 捕获源（字符串 id，不走 seen_lb 数字集）
+        for dev in extra_capture:
             idx = dev.get("id")
             name = str(dev.get("name", ""))
+            # 额外列表里可能有重复的输入设备；额外设备主要贡献是 wasapi_* 的 id
             if idx in seen_lb:
                 continue
+            # sounddevice 查出来的数字设备重复
+            if isinstance(idx, int) and not str(idx).startswith("wasapi_"):
+                if idx in {d.get("index") for d in inputs}:
+                    continue
             seen_lb.add(idx)
             label = format_device_label("loopback", name, idx)
             if is_vb_cable_capture(name, idx) or is_vb_cable_input(name, idx):
@@ -1082,6 +1090,7 @@ class MainWindow(QMainWindow):
                 "loopback" in f"{name} {idx}".lower()
                 or ".monitor" in f"{name} {idx}".lower()
                 or "wasapi_loopback:" in f"{name} {idx}".lower()
+                or "wasapi_proc_exclude:" in f"{name} {idx}".lower()
             ):
                 preferred.append((idx, label))
             else:
@@ -1123,7 +1132,7 @@ class MainWindow(QMainWindow):
             self._device_cache_inputs.append(
                 {"name": str(dev.get("name", "")), "index": dev.get("index")}
             )
-        for dev in rich_inputs:
+        for dev in extra_capture:
             self._device_cache_inputs.append(
                 {"name": str(dev.get("name", "")), "index": dev.get("id")}
             )
@@ -1133,10 +1142,6 @@ class MainWindow(QMainWindow):
         for dev in outputs:
             self._device_cache_outputs.append(
                 {"name": str(dev.get("name", "")), "index": dev.get("index")}
-            )
-        for dev in rich_outputs:
-            self._device_cache_outputs.append(
-                {"name": str(dev.get("name", "")), "index": dev.get("id")}
             )
 
     # -------------------------------------------------------------- config

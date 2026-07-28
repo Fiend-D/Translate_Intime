@@ -90,21 +90,36 @@ def is_virtual_or_loopback_input(name: Any, device_id: Any = None) -> bool:
 
 
 def is_vb_cable_input(name: Any, device_id: Any = None) -> bool:
-    """CABLE Input / virtual sink that apps play into (teammates hear via CABLE Output)."""
+    """CABLE Input / Voicemeeter virtual sink that apps play into (teammates hear via
+    CABLE Output / Voicemeeter Out Bn)."""
     text = _blob(name, device_id)
     kind = classify_device(str(name or ""), device_id)
     if kind in {"vb_to_game", "app_virtual"}:
         return True
-    return bool(re.search(r"cable\s*input|vb-audio.*input|translator_virtual_sink", text))
+    if re.search(r"cable\s*input|vb-audio.*input|translator_virtual_sink", text):
+        return True
+    # Voicemeeter: main VAIO Input, AUX Input, VAIO3 Input, In 1..5
+    if re.search(
+        r"voicemeeter\s+(aux\s+)?input\b|voicemeeter\s+vaio3\s+input|voicemeeter\s+in\s+\d",
+        text,
+    ):
+        return True
+    return False
 
 
 def is_vb_cable_capture(name: Any, device_id: Any = None) -> bool:
-    """CABLE Output / virtual capture — what games use as mic; must NOT be game-subtitle source."""
+    """CABLE Output / Voicemeeter Out [A|B]n — what games use as mic; must NOT be a
+    game-subtitle capture source because the app's own TTS would loop back."""
     text = _blob(name, device_id)
     kind = classify_device(str(name or ""), device_id)
     if kind == "vb_capture":
         return True
-    return bool(re.search(r"cable\s*output|vb-audio.*output", text))
+    if re.search(r"cable\s*output|vb-audio.*output", text):
+        return True
+    # Voicemeeter Out A1..A5 / B1..B3 or Voicemeeter Out 1..8 (Point N)
+    if re.search(r"voicemeeter\s+out\b", text):
+        return True
+    return False
 
 
 def is_system_loopback_capture(name: Any, device_id: Any = None) -> bool:
@@ -148,16 +163,31 @@ def shares_virtual_cable_path(
 
 
 def find_preferred_vb_output(devices: list[dict[str, Any]]) -> Any | None:
-    """Pick CABLE Input / virtual sink from output device list."""
+    """Pick CABLE Input / Voicemeeter Input (VAIO) / virtual sink from output list.
+
+    Order of preference:
+      1. CABLE Input (classic, name collision-free)
+      2. Voicemeeter main VAIO Input
+      3. Voicemeeter AUX Input
+      4. Voicemeeter In 1..5 / VAIO3 Input
+    """
     scored: list[tuple[int, Any]] = []
     for d in devices:
         name = d.get("name", "")
         did = d.get("index", d.get("id"))
         text = _blob(name, did)
+        if not is_vb_cable_input(name, did):
+            continue
         if re.search(r"cable\s*input", text):
             scored.append((0, did))
-        elif is_vb_cable_input(name, did):
+        elif re.search(r"voicemeeter input\b", text) and "aux" not in text and "vaio3" not in text:
             scored.append((1, did))
+        elif "aux" in text:
+            scored.append((2, did))
+        elif "vaio3" in text:
+            scored.append((3, did))
+        else:
+            scored.append((4, did))
     scored.sort(key=lambda x: x[0])
     return scored[0][1] if scored else None
 
