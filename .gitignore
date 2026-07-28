@@ -1,1 +1,133 @@
-models/*
+# ---- Local models / caches ----
+models/
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.onnx
+*.safetensors
+torch_cache/
+transformers_cache/
+hf_cache/
+.cache/
+.huggingface/
+.torch/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.venv
+venv
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
+*.manifest
+# PyInstaller / Nuitka generated specs (keep intentional *.spec in repo if added later)
+# *.spec
+
+# ---- Tooling / typecheck / lint / test ----
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.pytype/
+.pyre/
+dmypy.json
+.dmypy.json
+.dmypy.json.*
+
+# ---- App runtime / secrets / local user data ----
+.env
+.env.*
+!.env.example
+*.log
+logs/
+*.sqlite
+*.db
+settings.json
+**/settings.json
+usage_data.json
+**/usage_data.json
+# Local subtitle / transcript archives if written under the repo
+subtitles_*.txt
+archive_*.txt
+
+# ---- Media / scratch audio (tests & captures) ----
+*.webm
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+test*.wav
+microphone-test-*
+
+# ---- Packaging / Nuitka / pyinstaller ----
+*.dist/
+*.build/
+*.onefile-build/
+*.exe
+*.app
+*.dmg
+*.msi
+
+# ---- OS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ---- Editors / agents / local tooling ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+_cursor.md
+.specify/
+.trae/
+.claude/
+.codex/
+agent-transcripts/
+.agent-tools/
+
+# ---- Misc ----
+*.tmp
+*.bak
+*.orig
+*.rej
+.python-version
+.direnv/
+.nvmrc

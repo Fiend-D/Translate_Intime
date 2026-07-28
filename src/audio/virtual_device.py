@@ -2,9 +2,10 @@
 虚拟音频设备管理器 - 跨平台（Windows/Linux）虚拟音频设备管理
 用于将合成语音输出到游戏输入，以及捕获游戏输出声音
 """
-import subprocess
+
 import platform
-from typing import Optional
+import subprocess
+
 from src.utils.logger import logger
 
 OS_NAME = platform.system()
@@ -61,15 +62,20 @@ class VirtualAudioDevice:
                 return True
 
             # 创建 null sink 作为虚拟扬声器
-            self._run("pactl", "load-module", "module-null-sink",
-                      f"sink_name={self.name}_sink",
-                      f"sink_properties=device.description={self.name}_Speaker",
-                      check=True)
+            self._run(
+                "pactl",
+                "load-module",
+                "module-null-sink",
+                f"sink_name={self.name}_sink",
+                f"sink_properties=device.description={self.name}_Speaker",
+                check=True,
+            )
             logger.info(f"已创建虚拟扬声器: {self.name}_sink")
             return True
         except FileNotFoundError:
-            logger.warning("pactl 未安装，跳过虚拟音频设备创建。"
-                           "请运行: sudo apt install pulseaudio-utils")
+            logger.warning(
+                "pactl 未安装，跳过虚拟音频设备创建。请运行: sudo apt install pulseaudio-utils"
+            )
             return False
         except subprocess.CalledProcessError as e:
             logger.error(f"创建虚拟扬声器失败: {e}")
@@ -94,14 +100,14 @@ class VirtualAudioDevice:
             ok = ok and self._linux_create_mic_monitor()
         return ok
 
-    def get_virtual_speaker_name(self) -> Optional[str]:
+    def get_virtual_speaker_name(self) -> str | None:
         """获取虚拟扬声器设备名"""
         if self.is_windows:
             return "CABLE Input (VB-Audio Virtual Cable)"
         else:
             return f"{self.name}_sink"
 
-    def get_virtual_mic_monitor_name(self) -> Optional[str]:
+    def get_virtual_mic_monitor_name(self) -> str | None:
         """获取虚拟扬声器 monitor 源（用于捕获游戏声音）"""
         if self.is_windows:
             return "CABLE Output (VB-Audio Virtual Cable)"

@@ -20,7 +20,7 @@ def main() -> None:
     print("\npip:")
     subprocess.run([sys.executable, "-m", "pip", "-V"], check=False)
 
-    for name in ("funasr", "faster_whisper", "aiohttp", "soundfile"):
+    for name in ("aiohttp", "soundfile", "sounddevice", "PyQt6", "pynput", "protobuf"):
         print(f"\nimport {name}:")
         try:
             module = importlib.import_module(name)

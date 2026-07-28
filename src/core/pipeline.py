@@ -1,713 +1,635 @@
-"""
-双向翻译管道 - 核心调度模块
-协调 ASR -> Translation -> TTS 两条管道并发运行
+"""Volc AST-only translation session orchestrator."""
 
-管道1（出站）: 麦克风 -> ASR(中文) -> 翻译(中->外) -> TTS(外) -> 游戏
-管道2（入站）: 游戏声音 -> ASR(外语) -> 翻译(外->中) -> 字幕显示(+可选TTS)
-"""
-import asyncio
-import os
-import queue
-from dataclasses import dataclass, field
-from typing import Optional, Callable
-import numpy as np
+from __future__ import annotations
 
-from src.utils.config import AppConfig
-from src.utils.logger import logger
-from src.core.asr_engine import ASREngine
-from src.core.translator import TranslationEngine
-from src.core.tts_engine import TTSEngine
-from src.audio.stream import AudioStream
-from src.audio.virtual_device import VirtualAudioDevice
+import contextlib
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from PyQt6.QtCore import QObject, pyqtSignal
+
+from src.core.audio_capture import AudioCapture
+from src.core.audio_player import AudioPlayer
+from src.core.exceptions import EngineLoadError
+from src.core.speech_gate import SpeechGate
+from src.core.volc_engine import VolcASTClient, VolcRuntime, resolve_volc_credentials
+from src.models.config import AppConfigModel
+from src.models.enums import Direction, LanguageCode, SessionStatus
+from src.models.session import TranslationSession
+from src.models.subtitle import SubtitleEntry
+from src.utils.logger import SubtitleLogger, configure_logging, logger
 
 
 @dataclass
-class TranslationResult:
-    """翻译结果"""
-    source_text: str
-    translated_text: str
-    source_lang: str
-    target_lang: str
-    direction: str  # "outbound" | "inbound"
+class DirectionState:
+    """Per-direction subtitle pairing state."""
+
+    direction: Direction
+    source_lang: LanguageCode = LanguageCode.ZH
+    target_lang: LanguageCode = LanguageCode.EN
+    last_text: str = ""
+    last_source: str = ""
+    last_translated: str = ""
 
 
-class TranslationPipeline:
-    """
-    双向翻译管道管理器
-    维护两条独立的 asyncio 管道并发运行
-    """
+class TranslationPipeline(QObject):
+    """Real-time dual-channel translation via Volc AST 2.0 only."""
 
-    def __init__(self, config: AppConfig):
-        self.config = config
+    subtitle_ready = pyqtSignal(SubtitleEntry)
+    status_changed = pyqtSignal(str)
+    engine_status_changed = pyqtSignal(str, str, str)  # direction, engine_type, status
+    latency_reported = pyqtSignal(int)
+    error_occurred = pyqtSignal(str)
+    log_message = pyqtSignal(str)
+    usage_reported = pyqtSignal(str, dict)  # source, usage payload
 
-        # 云端翻译引擎（端到端，替代本地 ASR + 翻译）
-        self._cloud_engine = None          # 出站引擎
-        self._cloud_inbound_engine = None  # 入站引擎
-        self._cloud_engine_type = ""       # "volc" | "aliyun"
 
-        # 判断使用哪种翻译引擎
-        # 优先根据 backend 明确设置选择
-        backend = config.translation.backend.lower()
-        if backend == "hunyuan":
-            cloud_model = "腾讯混元"
-        elif backend == "aliyun":
-            cloud_model = "阿里云(通义千问)"
-        elif backend == "volc":
-            cloud_model = "火山引擎"
-        else:
-            # 没有明确设置时，根据 use_cloud_model 和已有配置推断
-            cloud_model = getattr(config, 'cloud_model', '')
-            if not cloud_model:
-                if config.translation.use_cloud_model and backend == "volc":
-                    cloud_model = "火山引擎"
-                else:
-                    # 检查是否有火山引擎配置
-                    has_volc = bool(
-                        config.translation.volc_app_id
-                        or config.translation.volc_access_token
-                        or os.getenv("VOLC_APP_ID")
-                        or os.getenv("VOLC_ACCESS_TOKEN")
-                        or os.getenv("VOLC_APP_KEY")
-                        or os.getenv("VOLC_API_KEY")
-                    )
-                    # 检查是否有阿里云配置
-                    has_aliyun = bool(
-                        getattr(config, 'aliyun', None) and config.aliyun.api_key
-                        or os.getenv("DASHSCOPE_API_KEY")
-                    )
-                    # 检查是否有腾讯混元配置
-                    has_hunyuan = bool(
-                        config.translation.hunyuan_model_path
-                    )
-                    if has_volc:
-                        cloud_model = "火山引擎"
-                    elif has_aliyun:
-                        cloud_model = "阿里云(通义千问)"
-                    elif has_hunyuan:
-                        cloud_model = "腾讯混元"
-
-        if cloud_model == "腾讯混元":
-            from src.core.hunyuan_engine import HunyuanEngine
-            logger.info("使用腾讯混元 HY-MT1.5-1.8B 本地翻译模型")
-            self._cloud_engine_type = "hunyuan"
-            # 腾讯混元作为纯翻译引擎，与本地 ASR 配合使用
-            self._cloud_engine = HunyuanEngine(config.translation)
-            self._cloud_inbound_engine = HunyuanEngine(config.translation)
-            # 加载本地模型
-            if not self._cloud_engine.load_model():
-                logger.error("腾讯混元模型加载失败，无法启动翻译")
-                self._running = False
-
-        elif cloud_model == "阿里云(通义千问)":
-            from src.core.aliyun_engine import AliyunLiveTranslateEngine
-            logger.info("使用阿里云 Qwen3.5 LiveTranslate 云端模型")
-            self._cloud_engine_type = "aliyun"
-            # 出站引擎：麦克风→外语
-            self._cloud_engine = AliyunLiveTranslateEngine(
-                api_key=getattr(config, 'aliyun', None) and config.aliyun.api_key or os.getenv("DASHSCOPE_API_KEY", ""),
-                enable_audio_output=config.ui.play_outbound_voice,
-                voice=getattr(config, 'aliyun', None) and config.aliyun.voice or "Tina",
-            )
-            # 入站引擎：游戏声音→中文
-            self._cloud_inbound_engine = AliyunLiveTranslateEngine(
-                api_key=getattr(config, 'aliyun', None) and config.aliyun.api_key or os.getenv("DASHSCOPE_API_KEY", ""),
-                enable_audio_output=False,  # 入站不生成音频，由本地TTS控制
-                voice=getattr(config, 'aliyun', None) and config.aliyun.voice or "Tina",
-            )
-            # 设置用量统计回调
-            self._cloud_engine.on_usage_update = self._on_cloud_usage_update
-            self._cloud_inbound_engine.on_usage_update = self._on_cloud_usage_update
-
-        elif cloud_model == "火山引擎" or cloud_model:
-            from src.core.volc_engine import VolcASREngine
-            logger.info("使用火山引擎云端模型")
-            self._cloud_engine_type = "volc"
-            # 出站引擎：麦克风→外语，根据UI配置决定使用s2s(带音频)或s2t(仅文本)
-            outbound_mode = "s2s" if config.ui.play_outbound_voice else "s2t"
-            self._cloud_engine = VolcASREngine(
-                app_id=config.translation.volc_app_id,
-                access_token=config.translation.volc_access_token,
-                mode=outbound_mode,
-                enable_tts=config.ui.play_outbound_voice,
-            )
-            # 入站引擎：游戏声音→中文，s2t模式本身不生成音频，由本地TTS控制
-            self._cloud_inbound_engine = VolcASREngine(
-                app_id=config.translation.volc_app_id,
-                access_token=config.translation.volc_access_token,
-                mode="s2t",
-                enable_tts=False,  # s2t模式不需要音频输出
-            )
-            # 设置用量统计回调
-            self._cloud_engine.on_usage_update = self._on_cloud_usage_update
-            self._cloud_inbound_engine.on_usage_update = self._on_cloud_usage_update
-
-        # ASR 引擎（本地模式）
-        self._asr_zh = ASREngine(config.asr, language=config.asr.source_language)
-        self._asr_foreign = ASREngine(config.asr, language=config.asr.target_language)
-
-        # 翻译引擎（复用）
-        self._translator = TranslationEngine(config.translation)
-
-        # TTS 引擎
-        self._tts = TTSEngine(config.tts)
-
-        # 音频流
-        self._mic_stream: Optional[AudioStream] = None   # 麦克风输入
-        self._game_stream: Optional[AudioStream] = None  # 游戏声音输入
-
-        # 虚拟音频设备
-        self._virtual_device = VirtualAudioDevice()
-
-        # 任务控制
+    def __init__(self, config: AppConfigModel, registry: object | None = None) -> None:
+        # registry kept optional for call-site compatibility; unused (Volc-only).
+        del registry
+        super().__init__()
+        self._config = config
+        self._session = TranslationSession()
+        self._capture_outbound: AudioCapture | None = None
+        self._capture_inbound: AudioCapture | None = None
+        self._player: AudioPlayer | None = None
+        self._directions: dict[Direction, DirectionState] = {}
+        self._subtitle_logger = SubtitleLogger(Path(config.log_dir))
         self._running = False
-        self._tasks: list[asyncio.Task] = []
+        self._outbound_active = False
+        self._inbound_active = False
+        self._play_outbound_voice = False
+        self._play_inbound_voice = False
+        self._volc: VolcRuntime | None = None
+        self._volc_started_at = 0.0
+        self._input_device: int | str | None = None
+        self._output_device: int | str | None = None
+        self._loopback_device: int | str | None = None
+        self._vad_outbound: SpeechGate | None = None
+        self._vad_inbound: SpeechGate | None = None
+        self._vad_diag_at = 0.0
+        self._vad_pass_chunks = 0
+        self._vad_drop_chunks = 0
+        self._ducker = None
 
-        # 火山引擎原文缓存（用于原文+译文同时显示）
-        self._last_source_text = ""  # 入站原文
-        self._last_outbound_source_text = ""  # 出站原文
+        configure_logging(Path(config.log_dir), config.debug_mode)
 
-        # 回调
-        self._on_subtitle: Optional[Callable[[TranslationResult], None]] = None
-        self._on_outbound: Optional[Callable[[TranslationResult], None]] = None
-        self._on_asr_text: Optional[Callable[[str, str], None]] = None  # (text, direction)
-        self._on_status: Optional[Callable[[str], None]] = None  # 状态文字
+    @property
+    def mode(self) -> str:
+        return "volc"
 
-    def on_subtitle(self, callback: Callable[[TranslationResult], None]) -> None:
-        """注册字幕显示回调（入站翻译结果）"""
-        self._on_subtitle = callback
+    def is_channel_active(self, direction: Direction) -> bool:
+        if direction == Direction.OUTBOUND:
+            return self._outbound_active
+        return self._inbound_active
 
-    def on_outbound(self, callback: Callable[[TranslationResult], None]) -> None:
-        """注册出站翻译结果回调"""
-        self._on_outbound = callback
+    def active_channels(self) -> list[Direction]:
+        channels: list[Direction] = []
+        if self._outbound_active:
+            channels.append(Direction.OUTBOUND)
+        if self._inbound_active:
+            channels.append(Direction.INBOUND)
+        return channels
 
-    def on_asr_text(self, callback: Callable[[str, str], None]) -> None:
-        """注册 ASR 原文回调（text, direction），翻译前立即触发"""
-        self._on_asr_text = callback
+    def has_volc_credentials(self) -> bool:
+        key, token, auth = resolve_volc_credentials(
+            self._config.volc_api_key,
+            self._config.volc_access_token,
+        )
+        if not key:
+            return False
+        if auth == "legacy":
+            return bool(token)
+        return True
 
-    def on_status(self, callback: Callable[[str], None]) -> None:
-        """注册状态更新回调"""
-        self._on_status = callback
+    # Backward-compatible alias used by GUI
+    def wants_volc(self) -> bool:
+        return self.has_volc_credentials()
 
-    def _on_cloud_usage_update(self, usage: dict) -> None:
-        """处理云端引擎用量更新"""
-        try:
-            volc_usage = self.config.volc_usage
-            
-            # 更新输入token
-            if 'input_tokens' in usage:
-                volc_usage.total_input_tokens += usage['input_tokens']
-            
-            # 更新输出文本token
-            if 'output_tokens' in usage:
-                volc_usage.total_output_text_tokens += usage['output_tokens']
-            
-            # 更新输出音频token
-            if 'output_audio_tokens' in usage:
-                volc_usage.total_output_audio_tokens += usage['output_audio_tokens']
-            
-            # 更新总费用
-            volc_usage.total_cost = volc_usage.estimated_cost
-            
-            logger.debug(
-                f"云端引擎用量更新: 输入={volc_usage.total_input_tokens}, "
-                f"输出文本={volc_usage.total_output_text_tokens}, "
-                f"输出音频={volc_usage.total_output_audio_tokens}, "
-                f"费用={volc_usage.total_cost:.2f}元"
+    def start(
+        self,
+        outbound: bool = True,
+        inbound: bool = True,
+        input_device: int | str | None = None,
+        output_device: int | str | None = None,
+        loopback_device: int | str | None = None,
+        play_outbound_voice: bool = False,
+        play_inbound_voice: bool = False,
+        force_local: bool = False,
+    ) -> None:
+        del force_local  # local path removed
+        self._input_device = input_device
+        self._output_device = output_device
+        self._loopback_device = loopback_device
+        self._play_outbound_voice = play_outbound_voice
+        self._play_inbound_voice = play_inbound_voice
+
+        if outbound and not self._outbound_active:
+            self.start_channel(Direction.OUTBOUND, play_voice=play_outbound_voice)
+        if inbound and not self._inbound_active:
+            self.start_channel(Direction.INBOUND, play_voice=play_inbound_voice)
+
+    def start_channel(
+        self,
+        direction: Direction,
+        *,
+        play_voice: bool | None = None,
+        force_local: bool = False,
+    ) -> None:
+        del force_local
+        if direction == Direction.OUTBOUND and self._outbound_active:
+            return
+        if direction == Direction.INBOUND and self._inbound_active:
+            return
+
+        opening_session = not self._outbound_active and not self._inbound_active
+
+        if play_voice is not None:
+            if direction == Direction.OUTBOUND:
+                self._play_outbound_voice = play_voice
+            else:
+                self._play_inbound_voice = play_voice
+
+        if direction == Direction.OUTBOUND:
+            self._directions.setdefault(
+                Direction.OUTBOUND,
+                DirectionState(
+                    direction=Direction.OUTBOUND,
+                    source_lang=LanguageCode(self._config.source_language),
+                    target_lang=LanguageCode(self._config.target_language),
+                ),
             )
-        except Exception as e:
-            logger.debug(f"用量更新失败: {e}")
-
-    async def initialize(self) -> None:
-        """初始化所有引擎和设备"""
-        logger.info("初始化翻译管道...")
-
-        # 设置虚拟音频设备（存在则创建，不存在则跳过）
-        self._virtual_device.setup_full()
-
-        if self._cloud_engine and self._cloud_engine.is_available and self._cloud_engine_type != "hunyuan":
-            logger.info(f"{self._cloud_engine_type} 云端引擎可用，跳过本地 ASR 模型加载")
         else:
-            await self._ensure_asr_models_loaded()
-
-        # TTS 输出设备：仅当用户明确配置时才指定，否则系统默认
-        tts_device = self.config.audio.output_device
-        if tts_device is not None:
-            self._tts.set_output_device(tts_device)
-            logger.info(f"TTS输出: 指定设备 ID={tts_device}")
-        else:
-            logger.info("TTS输出: 系统默认扬声器")
-
-        logger.info("翻译管道初始化完成")
-
-    async def _ensure_asr_models_loaded(self) -> None:
-        """仅检测本地 ASR 模型是否已加载，不自动下载。"""
-        if getattr(self, "_asr_models_loaded", False):
-            return
-
-        # 仅尝试加载已存在的本地模型
-        logger.info(f"检测本地 ASR 模型（backend={self.config.asr.backend}）...")
-        ok = self._asr_zh.load_model()
-        if not ok:
-            logger.error(
-                "本地ASR模型未找到！请先手动下载模型:\n"
-                "  FunASR: python -m pip install -U git+https://github.com/modelscope/FunASR.git\n"
-                "  Whisper: python -c \"from modelscope import snapshot_download; "
-                "snapshot_download('systran/faster-whisper-small', cache_dir='./models')\"\n"
-                "并将模型放置于 ./models 目录下"
+            self._directions.setdefault(
+                Direction.INBOUND,
+                DirectionState(
+                    direction=Direction.INBOUND,
+                    source_lang=LanguageCode(self._config.target_language),
+                    target_lang=LanguageCode(self._config.source_language),
+                ),
             )
-            # 停止翻译流程
-            self._running = False
-            if self._on_status:
-                self._on_status("错误: 未找到本地模型且未启用云端模型")
-            return
+
+        if not self.has_volc_credentials():
+            raise EngineLoadError("请先填写火山 API Key（当前仅支持火山同传）。")
+
+        label = "麦克风" if direction == Direction.OUTBOUND else "游戏字幕"
+        self.log_message.emit(f"正在连接火山同传（{label}）…")
+        if not self._ensure_volc_channel(direction):
+            raise EngineLoadError(f"火山同传连接失败（{label}）。请检查 API Key / 网络。")
+
+        if opening_session:
+            path = self._subtitle_logger.begin_session()
+            self.log_message.emit(f"翻译留档：{path}")
+
+        self.log_message.emit(f"火山同传已就绪（{label}）")
+
+        if direction == Direction.OUTBOUND:
+            self._vad_outbound = self._make_vad("mic")
+            self._capture_outbound = AudioCapture(
+                Direction.OUTBOUND,
+                self._input_device,
+                sample_rate=16000,
+                channels=1,
+            )
+            self._capture_outbound.on_pcm = lambda pcm: self._volc_direct_pcm("outbound", pcm)
+            self._capture_outbound.start()
+            self._outbound_active = True
         else:
-            # 外语 ASR 复用同一模型缓存
-            if not self._asr_foreign.share_model_from(self._asr_zh):
-                self._asr_foreign.load_model()
-            self._asr_models_loaded = True
+            loopback = self._resolve_loopback_device()
+            self._loopback_device = loopback
+            self._vad_inbound = self._make_vad("game")
+            self._capture_inbound = AudioCapture(
+                Direction.INBOUND,
+                loopback,
+                sample_rate=16000,
+                channels=1,
+            )
+            self._capture_inbound.on_pcm = lambda pcm: self._volc_direct_pcm("inbound", pcm)
+            self._capture_inbound.start()
+            self._inbound_active = True
+            self.log_message.emit(f"游戏声音捕获设备：{loopback!r}")
 
-    async def start(self) -> None:
-        """启动双向翻译管道"""
-        if self._running:
-            return
+        want_player = self._play_outbound_voice or self._play_inbound_voice
+        if want_player and self._player is None:
+            self._player = AudioPlayer(self._output_device)
+            self._player.start()
 
+        was_running = self._running
         self._running = True
-
-        # 麦克风输入
-        self._mic_stream = AudioStream(
-            device=self.config.audio.input_device,
-            sample_rate=self.config.audio.sample_rate,
-            channels=self.config.audio.channels,
-        )
-        try:
-            self._mic_stream.open_input()
-        except Exception as e:
-            logger.warning(f"麦克风打开失败 (device={self.config.audio.input_device}): {e}")
-            logger.info("使用系统默认麦克风")
-            self._mic_stream.device = None
-            self._mic_stream.open_input()
-
-        # 游戏声音捕获 — 仅当用户明确配置了设备才启用
-        self._game_stream = None
-        if self.config.audio.game_output_device is not None:
-            self._game_stream = AudioStream(
-                device=self.config.audio.game_output_device,
-                sample_rate=self.config.audio.sample_rate,
-                channels=self.config.audio.channels,
+        self._volc_started_at = time.time()
+        if not was_running:
+            self._session = TranslationSession(
+                outbound_enabled=self._outbound_active,
+                inbound_enabled=self._inbound_active,
+                source_language=LanguageCode(self._config.source_language),
+                target_language=LanguageCode(self._config.target_language),
             )
-            try:
-                self._game_stream.open_input()
-                logger.info("游戏声音捕获已开启")
-            except Exception as e:
-                logger.warning(f"游戏声音捕获设备打开失败: {e}")
-                self._game_stream.close()
-                self._game_stream = None
-        else:
-            logger.info("未配置游戏声音捕获设备，仅启用出站翻译（你说→外）")
+            with contextlib.suppress(ValueError):
+                self._session.transition(SessionStatus.STARTING)
+            with contextlib.suppress(ValueError):
+                self._session.transition(SessionStatus.RUNNING)
+            self.status_changed.emit("running")
 
-        # 启动并发任务
-        if self._cloud_engine_type == "hunyuan" and self._cloud_engine and self._cloud_engine.is_available:
-            # 腾讯混元：本地 ASR + 本地翻译模型
-            self._tasks = [
-                asyncio.create_task(self._outbound_loop(), name="outbound"),
-            ]
-            if self._game_stream is not None:
-                self._tasks.append(
-                    asyncio.create_task(self._inbound_loop(), name="inbound")
-                )
-                logger.info("✅ 腾讯混元本地翻译双向管道已启动（出站 + 入站）")
-            else:
-                logger.info("✅ 腾讯混元本地翻译管道已启动（出站）")
-        elif self._cloud_engine and self._cloud_engine.is_available:
-            self._tasks = [
-                asyncio.create_task(self._cloud_outbound_loop(), name="cloud-outbound"),
-            ]
-            if self._game_stream is not None and self._cloud_inbound_engine:
-                self._tasks.append(
-                    asyncio.create_task(self._cloud_inbound_loop(), name="cloud-inbound")
-                )
-                logger.info(f"✅ {self._cloud_engine_type} 云端双向管道已启动（出站 + 系统音频入站）")
-            else:
-                logger.info(f"✅ {self._cloud_engine_type} 云端管道已启动（端到端语音翻译）")
-        else:
-            self._tasks = [
-                asyncio.create_task(self._outbound_loop(), name="outbound"),
-            ]
-            if self._game_stream is not None:
-                self._tasks.append(
-                    asyncio.create_task(self._inbound_loop(), name="inbound")
-                )
-                logger.info("✅ 双向翻译管道已启动（出站 + 入站）")
-            else:
-                logger.info("✅ 出站翻译管道已启动（你说→外语）")
+        logger.info(f"Channel started: {direction.value} mode=volc")
+        self.log_message.emit(f"{label}通道已启动 · volc")
+        if direction == Direction.OUTBOUND and self._vad_outbound is not None:
+            sens = getattr(self._config, "vad_sensitivity", "medium") or "medium"
+            preset = getattr(self._config, "quality_preset", "balanced") or "balanced"
+            self.log_message.emit(f"麦克风 VAD 已启用（{sens} · 档位 {preset}）")
+        elif direction == Direction.INBOUND and self._vad_inbound is not None:
+            sens = getattr(self._config, "vad_sensitivity", "medium") or "medium"
+            preset = getattr(self._config, "quality_preset", "balanced") or "balanced"
+            self.log_message.emit(f"游戏字幕 VAD 已启用（{sens} · 档位 {preset}）")
+        elif direction == Direction.INBOUND:
+            self.log_message.emit("游戏字幕 VAD 已关闭（视频/游戏人声更完整）")
 
-    async def stop(self) -> None:
-        """停止管道"""
+        if (
+            (direction == Direction.OUTBOUND and self._play_outbound_voice)
+            or (direction == Direction.INBOUND and self._play_inbound_voice)
+        ):
+            self._ensure_ducker()
+            self._refresh_ducker_config()
+
+    @property
+    def subtitle_log_path(self):
+        return self._subtitle_logger.get_recent_path()
+
+    def log_typed_translation(self, original: str, translated: str) -> None:
+        self._subtitle_logger.log_typed(original, translated)
+
+    def _resolve_loopback_device(self) -> int | str:
+        """Never fall back to the default mic for game capture — resolve a real loopback."""
+        try:
+            from src.audio.device_guard import resolve_capture_backend
+            from src.audio.stream import list_audio_devices
+
+            devices = list_audio_devices()
+            inputs = [
+                {"name": d.get("name", ""), "index": d.get("id")}
+                for d in devices.get("input", [])
+            ]
+            backend = getattr(self._config, "capture_backend", "auto") or "auto"
+            picked = resolve_capture_backend(
+                str(backend),
+                configured=self._loopback_device,
+                devices=inputs,
+            )
+            if picked is not None:
+                if self._loopback_device in (None, ""):
+                    self.log_message.emit(
+                        "未指定游戏声音来源，已自动选择系统捕获"
+                        + ("（免驱动）" if str(picked).startswith("wasapi_proc_exclude:") else "")
+                    )
+                return picked
+        except Exception as exc:
+            logger.warning(f"Auto-select loopback failed: {exc}")
+        raise EngineLoadError(
+            "未找到可用的系统声音捕获（Loopback / monitor）。\n"
+            "请打开「高级」，在「游戏声音」里手动选择正在播放视频的扬声器/耳机 Loopback。"
+        )
+
+    def _make_vad(self, profile: str) -> SpeechGate | None:
+        if profile == "game":
+            if not bool(getattr(self._config, "vad_game_enabled", False)):
+                return None
+        elif not bool(getattr(self._config, "vad_enabled", True)):
+            return None
+        sens = getattr(self._config, "vad_sensitivity", "medium") or "medium"
+        open_ms = int(getattr(self._config, "vad_open_ms", 80) or 80)
+        hangover_ms = int(getattr(self._config, "vad_hangover_ms", 600) or 600)
+        return SpeechGate(
+            profile=profile,
+            sensitivity=str(sens),
+            sample_rate=16000,
+            open_ms=open_ms,
+            hangover_ms=hangover_ms,
+        )
+
+    def _ensure_ducker(self) -> None:
+        if self._ducker is not None:
+            return
+        from src.audio.session_ducker import SessionDucker
+
+        mode = getattr(self._config, "original_audio", "duck") or "duck"
+        gain = float(getattr(self._config, "duck_gain", 0.2) or 0.2)
+        self._ducker = SessionDucker(mode=mode, duck_gain=gain)
+
+    def _refresh_ducker_config(self) -> None:
+        if self._ducker is None:
+            return
+        mode = getattr(self._config, "original_audio", "duck") or "duck"
+        gain = float(getattr(self._config, "duck_gain", 0.2) or 0.2)
+        self._ducker.configure(mode=mode, duck_gain=gain)
+
+    def stop_channel(self, direction: Direction) -> None:
+        if direction == Direction.OUTBOUND and not self._outbound_active:
+            return
+        if direction == Direction.INBOUND and not self._inbound_active:
+            return
+
+        name = "outbound" if direction == Direction.OUTBOUND else "inbound"
+        if self._volc is not None:
+            with contextlib.suppress(Exception):
+                self._volc.disconnect_client(name)
+            if not self._volc.clients:
+                with contextlib.suppress(Exception):
+                    self._volc.stop()
+                self._volc = None
+
+        if direction == Direction.OUTBOUND:
+            if self._capture_outbound is not None:
+                with contextlib.suppress(Exception):
+                    self._capture_outbound.stop()
+                self._capture_outbound = None
+            self._vad_outbound = None
+            self._outbound_active = False
+            self._play_outbound_voice = False
+        else:
+            if self._capture_inbound is not None:
+                with contextlib.suppress(Exception):
+                    self._capture_inbound.stop()
+                self._capture_inbound = None
+            self._vad_inbound = None
+            self._inbound_active = False
+            self._play_inbound_voice = False
+
+        dp = self._directions.get(direction)
+        if dp is not None:
+            dp.last_text = ""
+            dp.last_source = ""
+            dp.last_translated = ""
+
+        other_wants = (
+            (self._outbound_active and self._play_outbound_voice)
+            or (self._inbound_active and self._play_inbound_voice)
+        )
+        if self._player is not None and not other_wants:
+            with contextlib.suppress(Exception):
+                self._player.stop()
+            self._player = None
+
+        label = "麦克风" if direction == Direction.OUTBOUND else "游戏字幕"
+        self.log_message.emit(f"{label}通道已停止")
+        logger.info(f"Channel stopped: {direction.value}")
+
+        if not self._outbound_active and not self._inbound_active:
+            self._running = False
+            if self._ducker is not None:
+                with contextlib.suppress(Exception):
+                    self._ducker.close()
+                self._ducker = None
+            with contextlib.suppress(ValueError):
+                self._session.transition(SessionStatus.STOPPED)
+            self.status_changed.emit("stopped")
+        else:
+            self.status_changed.emit("running")
+
+    def _ensure_volc_channel(self, direction: Direction) -> bool:
+        api_key, access_token, auth = resolve_volc_credentials(
+            self._config.volc_api_key,
+            self._config.volc_access_token,
+        )
+        if not api_key:
+            return False
+
+        logger.info(f"Volc auth mode={auth}, key_len={len(api_key)} channel={direction.value}")
+        if self._volc is None:
+            self._volc = VolcRuntime()
+
+        src = self._config.source_language
+        tgt = self._config.target_language
+        name = "outbound" if direction == Direction.OUTBOUND else "inbound"
+        speaker_id = getattr(self._config, "volc_speaker_id", "") or ""
+        speech_rate = int(getattr(self._config, "volc_speech_rate", 0) or 0)
+        hotwords = list(getattr(self._config, "hotwords", None) or [])
+        glossary = dict(getattr(self._config, "glossary", None) or {})
+
+        if name in self._volc.clients:
+            return True
+
+        try:
+            rotate_m = int(getattr(self._config, "volc_session_rotate_minutes", 12) or 0)
+
+            def _defer_rotate(gate_name: str = name) -> bool:
+                gate = (
+                    self._vad_outbound
+                    if gate_name == "outbound"
+                    else self._vad_inbound
+                )
+                return bool(gate is not None and gate.is_open)
+
+            common_kw = dict(
+                api_key=api_key,
+                access_token=access_token,
+                speech_rate=speech_rate,
+                hotwords=hotwords,
+                glossary=glossary,
+                on_error=self._on_volc_error,
+                on_status=lambda msg: self.log_message.emit(msg),
+                on_usage=lambda payload, src=name: self.usage_reported.emit(src, payload),
+                session_rotate_minutes=rotate_m,
+                should_defer_rotate=_defer_rotate,
+            )
+            if direction == Direction.OUTBOUND:
+                mode = "s2s" if self._play_outbound_voice else "s2t"
+                client = VolcASTClient(
+                    **common_kw,
+                    source_language=src,
+                    target_language=tgt,
+                    mode=mode,  # type: ignore[arg-type]
+                    speaker_id=speaker_id if mode == "s2s" else "",
+                    on_source_text=lambda text, final, d=Direction.OUTBOUND: self._on_volc_source(
+                        d, text, final
+                    ),
+                    on_translated_text=lambda text, final, d=Direction.OUTBOUND: self._on_volc_translated(
+                        d, text, final
+                    ),
+                    on_audio=lambda data: self._on_volc_audio(Direction.OUTBOUND, data),
+                )
+            else:
+                mode = "s2s" if self._play_inbound_voice else "s2t"
+                client = VolcASTClient(
+                    **common_kw,
+                    source_language=tgt,
+                    target_language=src,
+                    mode=mode,  # type: ignore[arg-type]
+                    speaker_id=speaker_id if mode == "s2s" else "",
+                    on_source_text=lambda text, final, d=Direction.INBOUND: self._on_volc_source(
+                        d, text, final
+                    ),
+                    on_translated_text=lambda text, final, d=Direction.INBOUND: self._on_volc_translated(
+                        d, text, final
+                    ),
+                    on_audio=lambda data: self._on_volc_audio(Direction.INBOUND, data),
+                )
+
+            if hotwords or glossary:
+                self.log_message.emit(
+                    f"热词 {len(hotwords)} 条 / 术语 {len(glossary)} 条已加载"
+                )
+            if speech_rate:
+                self.log_message.emit(f"同传语速: {speech_rate}")
+
+            if mode == "s2s":
+                voice_label = speaker_id or "原音色复刻"
+                self.log_message.emit(f"火山语音输出音色: {voice_label}")
+
+            if self._volc.connect_client(name, client):
+                self.engine_status_changed.emit(direction.value, "volc", "ready")
+                return True
+            self.engine_status_changed.emit(direction.value, "volc", "error")
+            return False
+        except Exception as exc:
+            logger.error(f"Volc channel start failed ({direction.value}): {exc}")
+            self.log_message.emit(f"火山启动异常: {exc}")
+            return False
+
+    def stop(self) -> None:
+        if self._outbound_active:
+            self.stop_channel(Direction.OUTBOUND)
+        if self._inbound_active:
+            self.stop_channel(Direction.INBOUND)
         self._running = False
+        if self._volc is not None:
+            with contextlib.suppress(Exception):
+                self._volc.stop()
+            self._volc = None
+        if self._capture_outbound is not None:
+            with contextlib.suppress(Exception):
+                self._capture_outbound.stop()
+            self._capture_outbound = None
+        if self._capture_inbound is not None:
+            with contextlib.suppress(Exception):
+                self._capture_inbound.stop()
+            self._capture_inbound = None
+        if self._player is not None:
+            with contextlib.suppress(Exception):
+                self._player.stop()
+            self._player = None
+        self._outbound_active = False
+        self._inbound_active = False
+        with contextlib.suppress(ValueError):
+            self._session.transition(SessionStatus.STOPPED)
+        self.status_changed.emit("stopped")
+        logger.info("Translation session stopped")
 
-        for task in self._tasks:
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
-
-        if self._mic_stream:
-            self._mic_stream.close()
-        if self._game_stream:
-            self._game_stream.close()
-
-        logger.info("翻译管道已停止")
-
-    # ---- 火山引擎管道（端到端） ----
-
-    async def _cloud_outbound_loop(self) -> None:
-        """
-        云端引擎出站：麦克风 → WebSocket → 识别+翻译+TTS
-        单条连接完成全部，延迟最低
-        """
-        if not self._cloud_engine:
+    def _on_volc_source(self, direction: Direction, text: str, is_final: bool) -> None:
+        del is_final
+        if not text.strip():
             return
-
-        logger.info(f"{self._cloud_engine_type} 云端出站管道启动")
-        
-        # 连接
-        ok = await self._cloud_engine.connect(
-            self.config.translation.source_lang,
-            self.config.translation.target_lang,
-        )
-        if not ok:
-            logger.error(f"{self._cloud_engine_type} 连接失败，回退本地模式")
-            await self._ensure_asr_models_loaded()
-            await self._outbound_loop()
+        dp = self._directions.get(direction)
+        if dp is None:
             return
+        dp.last_source = text.strip()
+        self._emit_volc_subtitle(direction, is_final=False)
 
-        # 保存最新原文，用于和译文一起显示
-        self._last_outbound_source_text = ""
-
-        def on_source(text: str):
-            self._last_outbound_source_text = text
-            if self._on_asr_text:
-                self._on_asr_text(text, "outbound")
-            if self._on_status:
-                self._on_status("翻译中...")
-
-        self._cloud_engine.on_source_text = on_source
-        
-        def on_translated(translated: str):
-            # 构建结果
-            result = TranslationResult(
-                source_text=self._last_outbound_source_text,
-                translated_text=translated,
-                source_lang=self.config.translation.source_lang,
-                target_lang=self.config.translation.target_lang,
-                direction="outbound",
-            )
-            if self._on_outbound:
-                self._on_outbound(result)
-            if self._on_status:
-                self._on_status("🎙 监听中")
-            # 清空已使用的原文
-            self._last_outbound_source_text = ""
-        
-        self._cloud_engine.on_translated_text = on_translated
-
-        # 接收循环（后台）
-        recv_task = asyncio.create_task(self._cloud_engine.recv_loop())
-
-        # 发送循环：持续发送 PCM 音频
-        try:
-            while self._running:
-                chunk = self._mic_stream.read_chunk() if self._mic_stream else None
-                if chunk is None:
-                    await asyncio.sleep(0.005)
-                    continue
-                
-                # 噪声门
-                chunk[np.abs(chunk) < self.config.asr.noise_gate_threshold] = 0
-                
-                await self._cloud_engine.send_audio(chunk)
-                await asyncio.sleep(0.005)
-                
-        except asyncio.CancelledError:
-            pass
-        finally:
-            recv_task.cancel()
-            await self._cloud_engine.stop()
-
-    async def _cloud_inbound_loop(self) -> None:
-        """
-        云端引擎入站：系统/游戏声音 -> WebSocket -> 原文+译文字幕
-        """
-        if not self._cloud_inbound_engine:
+    def _on_volc_translated(self, direction: Direction, text: str, is_final: bool) -> None:
+        if not text.strip():
             return
-
-        logger.info(f"{self._cloud_engine_type} 云端入站管道启动（系统音频→字幕）")
-
-        ok = await self._cloud_inbound_engine.connect(
-            self.config.translation.target_lang,
-            self.config.translation.source_lang,
-        )
-        if not ok:
-            logger.error(f"{self._cloud_engine_type} 入站连接失败，回退本地入站模式")
-            await self._ensure_asr_models_loaded()
-            await self._inbound_loop()
+        dp = self._directions.get(direction)
+        if dp is None:
             return
+        dp.last_translated = text.strip()
+        self._emit_volc_subtitle(direction, is_final=is_final)
 
-        # 保存最新原文，用于和译文一起显示
-        self._last_source_text = ""
-
-        def on_source(text: str):
-            self._last_source_text = text
-            if self._on_asr_text:
-                self._on_asr_text(text, "inbound")
-
-        self._cloud_inbound_engine.on_source_text = on_source
-
-        def on_translated(translated: str):
-            result = TranslationResult(
-                source_text=self._last_source_text,
-                translated_text=translated,
-                source_lang=self.config.translation.target_lang,
-                target_lang=self.config.translation.source_lang,
-                direction="inbound",
-            )
-            if self._on_subtitle:
-                self._on_subtitle(result)
-            if self._on_status:
-                self._on_status("🎙 监听中")
-            # 可选：本地TTS播放中文语音（云端s2t模式不返回音频）
-            if self.config.ui.play_chinese_voice:
-                asyncio.create_task(self._tts.synthesize_and_play(translated, is_target=False))
-            # 清空已使用的原文
-            self._last_source_text = ""
-
-        self._cloud_inbound_engine.on_translated_text = on_translated
-
-        recv_task = asyncio.create_task(self._cloud_inbound_engine.recv_loop())
-
+    def _emit_volc_subtitle(self, direction: Direction, *, is_final: bool = True) -> None:
+        dp = self._directions.get(direction)
+        if dp is None:
+            return
+        original = (dp.last_source or "").strip()
+        translated = (dp.last_translated or "").strip()
+        if not original and not translated:
+            return
+        pair = f"{original}||{translated}||{int(is_final)}"
+        if pair == dp.last_text:
+            return
+        dp.last_text = pair
         try:
-            while self._running:
-                chunk = self._game_stream.read_chunk() if self._game_stream else None
-                if chunk is None:
-                    await asyncio.sleep(0.005)
-                    continue
-
-                chunk[np.abs(chunk) < self.config.asr.noise_gate_threshold] = 0
-                await self._cloud_inbound_engine.send_audio(chunk)
-                await asyncio.sleep(0.005)
-
-        except asyncio.CancelledError:
-            pass
-        finally:
-            recv_task.cancel()
-            await self._cloud_inbound_engine.stop()
-
-    # ---- 本地出站管道 ----
-
-    async def _outbound_loop(self) -> None:
-        """本地出站翻译循环：麦克风 -> ASR -> 翻译 -> TTS。"""
-        logger.info("出站管道(中->外) 启动")
-        silence_counter = 0
-        had_voice = False
-
-        while self._running:
-            try:
-                # 1. 读取麦克风音频
-                chunk = self._mic_stream.read_chunk() if self._mic_stream else None
-                if chunk is None:
-                    await asyncio.sleep(0.005)
-                    continue
-
-                # 语音活动检测
-                energy = np.sqrt(np.mean(chunk ** 2))
-                if energy < 0.005:  # 静音阈值（降低以提高灵敏度）
-                    silence_counter += 1
-                    if had_voice and silence_counter > 15:  # 0.15s静音后触发识别（加速）
-                        text = self._asr_zh.transcribe()
-                        if text:
-                            await self._process_outbound(text)
-                        silence_counter = 0
-                        had_voice = False
-                    await asyncio.sleep(0.005)
-                    continue
-
-                # 噪声门：低于阈值的音频归零
-                noise_gate = self.config.asr.noise_gate_threshold
-                chunk[np.abs(chunk) < noise_gate] = 0
-
-                silence_counter = 0
-                had_voice = True
-                self._asr_zh.feed_audio(chunk)
-
-                # 2. 默认等静音断句后识别；长时间连续语音才兜底切分
-                if self._asr_zh.should_force_flush():
-                    text = self._asr_zh.transcribe()
-                    if text:
-                        await self._process_outbound(text)
-                    had_voice = False
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"出站管道异常: {e}")
-                await asyncio.sleep(0.1)
-
-    async def _process_outbound(self, text: str) -> None:
-        """处理出站翻译：中文 -> 外语 -> TTS"""
-        # 立即显示 ASR 原文
-        if self._on_asr_text:
-            self._on_asr_text(text, "outbound")
-        if self._on_status:
-            self._on_status("翻译中...")
-
-        try:
-            if self._cloud_engine_type == "hunyuan" and self._cloud_engine:
-                translated = self._cloud_engine.translate(
-                    text,
-                    source_lang=self.config.translation.source_lang,
-                    target_lang=self.config.translation.target_lang,
-                )
-                if translated is None:
-                    if self._on_status:
-                        self._on_status("翻译失败: 模型未加载")
-                    return
-            else:
-                translated = await self._translator.translate(
-                    text,
-                    source_lang=self.config.translation.source_lang,
-                    target_lang=self.config.translation.target_lang,
-                )
-
-            result = TranslationResult(
-                source_text=text,
-                translated_text=translated,
-                source_lang=self.config.translation.source_lang,
-                target_lang=self.config.translation.target_lang,
-                direction="outbound",
+            entry = SubtitleEntry(
+                direction=direction,
+                original_text=original or "…",
+                translated_text=translated or "…",
+                is_final=is_final,
             )
+        except ValueError:
+            return
+        self.subtitle_ready.emit(entry)
+        if is_final:
+            self._subtitle_logger.log(entry)
+            latency_ms = int((time.time() - self._volc_started_at) * 1000) % 100000
+            self.latency_reported.emit(min(latency_ms, 9999) if latency_ms > 0 else 0)
+            dp.last_source = ""
+            dp.last_translated = ""
 
-            if self._on_outbound:
-                self._on_outbound(result)
-            if self._on_status:
-                self._on_status("监听中")
-
-            # TTS合成并输出
-            await self._tts.synthesize_and_play(translated, is_target=True)
-
-        except Exception as e:
-            err = str(e).lower()
-            if "cuda" in err or "显存" in str(e) or "memory" in err:
-                status = "翻译失败: 显存/内存不足"
-            elif "timeout" in err or "超时" in str(e):
-                status = "翻译失败: 处理超时"
-            else:
-                status = f"翻译失败: {str(e)[:40]}"
-            logger.error(f"出站处理失败: {e}")
-            if self._on_status:
-                self._on_status(status)
-
-    # ---- 入站管道：外语 -> 中文 ----
-
-    async def _inbound_loop(self) -> None:
-        """
-        入站翻译循环
-        游戏声音 -> ASR(外语) -> 翻译(外->中) -> 字幕显示 + 可选中文TTS
-        """
-        logger.info("入站管道(外->中) 启动")
-        silence_counter = 0
-        last_level_log = 0.0
-        had_voice = False
-
-        while self._running:
-            try:
-                chunk = self._game_stream.read_chunk() if self._game_stream else None
-                if chunk is None:
-                    await asyncio.sleep(0.005)
-                    continue
-
-                energy = np.sqrt(np.mean(chunk ** 2))
-                now = asyncio.get_running_loop().time()
-                if now - last_level_log >= 5.0:
-                    logger.debug(f"系统音频输入电平 rms={energy:.5f}")
-                    last_level_log = now
-                if energy < 0.005:
-                    silence_counter += 1
-                    if had_voice and silence_counter > 15:
-                        text = self._asr_foreign.transcribe()
-                        if text:
-                            await self._process_inbound(text)
-                        silence_counter = 0
-                        had_voice = False
-                    await asyncio.sleep(0.005)
-                    continue
-
-                silence_counter = 0
-                had_voice = True
-                chunk[np.abs(chunk) < self.config.asr.noise_gate_threshold] = 0
-                self._asr_foreign.feed_audio(chunk)
-                if self._asr_foreign.should_force_flush():
-                    text = self._asr_foreign.transcribe()
-                    if text:
-                        await self._process_inbound(text)
-                    had_voice = False
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"入站管道异常: {e}")
-                await asyncio.sleep(0.1)
-
-    async def _process_inbound(self, text: str) -> None:
-        """处理入站翻译：外语 -> 中文 -> 字幕 + 可选TTS"""
-        # 立即显示 ASR 原文
-        if self._on_asr_text:
-            self._on_asr_text(text, "inbound")
-        if self._on_status:
-            self._on_status("翻译中...")
-
+    def _on_volc_audio(self, direction: Direction, data: bytes) -> None:
+        if not data:
+            return
+        if direction == Direction.OUTBOUND and not self._play_outbound_voice:
+            return
+        if direction == Direction.INBOUND and not self._play_inbound_voice:
+            return
+        if self._ducker is not None:
+            with contextlib.suppress(Exception):
+                self._ducker.pulse()
         try:
-            if self._cloud_engine_type == "hunyuan" and self._cloud_engine:
-                translated = self._cloud_engine.translate(
-                    text,
-                    source_lang=self.config.translation.target_lang,
-                    target_lang=self.config.translation.source_lang,
-                )
-                if translated is None:
-                    if self._on_status:
-                        self._on_status("翻译失败: 模型未加载")
-                    return
-            else:
-                translated = await self._translator.translate(
-                    text,
-                    source_lang=self.config.translation.target_lang,
-                    target_lang=self.config.translation.source_lang,
-                )
+            import numpy as np
+            import sounddevice as sd
 
-            result = TranslationResult(
-                source_text=text,
-                translated_text=translated,
-                source_lang=self.config.translation.target_lang,
-                target_lang=self.config.translation.source_lang,
-                direction="inbound",
-            )
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            device = self._player.device_id if self._player is not None else None
+            sd.play(samples, samplerate=16000, device=device, blocking=False)
+        except Exception as exc:
+            logger.debug(f"Volc TTS playback failed: {exc}")
+            if self._player is not None:
+                self._player.play(data)
 
-            if self._on_subtitle:
-                self._on_subtitle(result)
-            if self._on_status:
-                self._on_status("监听中")
+    def _on_volc_error(self, message: str) -> None:
+        self.log_message.emit(message)
+        self.error_occurred.emit(message)
 
-            # 可选：播放中文语音播报
-            if self.config.ui.play_chinese_voice:
-                await self._tts.synthesize_and_play(translated, is_target=False)
+    def process_tick(self) -> None:
+        """Volc uses direct PCM; tick kept as a lightweight no-op hook."""
+        return
 
-        except Exception as e:
-            err = str(e).lower()
-            if "cuda" in err or "显存" in str(e) or "memory" in err:
-                status = "翻译失败: 显存/内存不足"
-            elif "timeout" in err or "超时" in str(e):
-                status = "翻译失败: 处理超时"
-            else:
-                status = f"翻译失败: {str(e)[:40]}"
-            logger.error(f"入站处理失败: {e}")
-            if self._on_status:
-                self._on_status(status)
+    def _volc_direct_pcm(self, name: str, pcm: bytes) -> None:
+        if not pcm or self._volc is None:
+            return
+        if name not in self._volc.clients:
+            return
+        gate = self._vad_outbound if name == "outbound" else self._vad_inbound
+        if gate is not None:
+            ok = gate.accept(pcm)
+            if name == "inbound":
+                if ok:
+                    self._vad_pass_chunks += 1
+                else:
+                    self._vad_drop_chunks += 1
+                now = time.time()
+                if now - self._vad_diag_at >= 5.0:
+                    self._vad_diag_at = now
+                    st = gate.stats()
+                    total = self._vad_pass_chunks + self._vad_drop_chunks
+                    if total:
+                        msg = (
+                            f"游戏捕获电平 RMS={st.rms:.4f} "
+                            f"VAD={'开' if st.open else '关'} "
+                            f"近5秒送出 {self._vad_pass_chunks}/{total}"
+                        )
+                        if st.rms < 0.002:
+                            msg += " · 几乎无声，请确认「游戏声音」选的是正在播放视频的扬声器 Loopback"
+                        elif self._vad_pass_chunks == 0:
+                            msg += " · 有声但被 VAD 拦住，可在设置把灵敏度改「宽松」或暂时关闭 VAD"
+                        self.log_message.emit(msg)
+                        self._vad_pass_chunks = 0
+                        self._vad_drop_chunks = 0
+            if not ok:
+                return
+        self._volc.send_audio(name, pcm)
+
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def session(self) -> TranslationSession:
+        return self._session

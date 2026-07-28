@@ -71,15 +71,20 @@ tts:
   volume: +0%
 ui:
   always_on_top: true
-  font_size: 12
+  font_size: 22
   language: zh
   max_subtitle_lines: 10
+  enable_mic: true
+  enable_game: true
   play_chinese_voice: false
   play_outbound_voice: false
+  play_inbound_voice: false
   show_game_subtitle: true
   show_mic_subtitle: true
   show_subtitle_overlay: true
-  subtitle_opacity: 0.85
+  subtitle_opacity: 0.88
+  overlay_positions: {}
+  overlay_locked: {}
 volc_usage:
   monthly_quota: 500000
   total_cost: 0.0

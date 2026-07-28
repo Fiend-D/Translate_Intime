@@ -2,10 +2,9 @@
 字幕缓冲器 — 流式文本按句子聚合，避免碎片化显示
 参考 SayHey 的 subtitle_buffer.py 设计
 """
+
 import time
 from dataclasses import dataclass, field
-from typing import Optional
-
 
 # 句子结束标点（中英文）
 _SENTENCE_ENDS = frozenset("。！？!?.\n")
@@ -29,7 +28,7 @@ class SubtitleBuffer:
     _flush_timeout: float = 0.7  # 0.7秒无新文本就刷出
     _max_len: int = 200  # 超长兜底
 
-    def feed(self, text: str) -> Optional[str]:
+    def feed(self, text: str) -> str | None:
         """
         喂入新文本，返回可显示的完整句子（可能为 None）。
         """
@@ -54,29 +53,29 @@ class SubtitleBuffer:
 
         return self._try_split()
 
-    def _try_split(self) -> Optional[str]:
+    def _try_split(self) -> str | None:
         """如果有完整句子则返回"""
         for i, ch in enumerate(self._buffer):
             if ch in _SENTENCE_ENDS:
-                sentence = self._buffer[:i + 1].strip()
-                self._buffer = self._buffer[i + 1:].lstrip()
+                sentence = self._buffer[: i + 1].strip()
+                self._buffer = self._buffer[i + 1 :].lstrip()
                 return sentence
         # 超长兜底：在逗号处分段
         if len(self._buffer) > self._max_len:
             comma_idx = self._buffer.find("，", self._max_len // 2)
             if comma_idx > 0:
-                sentence = self._buffer[:comma_idx + 1].strip()
-                self._buffer = self._buffer[comma_idx + 1:].lstrip()
+                sentence = self._buffer[: comma_idx + 1].strip()
+                self._buffer = self._buffer[comma_idx + 1 :].lstrip()
                 return sentence
         return None
 
-    def _check_timeout(self) -> Optional[str]:
+    def _check_timeout(self) -> str | None:
         """超时刷出剩余内容"""
         if self._buffer and time.monotonic() - self._last_activity > self._flush_timeout:
             return self._flush()
         return None
 
-    def _flush(self) -> Optional[str]:
+    def _flush(self) -> str | None:
         """强制输出全部缓冲"""
         if not self._buffer.strip():
             return None
