@@ -1,14 +1,17 @@
 # ---- Local models / caches ----
+# Root-level model dumps only (do NOT ignore src/models/ package)
 /models/
 checkpoints/
+**/checkpoints/
 *.pth
 *.pt
 *.bin
 *.onnx
-!resource/
-!resource/vad/
-!resource/vad/.gitkeep
 *.safetensors
+# Local downloaded assets under resource/ (keep placeholder .gitkeep)
+resource/mt/
+resource/vad/*.onnx
+!resource/vad/.gitkeep
 torch_cache/
 transformers_cache/
 hf_cache/

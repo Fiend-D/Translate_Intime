@@ -617,11 +617,24 @@ class MainWindow(QMainWindow):
         row.addStretch()
         layout.addLayout(row)
 
-        self._chk_use_volc = QCheckBox("火山同传（唯一线路）")
-        self._chk_use_volc.setChecked(True)
-        self._chk_use_volc.setEnabled(False)
-        self._chk_use_volc.setToolTip("本地链路已移除，仅通过火山 AST 2.0 同传")
-        layout.addWidget(self._chk_use_volc)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self._field_label("翻译引擎"))
+        self._cmb_translation_mode = QComboBox()
+        self._prep_combo(self._cmb_translation_mode)
+        self._cmb_translation_mode.addItem("火山同传（低延迟）", "volc")
+        self._cmb_translation_mode.addItem(
+            "经济模式（Fun-ASR + NLLB本地翻译 + Kokoro语音）", "economy"
+        )
+        self._cmb_translation_mode.setToolTip(
+            "切换翻译引擎。若通道正在运行会先停止，无需重启应用。\n"
+            "经济模式 = 阿里云 Fun-ASR + NLLB 本地翻译 + Kokoro 语音；\n"
+            "首次运行会后台下载模型到 ~/.cache/translator_intime/。"
+        )
+        self._cmb_translation_mode.currentIndexChanged.connect(
+            self._on_translation_mode_changed
+        )
+        mode_row.addWidget(self._cmb_translation_mode, 1)
+        layout.addLayout(mode_row)
 
         preset_row = QHBoxLayout()
         preset_row.addWidget(self._field_label("质量档位"))
@@ -835,6 +848,43 @@ class MainWindow(QMainWindow):
         btn_refresh_pack.clicked.connect(self._on_refresh_pack_quota)
         pack_row.addWidget(btn_refresh_pack)
         layout.addLayout(pack_row)
+
+        self._txt_dashscope_key = QLineEdit()
+        self._txt_dashscope_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._txt_dashscope_key.setPlaceholderText("DashScope API Key（经济模式）")
+        self._txt_dashscope_key.setToolTip(
+            "经济模式 ASR 使用阿里云百炼 DashScope Key；也可设置环境变量 DASHSCOPE_API_KEY。"
+        )
+        layout.addWidget(self._txt_dashscope_key)
+        economy_tip = QLabel(
+            "经济模式 = Fun-ASR + NLLB本地翻译 + Kokoro语音（首次运行后台下载模型）"
+        )
+        economy_tip.setObjectName("fieldLabel")
+        economy_tip.setWordWrap(True)
+        layout.addWidget(economy_tip)
+        nllb_row = QHBoxLayout()
+        nllb_row.addWidget(self._field_label("NLLB 模型"))
+        self._cmb_nllb_model = QComboBox()
+        self._prep_combo(self._cmb_nllb_model)
+        from src.engines.pipeline.model_catalog import (
+            NLLB_OPTIONS,
+            format_kokoro_info,
+            format_option_label,
+        )
+
+        for opt in NLLB_OPTIONS:
+            self._cmb_nllb_model.addItem(format_option_label(opt), opt.id)
+        self._cmb_nllb_model.setToolTip(
+            "本地 NLLB CTranslate2 模型。更改后立即生效（运行中会停止通道）；\n"
+            "模型缓存至 ~/.cache/translator_intime/nllb/"
+        )
+        self._cmb_nllb_model.currentIndexChanged.connect(self._on_nllb_model_changed)
+        nllb_row.addWidget(self._cmb_nllb_model, 1)
+        layout.addLayout(nllb_row)
+        self._lbl_kokoro_info = QLabel(format_kokoro_info())
+        self._lbl_kokoro_info.setObjectName("fieldLabel")
+        self._lbl_kokoro_info.setWordWrap(True)
+        layout.addWidget(self._lbl_kokoro_info)
 
         layout.addWidget(self._field_label("Dota 助手（语音教练）"))
         coach_row = QHBoxLayout()
@@ -1264,8 +1314,29 @@ class MainWindow(QMainWindow):
         self._chk_play_game.setChecked(cfg.play_game_voice)
         self._spn_font.setValue(cfg.subtitle_font_size)
         self._spn_opacity.setValue(cfg.subtitle_opacity)
-        self._chk_use_volc.setChecked(True)
+        self._cmb_translation_mode.blockSignals(True)
+        self._select_combo_data(
+            self._cmb_translation_mode,
+            getattr(cfg, "translation_mode", "volc") or "volc",
+        )
+        self._cmb_translation_mode.blockSignals(False)
         self._txt_volc_key.setText(cfg.volc_api_key)
+        if hasattr(self, "_txt_dashscope_key"):
+            self._txt_dashscope_key.setText(
+                getattr(cfg, "economy_dashscope_api_key", "") or ""
+            )
+        if hasattr(self, "_cmb_nllb_model"):
+            self._cmb_nllb_model.blockSignals(True)
+            self._select_combo_data(
+                self._cmb_nllb_model,
+                getattr(
+                    cfg,
+                    "economy_nllb_model",
+                    "JustFrederik/nllb-200-distilled-600M-ct2-int8",
+                )
+                or "JustFrederik/nllb-200-distilled-600M-ct2-int8",
+            )
+            self._cmb_nllb_model.blockSignals(False)
         self._txt_volc_token.setText(cfg.volc_access_token)
         self._txt_volc_iam_ak.setText(getattr(cfg, "volc_iam_ak", "") or "")
         self._txt_volc_iam_sk.setText(getattr(cfg, "volc_iam_sk", "") or "")
@@ -1462,8 +1533,49 @@ class MainWindow(QMainWindow):
             input_device=self._cmb_input.currentData(),
             output_device=self._cmb_output.currentData(),
             loopback_device=self._cmb_loopback.currentData(),
-            use_volc=True,
+            translation_mode=self._cmb_translation_mode.currentData() or "volc",
+            use_volc=(self._cmb_translation_mode.currentData() or "volc") == "volc",
             volc_api_key=self._txt_volc_key.text().strip(),
+            economy_dashscope_api_key=(
+                self._txt_dashscope_key.text().strip()
+                if hasattr(self, "_txt_dashscope_key")
+                else getattr(self._config, "economy_dashscope_api_key", "")
+            ),
+            economy_asr_model=getattr(self._config, "economy_asr_model", "fun-asr-realtime")
+            or "fun-asr-realtime",
+            economy_mt_backend=getattr(self._config, "economy_mt_backend", "nllb") or "nllb",
+            economy_tts_backend=getattr(self._config, "economy_tts_backend", "kokoro")
+            or "kokoro",
+            economy_nllb_model=(
+                self._cmb_nllb_model.currentData()
+                if hasattr(self, "_cmb_nllb_model") and self._cmb_nllb_model.currentData()
+                else getattr(
+                    self._config,
+                    "economy_nllb_model",
+                    "JustFrederik/nllb-200-distilled-600M-ct2-int8",
+                )
+                or "JustFrederik/nllb-200-distilled-600M-ct2-int8"
+            ),
+            economy_offline_setup_done=bool(
+                getattr(self._config, "economy_offline_setup_done", False)
+            ),
+            economy_kokoro_voice_en=getattr(
+                self._config, "economy_kokoro_voice_en", "af_heart"
+            )
+            or "af_heart",
+            economy_kokoro_voice_zh=getattr(
+                self._config, "economy_kokoro_voice_zh", "zf_xiaoxiao"
+            )
+            or "zf_xiaoxiao",
+            economy_utterance_silence_ms=int(
+                getattr(self._config, "economy_utterance_silence_ms", 450) or 450
+            ),
+            economy_utterance_min_ms=int(
+                getattr(self._config, "economy_utterance_min_ms", 400) or 400
+            ),
+            economy_utterance_max_ms=int(
+                getattr(self._config, "economy_utterance_max_ms", 12000) or 12000
+            ),
             volc_access_token=self._txt_volc_token.text().strip(),
             volc_speaker_id=self._cmb_volc_voice.currentData() or "",
             volc_speech_rate=self._spn_speech_rate.value(),
@@ -1513,6 +1625,142 @@ class MainWindow(QMainWindow):
             f"质量档位 → {self._cmb_quality.currentText()} "
             f"(open={params.vad_open_ms}ms hangover={params.vad_hangover_ms}ms)"
         )
+
+    def _on_translation_mode_changed(self) -> None:
+        """Immediate engine swap: stop channels, update config, persist mode field."""
+        mode = self._cmb_translation_mode.currentData() or "volc"
+        if mode not in ("volc", "economy"):
+            mode = "volc"
+        prev = getattr(self._config, "translation_mode", "volc") or "volc"
+        if mode == prev and (
+            self._pipeline is None
+            or getattr(self._pipeline, "mode", prev) == mode
+        ):
+            return
+
+        if mode == "economy" and not self._ensure_economy_offline_setup():
+            self._cmb_translation_mode.blockSignals(True)
+            self._select_combo_data(self._cmb_translation_mode, prev)
+            self._cmb_translation_mode.blockSignals(False)
+            return
+
+        stopped = False
+        if self._pipeline is not None and self._pipeline.active_channels():
+            with contextlib.suppress(Exception):
+                self._pipeline.stop()
+            stopped = True
+            self._timer.stop()
+            self._btn_stop.setEnabled(False)
+            self._progress.setVisible(False)
+            self._badge.setText("Idle")
+            self._refresh_channel_buttons()
+            self._on_enable_toggled()
+
+        if self._pipeline is not None:
+            with contextlib.suppress(Exception):
+                self._pipeline.set_translation_mode(mode)  # type: ignore[arg-type]
+        self._config = self._config.model_copy(
+            update={"translation_mode": mode, "use_volc": mode == "volc"}
+        )
+        self._persist_config()
+
+        label = "火山同传" if mode == "volc" else "经济模式"
+        msg = f"已切换引擎 → {label}"
+        if stopped:
+            msg = "已切换引擎，通道已停止"
+            self._append_log(msg)
+            show_toast(msg)
+        else:
+            self._append_log(msg)
+        if mode == "economy":
+            key = ""
+            if hasattr(self, "_txt_dashscope_key"):
+                key = self._txt_dashscope_key.text().strip()
+            key = key or (
+                getattr(self._config, "economy_dashscope_api_key", "") or ""
+            ).strip()
+            import os as _os
+
+            if not key and not (_os.environ.get("DASHSCOPE_API_KEY") or "").strip():
+                warn = "经济模式需要 DashScope API Key（设置页填写或环境变量 DASHSCOPE_API_KEY）"
+                self._append_log(warn)
+                show_toast(warn)
+
+    def _ensure_economy_offline_setup(self) -> bool:
+        """Show first-run offline model dialog if needed. Returns False if cancelled."""
+        if bool(getattr(self._config, "economy_offline_setup_done", False)):
+            return True
+
+        from src.gui.offline_model_dialog import OfflineModelDialog
+
+        dlg = OfflineModelDialog(
+            current_model_id=getattr(self._config, "economy_nllb_model", None),
+            parent=self,
+        )
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return False
+
+        model_id = dlg.selected_nllb_model_id()
+        self._config = self._config.model_copy(
+            update={
+                "economy_nllb_model": model_id,
+                "economy_offline_setup_done": True,
+            }
+        )
+        if hasattr(self, "_cmb_nllb_model"):
+            self._cmb_nllb_model.blockSignals(True)
+            self._select_combo_data(self._cmb_nllb_model, model_id)
+            self._cmb_nllb_model.blockSignals(False)
+        self._persist_config()
+        self._append_log(f"已选择本地翻译模型：{model_id}")
+        return True
+
+    def _on_nllb_model_changed(self) -> None:
+        """Immediate apply NLLB model id; reload engine on next channel start."""
+        if not hasattr(self, "_cmb_nllb_model"):
+            return
+        model_id = self._cmb_nllb_model.currentData()
+        if not model_id:
+            return
+        current = getattr(self._config, "economy_nllb_model", "") or ""
+        if model_id == current and bool(
+            getattr(self._config, "economy_offline_setup_done", False)
+        ):
+            return
+
+        stopped = False
+        mode = getattr(self._config, "translation_mode", "volc") or "volc"
+        if mode == "economy" and self._pipeline is not None:
+            if self._pipeline.active_channels():
+                with contextlib.suppress(Exception):
+                    self._pipeline.stop()
+                stopped = True
+                self._timer.stop()
+                self._btn_stop.setEnabled(False)
+                self._progress.setVisible(False)
+                self._badge.setText("Idle")
+                self._refresh_channel_buttons()
+                self._on_enable_toggled()
+            with contextlib.suppress(Exception):
+                self._pipeline.close_engine()
+            # Refresh pipeline config so next start uses the new model.
+            self._pipeline._config = self._pipeline._config.model_copy(
+                update={"economy_nllb_model": model_id}
+            )
+
+        self._config = self._config.model_copy(
+            update={
+                "economy_nllb_model": model_id,
+                "economy_offline_setup_done": True,
+            }
+        )
+        self._persist_config()
+
+        msg = "已切换本地翻译模型，将在下次启动通道时生效"
+        if stopped:
+            msg = "已切换本地翻译模型，通道已停止；重新开启后生效"
+        self._append_log(msg)
+        show_toast(msg)
 
     def _refresh_corpus_label(self) -> None:
         hw = getattr(self, "_corpus_hotwords", None) or []
@@ -2070,6 +2318,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "配置错误", "源语言和目标语言不能相同。")
             return
 
+        mode = getattr(self._config, "translation_mode", "volc") or "volc"
+        if mode == "economy" and not self._ensure_economy_offline_setup():
+            return
+
         if not self._validate_devices_for_start(channel):
             return
 
@@ -2100,18 +2352,24 @@ class MainWindow(QMainWindow):
         )
 
         try:
-            if not pipeline.wants_volc():
-                raise RuntimeError("请先填写火山 API Key 并保存")
+            ok, reason = pipeline.can_start()
+            if not ok:
+                raise RuntimeError(reason)
             pipeline.start_channel(direction, play_voice=play_voice)
             if not self._timer.isActive():
                 self._timer.start()
             self._sync_overlays_visibility(preview=False)
             self._refresh_channel_buttons()
-            self._badge.setText("火山")
+            mode = pipeline.mode
+            badge = "火山" if mode == "volc" else "经济"
+            self._badge.setText(badge)
             self._progress.setRange(0, 100)
             self._progress.setValue(100)
             self._btn_stop.setEnabled(True)
-            self._append_log(f"{label}通道已启动（火山）")
+            mode_label = "火山" if mode == "volc" else "经济"
+            self._append_log(f"{label}通道已启动（{mode_label}）")
+            if mode == "economy" and reason:
+                self._append_log(reason)
             if play_voice:
                 self._append_log(f"{label}已开启语音输出")
             self._on_enable_toggled()

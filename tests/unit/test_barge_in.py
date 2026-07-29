@@ -8,20 +8,25 @@ import time
 from src.core.pipeline import TranslationPipeline
 from src.core.speech_gate import SpeechGate
 from src.models.config import AppConfigModel
+from src.models.enums import Direction
 
 
 def _pcm(value: int, samples: int = 320) -> bytes:
     return array.array("h", [value] * samples).tobytes()
 
 
-class _FakeVolc:
+class _FakeEngine:
     def __init__(self) -> None:
-        self.clients = {"outbound": object()}
+        self.engine_id = "volc"
+        self.active_directions = frozenset({Direction.OUTBOUND})
         self.sent: list[bytes] = []
 
-    def send_audio(self, name: str, data: bytes) -> None:
-        assert name == "outbound"
+    def send_pcm(self, direction: Direction, data: bytes) -> None:
+        assert direction == Direction.OUTBOUND
         self.sent.append(data)
+
+    def close(self) -> None:
+        return None
 
 
 class _FakePlayer:
@@ -40,7 +45,7 @@ def test_barge_in_clears_tts_and_flushes_buffer(tmp_path) -> None:
         vad_barge_in_ms=40,
     )
     pipeline = TranslationPipeline(config)
-    pipeline._volc = _FakeVolc()
+    pipeline._engine = _FakeEngine()
     pipeline._player = _FakePlayer()
     pipeline._vad_outbound = SpeechGate(
         backend="rms",
@@ -60,7 +65,6 @@ def test_barge_in_clears_tts_and_flushes_buffer(tmp_path) -> None:
 
     assert pipeline._player.cleared is True
     assert pipeline._tts_playing_until <= time.time()
-    assert pipeline._volc.sent
-    assert silence in pipeline._volc.sent[0]
-    assert loud in pipeline._volc.sent[0]
-
+    assert pipeline._engine.sent
+    assert silence in pipeline._engine.sent[0]
+    assert loud in pipeline._engine.sent[0]

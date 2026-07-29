@@ -1,4 +1,4 @@
-"""Volc-only pipeline smoke tests (no live network)."""
+"""Pipeline smoke tests (no live network)."""
 
 import pytest
 
@@ -13,6 +13,7 @@ def pipeline(tmp_path):
     config = AppConfigModel(
         log_dir=str(tmp_path / "logs"),
         volc_api_key="",
+        translation_mode="volc",
     )
     return TranslationPipeline(config)
 
@@ -22,5 +23,17 @@ def test_start_without_credentials_raises(pipeline):
         pipeline.start_channel(Direction.OUTBOUND, play_voice=False)
 
 
-def test_mode_is_always_volc(pipeline):
+def test_mode_follows_config(pipeline):
     assert pipeline.mode == "volc"
+
+
+def test_economy_can_start_without_volc_key(tmp_path):
+    config = AppConfigModel(
+        log_dir=str(tmp_path / "logs"),
+        volc_api_key="",
+        translation_mode="economy",
+    )
+    p = TranslationPipeline(config)
+    ok, msg = p.can_start()
+    assert ok is True
+    assert "经济" in msg

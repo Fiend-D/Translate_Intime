@@ -1,4 +1,4 @@
-"""Volc AST-only translation session orchestrator."""
+"""Translation session orchestrator — capture/VAD/UI own pipeline; engines own transport."""
 
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ from src.core.audio_capture import AudioCapture
 from src.core.audio_player import AudioPlayer
 from src.core.exceptions import EngineLoadError
 from src.core.speech_gate import SpeechGate
-from src.core.volc_engine import VolcASTClient, VolcRuntime, resolve_volc_credentials
+from src.core.volc_engine import resolve_volc_credentials
+from src.engines.base import EngineCallbacks, EngineMode, TranslationEngine
+from src.engines.factory import create_engine
 from src.models.config import AppConfigModel
 from src.models.enums import Direction, LanguageCode, SessionStatus
 from src.models.session import TranslationSession
@@ -35,7 +37,7 @@ class DirectionState:
 
 
 class TranslationPipeline(QObject):
-    """Real-time dual-channel translation via Volc AST 2.0 only."""
+    """Real-time dual-channel translation with pluggable engines (volc / economy)."""
 
     subtitle_ready = pyqtSignal(SubtitleEntry)
     status_changed = pyqtSignal(str)
@@ -45,9 +47,8 @@ class TranslationPipeline(QObject):
     log_message = pyqtSignal(str)
     usage_reported = pyqtSignal(str, dict)  # source, usage payload
 
-
     def __init__(self, config: AppConfigModel, registry: object | None = None) -> None:
-        # registry kept optional for call-site compatibility; unused (Volc-only).
+        # registry kept optional for call-site compatibility; unused.
         del registry
         super().__init__()
         self._config = config
@@ -62,8 +63,8 @@ class TranslationPipeline(QObject):
         self._inbound_active = False
         self._play_outbound_voice = False
         self._play_inbound_voice = False
-        self._volc: VolcRuntime | None = None
-        self._volc_started_at = 0.0
+        self._engine: TranslationEngine | None = None
+        self._session_started_at = 0.0
         self._input_device: int | str | None = None
         self._output_device: int | str | None = None
         self._loopback_device: int | str | None = None
@@ -99,7 +100,9 @@ class TranslationPipeline(QObject):
 
     @property
     def mode(self) -> str:
-        return "volc"
+        if self._engine is not None:
+            return self._engine.engine_id
+        return getattr(self._config, "translation_mode", "volc") or "volc"
 
     def is_channel_active(self, direction: Direction) -> bool:
         if direction == Direction.OUTBOUND:
@@ -125,9 +128,83 @@ class TranslationPipeline(QObject):
             return bool(token)
         return True
 
-    # Backward-compatible alias used by GUI
     def wants_volc(self) -> bool:
+        """True when current mode is volc and credentials are present."""
+        if self.mode != "volc":
+            return False
         return self.has_volc_credentials()
+
+    def can_start(self) -> tuple[bool, str]:
+        """Whether a channel may be started under the current engine mode."""
+        mode = self.mode
+        if mode == "economy":
+            from src.engines.pipeline.engine import resolve_dashscope_api_key
+
+            if not resolve_dashscope_api_key(self._config):
+                return (
+                    False,
+                    "请先填写 DashScope API Key（经济模式）或设置环境变量 DASHSCOPE_API_KEY。",
+                )
+            return True, "经济模式：阿里云 Fun-ASR + NLLB 本地翻译 + Kokoro TTS"
+        if mode == "volc":
+            if not self.has_volc_credentials():
+                return False, "请先填写火山 API Key（当前为火山同传模式）。"
+            return True, ""
+        return False, f"未知翻译模式: {mode}"
+
+    def set_translation_mode(self, mode: EngineMode) -> None:
+        """Switch engine mode; stops active channels and closes the old engine."""
+        current = getattr(self._config, "translation_mode", "volc") or "volc"
+        if (
+            mode == current
+            and self._engine is not None
+            and self._engine.engine_id == mode
+        ):
+            return
+
+        if self._outbound_active or self._inbound_active:
+            self.stop()
+
+        self.close_engine()
+        self._config = self._config.model_copy(update={"translation_mode": mode})
+        # Keep use_volc in sync for backward-compatible config readers.
+        self._config = self._config.model_copy(update={"use_volc": mode == "volc"})
+
+    def close_engine(self) -> None:
+        if self._engine is not None:
+            with contextlib.suppress(Exception):
+                self._engine.close()
+            self._engine = None
+
+    def _engine_callbacks(self) -> EngineCallbacks:
+        return EngineCallbacks(
+            on_source_text=self._on_engine_source,
+            on_translated_text=self._on_engine_translated,
+            on_audio=self._on_engine_audio,
+            on_error=self._on_engine_error,
+            on_status=lambda msg: self.log_message.emit(msg),
+            on_usage=lambda src, payload: self.usage_reported.emit(src, payload),
+            on_engine_status=lambda d, eng, st: self.engine_status_changed.emit(
+                d.value, eng, st
+            ),
+            should_defer_rotate=self._should_defer_rotate,
+        )
+
+    def _should_defer_rotate(self, direction: Direction) -> bool:
+        gate = (
+            self._vad_outbound
+            if direction == Direction.OUTBOUND
+            else self._vad_inbound
+        )
+        return bool(gate is not None and gate.is_open)
+
+    def _ensure_engine(self) -> TranslationEngine:
+        mode: EngineMode = getattr(self._config, "translation_mode", "volc") or "volc"
+        if self._engine is not None and self._engine.engine_id == mode:
+            return self._engine
+        self.close_engine()
+        self._engine = create_engine(mode, self._config, self._engine_callbacks())
+        return self._engine
 
     def start(
         self,
@@ -140,7 +217,7 @@ class TranslationPipeline(QObject):
         play_inbound_voice: bool = False,
         force_local: bool = False,
     ) -> None:
-        del force_local  # local path removed
+        del force_local
         self._input_device = input_device
         self._output_device = output_device
         self._loopback_device = loopback_device
@@ -192,19 +269,36 @@ class TranslationPipeline(QObject):
                 ),
             )
 
-        if not self.has_volc_credentials():
-            raise EngineLoadError("请先填写火山 API Key（当前仅支持火山同传）。")
+        ok, reason = self.can_start()
+        if not ok:
+            raise EngineLoadError(reason)
 
+        mode = self.mode
         label = "麦克风" if direction == Direction.OUTBOUND else "游戏字幕"
-        self.log_message.emit(f"正在连接火山同传（{label}）…")
-        if not self._ensure_volc_channel(direction):
-            raise EngineLoadError(f"火山同传连接失败（{label}）。请检查 API Key / 网络。")
+        engine_label = "火山同传" if mode == "volc" else "经济模式"
+        self.log_message.emit(f"正在连接{engine_label}（{label}）…")
+
+        engine = self._ensure_engine()
+        voice = (
+            self._play_outbound_voice
+            if direction == Direction.OUTBOUND
+            else self._play_inbound_voice
+        )
+        if not engine.start_direction(direction, play_voice=voice):
+            hint = (
+                "请检查 API Key / 网络。"
+                if mode == "volc"
+                else "请检查 DashScope Key / 是否已安装 dashscope。"
+            )
+            raise EngineLoadError(f"{engine_label}连接失败（{label}）。{hint}")
 
         if opening_session:
             path = self._subtitle_logger.begin_session()
             self.log_message.emit(f"翻译留档：{path}")
 
-        self.log_message.emit(f"火山同传已就绪（{label}）")
+        self.log_message.emit(f"{engine_label}已就绪（{label}）")
+        if mode == "economy" and reason:
+            self.log_message.emit(reason)
 
         if direction == Direction.OUTBOUND:
             self._validate_feedback_routes(Direction.OUTBOUND)
@@ -219,7 +313,9 @@ class TranslationPipeline(QObject):
                 sample_rate=16000,
                 channels=1,
             )
-            self._capture_outbound.on_pcm = lambda pcm: self._volc_direct_pcm("outbound", pcm)
+            self._capture_outbound.on_pcm = lambda pcm: self._engine_direct_pcm(
+                Direction.OUTBOUND, pcm
+            )
             self._capture_outbound.start()
             self._outbound_active = True
         else:
@@ -233,7 +329,9 @@ class TranslationPipeline(QObject):
                 sample_rate=16000,
                 channels=1,
             )
-            self._capture_inbound.on_pcm = lambda pcm: self._volc_direct_pcm("inbound", pcm)
+            self._capture_inbound.on_pcm = lambda pcm: self._engine_direct_pcm(
+                Direction.INBOUND, pcm
+            )
             self._capture_inbound.start()
             self._inbound_active = True
             self.log_message.emit(f"游戏声音捕获设备：{loopback!r}")
@@ -248,7 +346,7 @@ class TranslationPipeline(QObject):
 
         was_running = self._running
         self._running = True
-        self._volc_started_at = time.time()
+        self._session_started_at = time.time()
         if not was_running:
             self._session = TranslationSession(
                 outbound_enabled=self._outbound_active,
@@ -262,15 +360,15 @@ class TranslationPipeline(QObject):
                 self._session.transition(SessionStatus.RUNNING)
             self.status_changed.emit("running")
 
-        logger.info(f"Channel started: {direction.value} mode=volc")
-        self.log_message.emit(f"{label}通道已启动 · volc")
+        logger.info(f"Channel started: {direction.value} mode={mode}")
+        self.log_message.emit(f"{label}通道已启动 · {mode}")
         if direction == Direction.OUTBOUND and self._vad_outbound is not None:
             sens = getattr(self._config, "vad_sensitivity", "medium") or "medium"
             preset = getattr(self._config, "quality_preset", "balanced") or "balanced"
             backend = self._vad_outbound.backend
-            mode = "过滤+抢话" if self._vad_outbound_filters else "抢话检测"
+            vad_mode = "过滤+抢话" if self._vad_outbound_filters else "抢话检测"
             self.log_message.emit(
-                f"麦克风 VAD 已启用（{backend}/{sens} · 档位 {preset} · {mode}）"
+                f"麦克风 VAD 已启用（{backend}/{sens} · 档位 {preset} · {vad_mode}）"
             )
         elif direction == Direction.INBOUND and self._vad_inbound is not None:
             sens = getattr(self._config, "vad_sensitivity", "medium") or "medium"
@@ -434,14 +532,11 @@ class TranslationPipeline(QObject):
         if direction == Direction.INBOUND and not self._inbound_active:
             return
 
-        name = "outbound" if direction == Direction.OUTBOUND else "inbound"
-        if self._volc is not None:
+        if self._engine is not None:
             with contextlib.suppress(Exception):
-                self._volc.disconnect_client(name)
-            if not self._volc.clients:
-                with contextlib.suppress(Exception):
-                    self._volc.stop()
-                self._volc = None
+                self._engine.stop_direction(direction)
+            if not self._engine.active_directions:
+                self.close_engine()
 
         if direction == Direction.OUTBOUND:
             if self._capture_outbound is not None:
@@ -493,116 +588,13 @@ class TranslationPipeline(QObject):
         else:
             self.status_changed.emit("running")
 
-    def _ensure_volc_channel(self, direction: Direction) -> bool:
-        api_key, access_token, auth = resolve_volc_credentials(
-            self._config.volc_api_key,
-            self._config.volc_access_token,
-        )
-        if not api_key:
-            return False
-
-        logger.info(f"Volc auth mode={auth}, key_len={len(api_key)} channel={direction.value}")
-        if self._volc is None:
-            self._volc = VolcRuntime()
-
-        src = self._config.source_language
-        tgt = self._config.target_language
-        name = "outbound" if direction == Direction.OUTBOUND else "inbound"
-        speaker_id = getattr(self._config, "volc_speaker_id", "") or ""
-        speech_rate = int(getattr(self._config, "volc_speech_rate", 0) or 0)
-        hotwords = list(getattr(self._config, "hotwords", None) or [])
-        glossary = dict(getattr(self._config, "glossary", None) or {})
-
-        if name in self._volc.clients:
-            return True
-
-        try:
-            rotate_m = int(getattr(self._config, "volc_session_rotate_minutes", 12) or 0)
-
-            def _defer_rotate(gate_name: str = name) -> bool:
-                gate = (
-                    self._vad_outbound
-                    if gate_name == "outbound"
-                    else self._vad_inbound
-                )
-                return bool(gate is not None and gate.is_open)
-
-            common_kw = dict(
-                api_key=api_key,
-                access_token=access_token,
-                speech_rate=speech_rate,
-                hotwords=hotwords,
-                glossary=glossary,
-                on_error=self._on_volc_error,
-                on_status=lambda msg: self.log_message.emit(msg),
-                on_usage=lambda payload, src=name: self.usage_reported.emit(src, payload),
-                session_rotate_minutes=rotate_m,
-                should_defer_rotate=_defer_rotate,
-            )
-            if direction == Direction.OUTBOUND:
-                mode = "s2s" if self._play_outbound_voice else "s2t"
-                client = VolcASTClient(
-                    **common_kw,
-                    source_language=src,
-                    target_language=tgt,
-                    mode=mode,  # type: ignore[arg-type]
-                    speaker_id=speaker_id if mode == "s2s" else "",
-                    on_source_text=lambda text, final, d=Direction.OUTBOUND: self._on_volc_source(
-                        d, text, final
-                    ),
-                    on_translated_text=lambda text, final, d=Direction.OUTBOUND: self._on_volc_translated(
-                        d, text, final
-                    ),
-                    on_audio=lambda data: self._on_volc_audio(Direction.OUTBOUND, data),
-                )
-            else:
-                mode = "s2s" if self._play_inbound_voice else "s2t"
-                client = VolcASTClient(
-                    **common_kw,
-                    source_language=tgt,
-                    target_language=src,
-                    mode=mode,  # type: ignore[arg-type]
-                    speaker_id=speaker_id if mode == "s2s" else "",
-                    on_source_text=lambda text, final, d=Direction.INBOUND: self._on_volc_source(
-                        d, text, final
-                    ),
-                    on_translated_text=lambda text, final, d=Direction.INBOUND: self._on_volc_translated(
-                        d, text, final
-                    ),
-                    on_audio=lambda data: self._on_volc_audio(Direction.INBOUND, data),
-                )
-
-            if hotwords or glossary:
-                self.log_message.emit(
-                    f"热词 {len(hotwords)} 条 / 术语 {len(glossary)} 条已加载"
-                )
-            if speech_rate:
-                self.log_message.emit(f"同传语速: {speech_rate}")
-
-            if mode == "s2s":
-                voice_label = speaker_id or "原音色复刻"
-                self.log_message.emit(f"火山语音输出音色: {voice_label}")
-
-            if self._volc.connect_client(name, client):
-                self.engine_status_changed.emit(direction.value, "volc", "ready")
-                return True
-            self.engine_status_changed.emit(direction.value, "volc", "error")
-            return False
-        except Exception as exc:
-            logger.error(f"Volc channel start failed ({direction.value}): {exc}")
-            self.log_message.emit(f"火山启动异常: {exc}")
-            return False
-
     def stop(self) -> None:
         if self._outbound_active:
             self.stop_channel(Direction.OUTBOUND)
         if self._inbound_active:
             self.stop_channel(Direction.INBOUND)
         self._running = False
-        if self._volc is not None:
-            with contextlib.suppress(Exception):
-                self._volc.stop()
-            self._volc = None
+        self.close_engine()
         if self._capture_outbound is not None:
             with contextlib.suppress(Exception):
                 self._capture_outbound.stop()
@@ -622,7 +614,7 @@ class TranslationPipeline(QObject):
         self.status_changed.emit("stopped")
         logger.info("Translation session stopped")
 
-    def _on_volc_source(self, direction: Direction, text: str, is_final: bool) -> None:
+    def _on_engine_source(self, direction: Direction, text: str, is_final: bool) -> None:
         del is_final
         if not text.strip():
             return
@@ -630,9 +622,9 @@ class TranslationPipeline(QObject):
         if dp is None:
             return
         dp.last_source = text.strip()
-        self._emit_volc_subtitle(direction, is_final=False)
+        self._emit_engine_subtitle(direction, is_final=False)
 
-    def _on_volc_translated(self, direction: Direction, text: str, is_final: bool) -> None:
+    def _on_engine_translated(self, direction: Direction, text: str, is_final: bool) -> None:
         if not text.strip():
             return
         dp = self._directions.get(direction)
@@ -660,9 +652,9 @@ class TranslationPipeline(QObject):
             self._skip_next_audio_for.discard(direction)
 
         dp.last_translated = cleaned
-        self._emit_volc_subtitle(direction, is_final=is_final)
+        self._emit_engine_subtitle(direction, is_final=is_final)
 
-    def _emit_volc_subtitle(self, direction: Direction, *, is_final: bool = True) -> None:
+    def _emit_engine_subtitle(self, direction: Direction, *, is_final: bool = True) -> None:
         dp = self._directions.get(direction)
         if dp is None:
             return
@@ -686,12 +678,12 @@ class TranslationPipeline(QObject):
         self.subtitle_ready.emit(entry)
         if is_final:
             self._subtitle_logger.log(entry)
-            latency_ms = int((time.time() - self._volc_started_at) * 1000) % 100000
+            latency_ms = int((time.time() - self._session_started_at) * 1000) % 100000
             self.latency_reported.emit(min(latency_ms, 9999) if latency_ms > 0 else 0)
             dp.last_source = ""
             dp.last_translated = ""
 
-    def _on_volc_audio(self, direction: Direction, data: bytes) -> None:
+    def _on_engine_audio(self, direction: Direction, data: bytes) -> None:
         if not data:
             return
         if direction == Direction.OUTBOUND and not self._play_outbound_voice:
@@ -728,21 +720,21 @@ class TranslationPipeline(QObject):
         if candidate > self._tts_playing_until:
             self._tts_playing_until = candidate
 
-    def _on_volc_error(self, message: str) -> None:
+    def _on_engine_error(self, message: str) -> None:
         self.log_message.emit(message)
         self.error_occurred.emit(message)
 
     def process_tick(self) -> None:
-        """Volc uses direct PCM; tick kept as a lightweight no-op hook."""
+        """Engines use direct PCM; tick kept as a lightweight no-op hook."""
         return
 
-    def _volc_direct_pcm(self, name: str, pcm: bytes) -> None:
-        if not pcm or self._volc is None:
+    def _engine_direct_pcm(self, direction: Direction, pcm: bytes) -> None:
+        if not pcm or self._engine is None:
             return
-        if name not in self._volc.clients:
+        if direction not in self._engine.active_directions:
             return
 
-        if name == "outbound":
+        if direction == Direction.OUTBOUND:
             # 麦克风走回灌抑制缓冲：TTS 播放期间音频入缓存，
             # 窗口解除时回放给翻译引擎。
             self._handle_mic_with_feedback_suppression(pcm)
@@ -780,9 +772,9 @@ class TranslationPipeline(QObject):
             if not ok:
                 return
             if result.opened_now and result.preroll:
-                self._volc.send_audio(name, result.preroll + pcm)
+                self._engine.send_pcm(direction, result.preroll + pcm)
                 return
-        self._volc.send_audio(name, pcm)
+        self._engine.send_pcm(direction, pcm)
 
     def _handle_mic_with_feedback_suppression(self, pcm: bytes) -> None:
         """麦克风音频：TTS 播放期间入 buffer；窗口解除时回放。
@@ -852,17 +844,16 @@ class TranslationPipeline(QObject):
             chunks = self._mic_buffer
             self._mic_buffer = []
             self._mic_buffer_bytes = 0
-        if self._volc is None or "outbound" not in self._volc.clients:
+        if self._engine is None or Direction.OUTBOUND not in self._engine.active_directions:
             return
-        # 拼接所有 chunk 一次性发送（Volc 接受变长 PCM）
         try:
-            self._volc.send_audio("outbound", b"".join(chunks))
+            self._engine.send_pcm(Direction.OUTBOUND, b"".join(chunks))
         except Exception as exc:
             logger.debug(f"flush mic buffer failed: {exc}")
 
     def _send_mic_pcm(self, pcm: bytes, *, gate_result: object | None = None) -> None:
         """正常路径：实时发送麦克风音频（窗口已解除）。"""
-        if self._volc is None or "outbound" not in self._volc.clients:
+        if self._engine is None or Direction.OUTBOUND not in self._engine.active_directions:
             return
         if self._vad_outbound is not None and self._vad_outbound_filters:
             result = gate_result if gate_result is not None else self._vad_outbound.process(pcm)
@@ -872,7 +863,7 @@ class TranslationPipeline(QObject):
             if preroll:
                 pcm = preroll + pcm
         with contextlib.suppress(Exception):
-            self._volc.send_audio("outbound", pcm)
+            self._engine.send_pcm(Direction.OUTBOUND, pcm)
 
     def is_running(self) -> bool:
         return self._running

@@ -46,7 +46,8 @@ class AppConfigModel(BaseModel):
     output_device: int | str | None = None
     loopback_device: int | str | None = None
 
-    use_volc: bool = True
+    use_volc: bool = True  # backward compat; prefer translation_mode
+    translation_mode: Literal["volc", "economy"] = "volc"
     volc_api_key: str = ""
     volc_access_token: str = ""
     volc_speaker_id: str = ""
@@ -55,6 +56,19 @@ class AppConfigModel(BaseModel):
     volc_iam_sk: str = ""
     volc_console_app_id: str = ""
     volc_session_rotate_minutes: int = Field(default=12, ge=0, le=240)
+
+    # Economy mode (Fun-ASR + NLLB local MT + Kokoro TTS)
+    economy_dashscope_api_key: str = ""
+    economy_asr_model: str = "fun-asr-realtime"  # or paraformer-realtime-v2
+    economy_mt_backend: Literal["auto", "nllb", "argos", "mymemory"] = "nllb"
+    economy_tts_backend: Literal["auto", "kokoro", "edge"] = "kokoro"
+    economy_nllb_model: str = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
+    economy_offline_setup_done: bool = False  # first-run offline model dialog completed
+    economy_kokoro_voice_en: str = "af_heart"
+    economy_kokoro_voice_zh: str = "zf_xiaoxiao"
+    economy_utterance_silence_ms: int = Field(default=450, ge=50, le=5000)
+    economy_utterance_min_ms: int = Field(default=400, ge=50, le=10000)
+    economy_utterance_max_ms: int = Field(default=12000, ge=500, le=60000)
 
     hotwords: list[str] = Field(default_factory=list)
     glossary: dict[str, str] = Field(default_factory=dict)
@@ -108,5 +122,7 @@ class AppConfigModel(BaseModel):
     def _languages_must_differ(self) -> "AppConfigModel":
         if self.source_language == self.target_language:
             raise ValueError("source_language and target_language must be different")
+        # Keep use_volc aligned with translation_mode for older readers.
+        object.__setattr__(self, "use_volc", self.translation_mode == "volc")
         return self
 

@@ -10,6 +10,13 @@ def test_default_config_is_valid() -> None:
     assert config.source_language == "zh"
     assert config.target_language == "en"
     assert config.use_volc is True
+    assert config.translation_mode == "volc"
+
+
+def test_translation_mode_economy_sets_use_volc_false() -> None:
+    config = AppConfigModel(translation_mode="economy")
+    assert config.translation_mode == "economy"
+    assert config.use_volc is False
 
 
 def test_languages_must_differ() -> None:

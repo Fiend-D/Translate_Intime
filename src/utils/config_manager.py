@@ -152,6 +152,7 @@ def validate_config(config: AppConfigModel) -> tuple[bool, str]:
     """High-level save-time validation returning (ok, error_message)."""
     if config.source_language == config.target_language:
         return False, "源语言和目标语言不能相同"
-    if not (config.volc_api_key or "").strip():
+    mode = getattr(config, "translation_mode", "volc") or "volc"
+    if mode == "volc" and not (config.volc_api_key or "").strip():
         return False, "请填写火山 API Key"
     return True, ""
