@@ -37,18 +37,23 @@ def enhance_clarity(
     audio: np.ndarray,
     sr: int,
     *,
-    target_peak_db: float = -1.0,
-    presence_db: float = 3.0,
+    target_peak_db: float = -3.0,
+    max_boost_db: float = 12.0,
+    presence_db: float = 2.0,
     presence_hz: float = 3000.0,
+    noise_floor_db: float = -30.0,
 ) -> np.ndarray:
     """Boost loudness and vocal presence for virtual-cable / small-speaker playback.
 
     Pipeline:
-      1. Peak normalize to ``target_peak_db`` dBFS (maximizes signal level so the
-         receiver's noise gate does not chop quiet speech).
-      2. High-shelf boost above ``presence_hz`` by ``presence_db`` (restores vocal
-         consonants that 16 kHz TTS audio and receiver high-pass filters attenuate).
-      3. Soft-limit (tanh) to prevent clipping from the above processing.
+      1. **Noise gate** — silence below ``noise_floor_db`` dBFS to prevent hiss.
+      2. **Peak normalization with gain cap** — normalize to ``target_peak_db``
+         but never boost more than ``max_boost_db`` dB.  This prevents blowing up
+         the noise floor on quiet TTS segments.
+      3. **Zero-phase high-shelf boost** — lift ``presence_hz`` and above by
+         ``presence_db`` using forward-backward filtering (no phase shift, no
+         ringing).
+      4. **Soft-limit** (tanh) to keep within [-1, 1] without hard clipping.
 
     Operates on a 1-D float32 array. Returns float32.
     """
@@ -57,28 +62,42 @@ def enhance_clarity(
 
     out = audio.astype(np.float32, copy=True)
 
-    # 1. Peak normalization
+    # --- Step 1: Noise gate ---
+    # 静音低于噪声门限的部分，避免峰值归一化时把噪声底拉起来
+    gate_threshold = 10.0 ** (noise_floor_db / 20.0)
+    gate_mask = np.abs(out) < gate_threshold
+    out[gate_mask] = 0.0
+
+    # --- Step 2: Peak normalization (gain-capped) ---
     peak = float(np.max(np.abs(out)))
-    if peak > 1e-6:
-        target = 10.0 ** (target_peak_db / 20.0)
-        out *= target / peak
+    if peak > gate_threshold:
+        target_linear = 10.0 ** (target_peak_db / 20.0)
+        gain = target_linear / peak
+        # 限制最大提升量（dB），防止静音/尾音段被过度放大
+        max_gain_linear = 10.0 ** (max_boost_db / 20.0)
+        if gain > max_gain_linear:
+            gain = max_gain_linear
+        out *= gain
 
-    # 2. High-shelf presence boost (high-pass + additive blend)
+    # --- Step 3: Zero-phase high-shelf presence boost ---
     nyq = sr / 2.0
-    cutoff = min(presence_hz, nyq * 0.9)
-    if cutoff < nyq:
+    cutoff = min(presence_hz, nyq * 0.85)
+    if cutoff < nyq and presence_db > 0:
         try:
-            from scipy.signal import butter, sosfilt
+            from scipy.signal import butter, filtfilt
 
-            sos = butter(1, cutoff / nyq, btype="high", output="sos")
-            high = sosfilt(sos, out)
+            # 使用零相位滤波 (filtfilt)：前向+后向各一次，无相位偏移，无振铃
+            sos = butter(
+                2, cutoff / nyq, btype="high", output="sos"
+            )
+            high = filtfilt(sos, out.astype(np.float64)).astype(np.float32)
             additive_gain = 10.0 ** (presence_db / 20.0) - 1.0
             out = out + high * additive_gain
         except Exception:
             pass
 
-    # 3. Soft limit to keep within [-1, 1] without hard clipping
-    out = np.tanh(out * 1.2) / 1.2
+    # --- Step 4: Soft limit ---
+    out = np.tanh(out * 1.15) / 1.15
 
     return out.astype(np.float32)
 

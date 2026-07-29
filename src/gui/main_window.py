@@ -109,7 +109,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Translator InTime")
+        self.setWindowTitle("声渡 SoundFerry")
         self.setMinimumSize(860, 560)
         self.resize(1100, 720)
 

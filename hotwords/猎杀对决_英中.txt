@@ -1,0 +1,189 @@
+# 猎杀对决 / Hunt: Showdown 英→中 热词表
+# 格式：源词=目标译文
+# 大小写敏感，每行一对
+
+# === 游戏与机制 ===
+Hunt Showdown=猎杀对决
+Hunt=猎杀
+Showdown=对决
+Bloodline=血脉
+Bloodline Rank=血脉等级
+Hunt Dollars=猎金
+Blood Bonds=血债
+Prestige=转生
+Event=活动
+Battle Pass=通行证
+Reward=奖励
+Challenge=挑战
+Contract=合约
+Bounty=赏金
+Bounty Hunt=赏金任务
+Rift=裂隙
+Rift Token=裂隙代币
+Clue=线索
+Dark Sight=暗视
+Banish=驱逐
+Banishing=驱逐中
+Extract=撤离
+Extraction Point=撤离点
+Audio Cue=声音线索
+
+# === Boss ===
+Butcher=屠夫
+Assassin=刺客
+Spider=蜘蛛
+Scrapbeak=碎骨
+Rotjaw=腐颚
+Blighted Joe=枯萎乔
+
+# === 怪物 / PVE ===
+Grunt=普通僵尸
+Immolator=自燃者
+Meathead=肉堆
+Hive=蜂巢
+Hellhound=地狱犬
+Water Devil=水魔
+Armored=装甲怪
+Infected=感染者
+Plague=瘟疫
+
+# === 地点 / Compound ===
+Farm=农场
+Farmhouse=农舍
+Chapel=教堂
+Prison=监狱
+Docks=码头
+Refinery=炼油厂
+Wellhouse=井房
+Windmill=风车
+Sawmill=锯木厂
+Lumberyard=伐木场
+Distillery=酿酒厂
+Saltworks=盐矿
+Quarry=采石场
+Forge=铁匠铺
+Manor=庄园
+Fort=堡垒
+Port Reeker=鬼屋
+Lighthouse=灯塔
+Shipyard=沉船
+Wagon=马车
+Supply Tower=补给塔
+Nether Linnett=林奈特
+Blanchett=布兰切特
+Davenport=达文波特
+Cain=凯恩
+Seven Sons=七室
+
+# === 武器类型 ===
+Primary=主武器
+Secondary=副武器
+Melee=近战
+Tool=工具
+Consumable=消耗品
+Long Ammo=大枪弹
+Medium Ammo=中弹
+Compact Ammo=小弹
+Special Ammo=特殊弹
+Rifle=步枪
+Shotgun=霰弹枪
+Pistol=手枪
+Revolver=左轮
+Sniper=狙击
+Bow=弓
+Crossbow=十字弩
+Throwing Axe=投斧
+Throwing Knife=飞刀
+Explosive Crossbow=爆炸弩
+Fire Bomb=燃烧瓶
+Dum Dum=达姆弹
+Spitzer=穿甲弹
+Incendiary=燃烧弹
+Silenced=消音
+
+# === 武器名称 ===
+Romero=罗马尼
+Winchester=温彻斯特
+Winfield=温菲
+Springfield=春田
+Mosin=莫辛
+Lebel=勒贝尔
+Martini=马蒂尼
+Sparks=施帕斯
+Nagant=尼禄
+Caldwell=考德威尔
+Scottfield=桑顿
+Officer=军官左轮
+Hand Cannon=手炮
+Dolch=多尔赫
+Barker=柏克莱
+Maxim=马克斯
+
+# === 工具 ===
+First Aid Kit=急救包
+Medkit=医疗包
+Antidote=解毒剂
+Antidote Shot=解毒针
+Stamina Shot=强心剂
+Vitality Shot=生命药
+Flare=照明弹
+Concertina=铁丝网
+Trip Mine=绊雷
+Poison Mine=毒气陷阱
+Firecracker=爆竹
+Decoy=诱饵
+
+# === 状态与沟通 ===
+Burning=燃烧
+Poisoned=中毒
+Bleeding=流血
+Low HP=残血
+Full HP=满血
+Down=倒地
+Downed=被击倒
+Clear=安全
+Moving=走了
+Come Here=过来
+Help Me=帮我
+Cover Me=掩护我
+Wait=等等
+Together=一起
+Careful=小心
+Watch Out=注意
+Right=右边
+Left=左边
+Front=前面
+Behind=后面
+Rooftop=屋顶
+Second Floor=二楼
+Ground Floor=一楼
+Basement=地下室
+
+# === 战术 ===
+Sneak=静步
+Crouch Walk=蹲走
+Push=冲锋
+Fall Back=撤退
+Retreat=后撤
+Flank=绕后
+Pinch=包夹
+Camp=蹲点
+Hold Angle=架枪
+Peek=探头
+Engaging=交火
+Shooting=开枪
+Reload=换弹
+Empty=没子弹
+Steal=偷
+
+# === 撤离与赏金 ===
+Got Bounty=拿到赏金
+Carrying Bounty=带着赏金
+Banished=驱逐完成
+Boss Dead=Boss死了
+Boss Killed=Boss被杀了
+Going to Extract=去撤离
+At Extraction=到撤离了
+Extracted=已撤离
+Steal Bounty=偷赏金
+Camp Extraction=蹲撤离

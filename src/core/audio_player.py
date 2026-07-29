@@ -1,8 +1,9 @@
 """Audio playback and output routing using sounddevice."""
 
 import threading
+import time
 from queue import Queue
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import sounddevice as sd
@@ -29,6 +30,9 @@ class AudioPlayer:
         self._device_sr = _TTS_SR
         self._device_ch = 2
         self._query_device()
+        # 回调：每次一段播放结束后调用，传入该段真实播放时长（秒）
+        # 用途：外部可以据此延长麦克风回灌静音窗口
+        self.on_segment_finished: Callable[[float], None] | None = None
 
     def _query_device(self) -> None:
         """查询目标设备的实际采样率和声道数，优先升级到 WASAPI 2ch 版本。"""
@@ -148,11 +152,18 @@ class AudioPlayer:
                 data = self._queue.get(timeout=0.1)
             except Exception:
                 continue
+            t0 = time.time()
             try:
                 self._play_immediate(data)
             except Exception as exc:
                 logger.error(f"Audio playback error: {exc}")
             finally:
+                # 通知外部该段真实播放耗时（覆盖段间开销/重采样延迟）
+                if self.on_segment_finished is not None:
+                    try:
+                        self.on_segment_finished(time.time() - t0)
+                    except Exception:
+                        pass
                 secure_clear(bytearray(data))
 
     def set_device(self, device_id: int | str | None) -> None:

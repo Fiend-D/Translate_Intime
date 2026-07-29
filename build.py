@@ -119,6 +119,7 @@ def build_exe(debug: bool = False) -> None:
         ("python_protogen", "python_protogen"),
         ("config", "config"),
         ("assets", "assets"),
+        ("hotwords", "hotwords"),
     ]
 
     # 检查 specs 目录是否存在

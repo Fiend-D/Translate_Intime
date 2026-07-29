@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,25 @@ class TranslationPipeline(QObject):
         self._vad_pass_chunks = 0
         self._vad_drop_chunks = 0
         self._ducker = None
+
+        # --- 回灌抑制（feedback suppression） ---
+        # TTS 播放期间，麦克风音频**不丢弃**，而是缓存到 buffer。
+        # 当 TTS 静音窗口解除（玩家句间停顿够长）时，批量回放给翻译引擎。
+        # 好处：连续说话中间停顿不会被截断；同时回灌不会触发新翻译。
+        self._tts_playing_until: float = 0.0
+        self._tts_min_silence_sec: float = 2.0
+        self._tts_silence_margin_sec: float = 0.5
+        # outbound 麦克风缓存：每次回调追加
+        self._mic_buffer: list[bytes] = []
+        self._mic_buffer_bytes: int = 0
+        self._mic_buffer_max_bytes: int = 5 * 16000 * 2  # 最多 5 秒（16000Hz, 16bit, mono）
+        # 文本去重：8 秒内连续相同译文只播放一次
+        self._last_played_text: str = ""
+        self._last_played_at: float = 0.0
+        self._text_dedup_window_sec: float = 8.0
+        self._skip_next_audio_for: set[Direction] = set()
+        # 保护 buffer 写入的锁（on_pcm 在录音线程被调用）
+        self._mic_buffer_lock = threading.Lock()
 
         configure_logging(Path(config.log_dir), config.debug_mode)
 
@@ -213,6 +233,9 @@ class TranslationPipeline(QObject):
         want_player = self._play_outbound_voice or self._play_inbound_voice
         if want_player and self._player is None:
             self._player = AudioPlayer(self._output_device)
+            # 真实播放时长反馈：用每段"wall clock"延长麦克风静音窗口
+            # 解决 TTS 多段累积下静音窗口不足的问题
+            self._player.on_segment_finished = self._on_tts_segment_finished
             self._player.start()
 
         was_running = self._running
@@ -530,7 +553,28 @@ class TranslationPipeline(QObject):
         dp = self._directions.get(direction)
         if dp is None:
             return
-        dp.last_translated = text.strip()
+        cleaned = text.strip()
+        # 规范化：去标点/空格，用于回灌识别
+        normalized = "".join(ch for ch in cleaned if ch.isalnum())
+
+        # --- 文本去重：8 秒内连续相同译文只播放一次 ---
+        if is_final:
+            now = time.time()
+            if (
+                normalized
+                and normalized == self._last_played_text
+                and now - self._last_played_at < self._text_dedup_window_sec
+            ):
+                # 整句丢弃后续所有 TTS 段（直到下次句边界）
+                self._skip_next_audio_for.add(direction)
+                return
+            if normalized:
+                self._last_played_text = normalized
+                self._last_played_at = now
+            # 真正的"新句"：解除句级丢弃标记
+            self._skip_next_audio_for.discard(direction)
+
+        dp.last_translated = cleaned
         self._emit_volc_subtitle(direction, is_final=is_final)
 
     def _emit_volc_subtitle(self, direction: Direction, *, is_final: bool = True) -> None:
@@ -569,11 +613,35 @@ class TranslationPipeline(QObject):
             return
         if direction == Direction.INBOUND and not self._play_inbound_voice:
             return
+
+        # 句级去重：当前正在丢弃该方向的所有音频段
+        if direction in self._skip_next_audio_for:
+            return  # 持续丢弃直到句边界取消
+
+        # 用播放端"真实时长"做静音窗口（数据字节数 + 0.5s 余量，至少 2s）
+        # PCM16 单声道 16kHz → 每样本 2 字节
+        audio_len_sec = len(data) / 2.0 / 16000.0
+        candidate_end = time.time() + max(
+            self._tts_min_silence_sec,
+            audio_len_sec + self._tts_silence_margin_sec,
+        )
+        if candidate_end > self._tts_playing_until:
+            self._tts_playing_until = candidate_end
+
         if self._ducker is not None:
             with contextlib.suppress(Exception):
                 self._ducker.pulse()
         if self._player is not None:
             self._player.play(data)
+
+    def _on_tts_segment_finished(self, played_sec: float) -> None:
+        """AudioPlayer 一段播完后调用。用 wall clock 精确延长静音窗口，
+        避免 TTS 多段累积下窗口不足导致回灌。"""
+        if played_sec <= 0:
+            return
+        candidate = time.time() + played_sec + self._tts_silence_margin_sec
+        if candidate > self._tts_playing_until:
+            self._tts_playing_until = candidate
 
     def _on_volc_error(self, message: str) -> None:
         self.log_message.emit(message)
@@ -588,35 +656,91 @@ class TranslationPipeline(QObject):
             return
         if name not in self._volc.clients:
             return
-        gate = self._vad_outbound if name == "outbound" else self._vad_inbound
+
+        if name == "outbound":
+            # 麦克风走回灌抑制缓冲：TTS 播放期间音频入缓存，
+            # 窗口解除时回放给翻译引擎。
+            self._handle_mic_with_feedback_suppression(pcm)
+            return
+
+        # --- inbound（游戏字幕）走原始路径 ---
+        gate = self._vad_inbound
         if gate is not None:
             ok = gate.accept(pcm)
-            if name == "inbound":
-                if ok:
-                    self._vad_pass_chunks += 1
-                else:
-                    self._vad_drop_chunks += 1
-                now = time.time()
-                if now - self._vad_diag_at >= 5.0:
-                    self._vad_diag_at = now
-                    st = gate.stats()
-                    total = self._vad_pass_chunks + self._vad_drop_chunks
-                    if total:
-                        msg = (
-                            f"游戏捕获电平 RMS={st.rms:.4f} "
-                            f"VAD={'开' if st.open else '关'} "
-                            f"近5秒送出 {self._vad_pass_chunks}/{total}"
-                        )
-                        if st.rms < 0.002:
-                            msg += " · 几乎无声，请确认「游戏声音」选的是正在播放视频的扬声器 Loopback"
-                        elif self._vad_pass_chunks == 0:
-                            msg += " · 有声但被 VAD 拦住，可在设置把灵敏度改「宽松」或暂时关闭 VAD"
-                        self.log_message.emit(msg)
-                        self._vad_pass_chunks = 0
-                        self._vad_drop_chunks = 0
+            if ok:
+                self._vad_pass_chunks += 1
+            else:
+                self._vad_drop_chunks += 1
+            now = time.time()
+            if now - self._vad_diag_at >= 5.0:
+                self._vad_diag_at = now
+                st = gate.stats()
+                total = self._vad_pass_chunks + self._vad_drop_chunks
+                if total:
+                    msg = (
+                        f"游戏捕获电平 RMS={st.rms:.4f} "
+                        f"VAD={'开' if st.open else '关'} "
+                        f"近5秒送出 {self._vad_pass_chunks}/{total}"
+                    )
+                    if st.rms < 0.002:
+                        msg += " · 几乎无声，请确认「游戏声音」选的是正在播放视频的扬声器 Loopback"
+                    elif self._vad_pass_chunks == 0:
+                        msg += " · 有声但被 VAD 拦住，可在设置把灵敏度改「宽松」或暂时关闭 VAD"
+                    self.log_message.emit(msg)
+                    self._vad_pass_chunks = 0
+                    self._vad_drop_chunks = 0
             if not ok:
                 return
         self._volc.send_audio(name, pcm)
+
+    def _handle_mic_with_feedback_suppression(self, pcm: bytes) -> None:
+        """麦克风音频：TTS 播放期间入 buffer；窗口解除时回放。
+
+        关键点：buffer 写入必须在录音线程**快**（O(1)），
+        否则会卡住采集。实际回放放在主流程外。
+        """
+        in_silence = time.time() < self._tts_playing_until
+        if not in_silence:
+            # 窗口已解除：先把 buffer 残留（来自上次静音期）回放，再发当前帧
+            self._flush_mic_buffer()
+            self._send_mic_pcm(pcm)
+            return
+
+        # TTS 正在播放：缓存当前帧
+        with self._mic_buffer_lock:
+            self._mic_buffer.append(pcm)
+            self._mic_buffer_bytes += len(pcm)
+            # 超过上限：丢弃最早一段（FIFO），保留最近 5 秒
+            if self._mic_buffer_bytes > self._mic_buffer_max_bytes:
+                drop = self._mic_buffer.pop(0)
+                self._mic_buffer_bytes -= len(drop)
+                with contextlib.suppress(Exception):
+                    import array as _a
+                    _a.array("b", drop)  # 触发 zeroization best-effort
+
+    def _flush_mic_buffer(self) -> None:
+        """把缓存的麦克风音频批量送回翻译引擎。"""
+        with self._mic_buffer_lock:
+            if not self._mic_buffer:
+                return
+            chunks = self._mic_buffer
+            self._mic_buffer = []
+            self._mic_buffer_bytes = 0
+        if self._volc is None or "outbound" not in self._volc.clients:
+            return
+        # 拼接所有 chunk 一次性发送（Volc 接受变长 PCM）
+        try:
+            self._volc.send_audio("outbound", b"".join(chunks))
+        except Exception as exc:
+            logger.debug(f"flush mic buffer failed: {exc}")
+
+    def _send_mic_pcm(self, pcm: bytes) -> None:
+        """正常路径：实时发送麦克风音频（窗口已解除）。"""
+        if self._volc is None or "outbound" not in self._volc.clients:
+            return
+        # outbound 不做 VAD（实时性要求），全部送出
+        with contextlib.suppress(Exception):
+            self._volc.send_audio("outbound", pcm)
 
     def is_running(self) -> bool:
         return self._running
