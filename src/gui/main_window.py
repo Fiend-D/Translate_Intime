@@ -42,6 +42,7 @@ from src.audio.device_guard import (
     is_vb_cable_capture,
     is_vb_cable_input,
     is_virtual_or_loopback_input,
+    shares_physical_output_path,
     shares_virtual_cable_path,
     validate_channel_devices,
     vb_cable_setup_hint,
@@ -650,11 +651,10 @@ class MainWindow(QMainWindow):
             "仅作用于麦克风通道。静音/空噪不送火山。\n更改后需重新开启通道。"
         )
         vad_col.addWidget(self._chk_vad)
-        self._chk_vad_game = QCheckBox("游戏/视频 VAD（默认关）")
-        self._chk_vad_game.setChecked(False)
+        self._chk_vad_game = QCheckBox("游戏/视频 VAD")
+        self._chk_vad_game.setChecked(True)
         self._chk_vad_game.setToolTip(
-            "作用于游戏字幕通道。视频/游戏人声容易被误拦，默认关闭。\n"
-            "若枪战空噪幻觉严重再打开，并建议灵敏度选「宽松」。"
+            "作用于游戏字幕通道。默认优先 Silero，空噪较多时建议保持开启。"
         )
         vad_col.addWidget(self._chk_vad_game)
         vad_row = QHBoxLayout()
@@ -671,6 +671,16 @@ class MainWindow(QMainWindow):
             "严格：只送明显人声"
         )
         vad_row.addWidget(self._cmb_vad_sens)
+        vad_row.addWidget(self._field_label("后端"))
+        self._cmb_vad_backend = QComboBox()
+        self._prep_combo(self._cmb_vad_backend)
+        self._cmb_vad_backend.addItem("自动 Silero", "auto")
+        self._cmb_vad_backend.addItem("仅 Silero", "silero")
+        self._cmb_vad_backend.addItem("仅电平", "rms")
+        self._cmb_vad_backend.setToolTip(
+            "自动：优先 Silero ONNX，不可用时回退电平 VAD。\n更改后需重新开启通道。"
+        )
+        vad_row.addWidget(self._cmb_vad_backend)
         layout.addLayout(vad_row)
 
         duck_row = QHBoxLayout()
@@ -1265,6 +1275,9 @@ class MainWindow(QMainWindow):
         self._select_combo_data(
             self._cmb_vad_sens, getattr(cfg, "vad_sensitivity", "medium") or "medium"
         )
+        self._select_combo_data(
+            self._cmb_vad_backend, getattr(cfg, "vad_backend", "auto") or "auto"
+        )
         self._vad_open_ms = int(getattr(cfg, "vad_open_ms", 80) or 80)
         self._vad_hangover_ms = int(getattr(cfg, "vad_hangover_ms", 600) or 600)
         self._cmb_quality.blockSignals(True)
@@ -1273,7 +1286,7 @@ class MainWindow(QMainWindow):
         )
         self._cmb_quality.blockSignals(False)
         self._select_combo_data(
-            self._cmb_original_audio, getattr(cfg, "original_audio", "duck") or "duck"
+            self._cmb_original_audio, getattr(cfg, "original_audio", "mix") or "mix"
         )
         self._spn_duck_gain.setValue(float(getattr(cfg, "duck_gain", 0.2) or 0.2))
         self._select_combo_data(
@@ -1420,6 +1433,17 @@ class MainWindow(QMainWindow):
         self._suppress_tab_guard = False
         self._current_tab_index = index
 
+    def _effective_original_audio(self) -> str:
+        mode = self._cmb_original_audio.currentData() or "mix"
+        if (
+            mode == "duck"
+            and self._chk_enable_game.isChecked()
+            and self._chk_show_game.isChecked()
+            and not self._chk_play_game.isChecked()
+        ):
+            return "mix"
+        return str(mode)
+
     def _collect_config_from_ui(self) -> AppConfigModel:
         return AppConfigModel(
             source_language=self._cmb_mic_source.currentData(),
@@ -1458,12 +1482,15 @@ class MainWindow(QMainWindow):
             show_advanced_devices=self._chk_advanced.isChecked(),
             vad_enabled=self._chk_vad.isChecked(),
             vad_game_enabled=self._chk_vad_game.isChecked(),
+            vad_backend=self._cmb_vad_backend.currentData() or "auto",
             vad_sensitivity=self._cmb_vad_sens.currentData() or "medium",
             vad_open_ms=int(getattr(self, "_vad_open_ms", 80) or 80),
             vad_hangover_ms=int(getattr(self, "_vad_hangover_ms", 600) or 600),
+            vad_preroll_ms=int(getattr(self._config, "vad_preroll_ms", 300) or 300),
+            vad_barge_in_ms=int(getattr(self._config, "vad_barge_in_ms", 200) or 200),
             quality_preset=self._cmb_quality.currentData() or "balanced",
             capture_backend=self._cmb_capture_backend.currentData() or "auto",
-            original_audio=self._cmb_original_audio.currentData() or "duck",
+            original_audio=self._effective_original_audio(),
             duck_gain=float(self._spn_duck_gain.value()),
             volc_session_rotate_minutes=int(self._spn_rotate.value()),
             dota_coach_enabled=self._chk_dota_coach.isChecked(),
@@ -1478,6 +1505,7 @@ class MainWindow(QMainWindow):
         params = apply_quality_preset(self._cmb_quality.currentData() or "balanced")
         self._chk_vad.setChecked(params.vad_enabled)
         self._chk_vad_game.setChecked(params.vad_game_enabled)
+        self._select_combo_data(self._cmb_vad_backend, params.vad_backend)
         self._select_combo_data(self._cmb_vad_sens, params.vad_sensitivity)
         self._vad_open_ms = params.vad_open_ms
         self._vad_hangover_ms = params.vad_hangover_ms
@@ -1748,6 +1776,7 @@ class MainWindow(QMainWindow):
             loopback_device=self._cmb_loopback.currentData(),
             loopback_name=self._combo_label(self._cmb_loopback),
             play_mic_voice=self._chk_play_mic.isChecked(),
+            play_game_voice=self._chk_play_game.isChecked(),
             mic_channel_active=mic_active,
             game_channel_active=game_active,
         )
@@ -2522,6 +2551,24 @@ class MainWindow(QMainWindow):
 
         out = self._cmb_output.currentData()
         out_name = self._cmb_output.currentText()
+        game_capture_on = (
+            self._pipeline is not None
+            and self._pipeline.is_channel_active(Direction.INBOUND)
+        )
+        if game_capture_on and shares_physical_output_path(
+            output_name=out_name,
+            output_device=out,
+            loopback_name=self._cmb_loopback.currentText(),
+            loopback_device=self._cmb_loopback.currentData(),
+        ):
+            QMessageBox.critical(
+                self,
+                "音乐回灌风险",
+                "音乐输出与游戏字幕捕获共用同一虚拟线或扬声器 Loopback，"
+                "会被再次识别。\n\n"
+                "请把游戏捕获改成「免驱动（排除本应用）」或把音乐输出到另一只设备。",
+            )
+            return False
         self._music.set_device(out)
         self._music.set_volume(self._sld_music_vol.value() / 100.0)
         self._music.set_loop(self._chk_music_loop.isChecked())

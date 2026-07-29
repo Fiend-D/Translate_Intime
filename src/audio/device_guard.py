@@ -139,6 +139,52 @@ def is_system_loopback_capture(name: Any, device_id: Any = None) -> bool:
     )
 
 
+def is_process_exclude_capture(name: Any, device_id: Any = None) -> bool:
+    """True for the Windows driverless loopback that excludes this app."""
+    return "wasapi_proc_exclude:" in _blob(name, device_id)
+
+
+def _endpoint_key(name: Any, device_id: Any = None) -> str:
+    """Normalize render/capture labels enough to compare physical endpoints."""
+    text = _blob(name, device_id)
+    text = re.sub(r"wasapi_loopback:", " ", text)
+    text = re.sub(r"wasapi_proc_exclude:", " ", text)
+    text = re.sub(r"\[(?:loopback|默认|推荐)[^\]]*\]", " ", text)
+    text = re.sub(r"\b(?:loopback|monitor|default|默认|系统声音|回采|免驱动|排除本应用)\b", " ", text)
+    text = re.sub(r"^(?:🔊|🎧|🔁)\s*", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def shares_physical_output_path(
+    *,
+    output_name: str,
+    output_device: Any,
+    loopback_name: str,
+    loopback_device: Any,
+) -> bool:
+    """True when playback output is the same physical endpoint being looped back."""
+    if is_process_exclude_capture(loopback_name, loopback_device):
+        return False
+    if shares_virtual_cable_path(
+        output_name=output_name,
+        output_device=output_device,
+        loopback_name=loopback_name,
+        loopback_device=loopback_device,
+    ):
+        return True
+    if not is_system_loopback_capture(loopback_name, loopback_device):
+        return False
+    out_key = _endpoint_key(output_name, output_device)
+    lb_key = _endpoint_key(loopback_name, loopback_device)
+    if not out_key or not lb_key:
+        return False
+    if output_device is not None and loopback_device is not None:
+        if str(output_device) == str(loopback_device):
+            return True
+    return out_key in lb_key or lb_key in out_key
+
+
 def shares_virtual_cable_path(
     *,
     output_name: str,
@@ -303,6 +349,7 @@ def validate_channel_devices(
     loopback_device: Any,
     loopback_name: str,
     play_mic_voice: bool = False,
+    play_game_voice: bool = False,
     mic_channel_active: bool = False,
     game_channel_active: bool = False,
 ) -> list[DeviceIssue]:
@@ -341,6 +388,34 @@ def validate_channel_devices(
                         "译文输出设备与游戏捕获源是同一设备，必现回灌。请分开选择。",
                     )
                 )
+        if play_mic_voice and game_channel_active and shares_physical_output_path(
+            output_name=output_name,
+            output_device=output_device,
+            loopback_name=loopback_name,
+            loopback_device=loopback_device,
+        ):
+            issues.append(
+                DeviceIssue(
+                    "error",
+                    "麦克风译文正在播到游戏字幕捕获的同一扬声器/耳机 Loopback，"
+                    "会被再次识别。请把游戏捕获改成「免驱动（排除本应用）」或分开输出设备。",
+                )
+            )
+        if (
+            play_mic_voice
+            and game_channel_active
+            and output_device is None
+            and is_system_loopback_capture(loopback_name, loopback_device)
+            and not is_process_exclude_capture(loopback_name, loopback_device)
+        ):
+            issues.append(
+                DeviceIssue(
+                    "error",
+                    "已开启译文语音但输出设备为默认，同时游戏字幕使用经典 Loopback。"
+                    "默认扬声器很可能被再次捕获。请明确选择 CABLE Input / 另一只设备，"
+                    "或把游戏捕获改为「免驱动（排除本应用）」。",
+                )
+            )
         if IS_WINDOWS and output_device is None and play_mic_voice:
             issues.append(
                 DeviceIssue(
@@ -388,6 +463,36 @@ def validate_channel_devices(
                         "建议改选系统扬声器 Loopback。",
                     )
                 )
+        if (
+            (play_game_voice or (play_mic_voice and mic_channel_active))
+            and shares_physical_output_path(
+                output_name=output_name,
+                output_device=output_device,
+                loopback_name=loopback_name,
+                loopback_device=loopback_device,
+            )
+        ):
+            issues.append(
+                DeviceIssue(
+                    "error",
+                    "语音/音乐输出与游戏字幕捕获共用同一扬声器/耳机 Loopback，"
+                    "会造成回灌或回声。Windows 请优先选「免驱动（排除本应用）」；"
+                    "经典 Loopback 时请把译文/音乐输出到 CABLE Input 或另一只设备。",
+                )
+            )
+        if (
+            (play_game_voice or (play_mic_voice and mic_channel_active))
+            and output_device is None
+            and is_system_loopback_capture(loopback_name, loopback_device)
+            and not is_process_exclude_capture(loopback_name, loopback_device)
+        ):
+            issues.append(
+                DeviceIssue(
+                    "error",
+                    "语音输出为默认设备，游戏字幕使用经典 Loopback，无法保证不会捕获本应用声音。"
+                    "请改用「免驱动（排除本应用）」或明确选择不被捕获的输出设备。",
+                )
+            )
 
     return issues
 

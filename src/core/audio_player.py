@@ -1,5 +1,6 @@
 """Audio playback and output routing using sounddevice."""
 
+import contextlib
 import threading
 import time
 from queue import Queue
@@ -27,6 +28,9 @@ class AudioPlayer:
         self._queue: Queue[bytes] = Queue()
         self._running = False
         self._thread: threading.Thread | None = None
+        self._stream: sd.OutputStream | None = None
+        self._stream_key: tuple[object, int, int] | None = None
+        self._stream_lock = threading.Lock()
         self._device_sr = _TTS_SR
         self._device_ch = 2
         self._query_device()
@@ -133,13 +137,19 @@ class AudioPlayer:
     def stop(self) -> None:
         """Stop the playback thread and clear queued audio."""
         self._running = False
-        while not self._queue.empty():
-            data = self._queue.get()
-            secure_clear(bytearray(data))
+        self.clear_queue()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        self._close_stream()
         logger.info("Audio player stopped")
+
+    def clear_queue(self) -> None:
+        """Drop pending playback and close the active stream best-effort."""
+        while not self._queue.empty():
+            data = self._queue.get()
+            secure_clear(bytearray(data))
+        self._close_stream()
 
     def play(self, pcm16_bytes: bytes) -> None:
         """Enqueue PCM16 mono audio for playback."""
@@ -147,7 +157,7 @@ class AudioPlayer:
             self._queue.put(pcm16_bytes)
 
     def _playback_loop(self) -> None:
-        while self._running:
+        while self._running or not self._queue.empty():
             try:
                 data = self._queue.get(timeout=0.1)
             except Exception:
@@ -170,6 +180,7 @@ class AudioPlayer:
         """Change the output device."""
         self.device_id = device_id
         self._query_device()
+        self._close_stream()
 
     def _play_immediate(self, pcm16_bytes: bytes) -> None:
         # int16 → float32
@@ -186,18 +197,52 @@ class AudioPlayer:
         # 单声道转立体声（匹配设备声道数，避免 VB-Cable 16ch 映射错误）
         if self._device_ch == 2 and samples.ndim == 1:
             samples = np.column_stack([samples, samples])
+        elif self._device_ch == 1 and samples.ndim == 1:
+            samples = samples.reshape(-1, 1)
 
+        with self._stream_lock:
+            stream = self._ensure_stream_locked()
+            stream.write(np.ascontiguousarray(samples, dtype=np.float32))
+
+    def _resolve_device(self) -> int | None:
         device = self.device_id
         if isinstance(device, str):
             import os
 
             os.environ["PULSE_SINK"] = device
-            device = None
+            return None
+        return device
 
-        sd.play(
-            samples,
+    def _ensure_stream_locked(self) -> sd.OutputStream:
+        device = self._resolve_device()
+        key = (device, self._device_sr, self._device_ch)
+        if self._stream is not None and self._stream_key == key and self._stream.active:
+            return self._stream
+        self._close_stream_locked()
+        self._stream = sd.OutputStream(
             samplerate=self._device_sr,
+            channels=self._device_ch,
+            dtype="float32",
             device=device,
-            blocking=True,
         )
-        sd.wait()
+        self._stream.start()
+        self._stream_key = key
+        logger.info(
+            f"Audio output stream opened: device={self.device_id!r} "
+            f"sr={self._device_sr} ch={self._device_ch}"
+        )
+        return self._stream
+
+    def _close_stream(self) -> None:
+        with self._stream_lock:
+            self._close_stream_locked()
+
+    def _close_stream_locked(self) -> None:
+        stream = self._stream
+        self._stream = None
+        self._stream_key = None
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.stop()
+            with contextlib.suppress(Exception):
+                stream.close()

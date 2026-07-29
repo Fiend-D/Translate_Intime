@@ -69,6 +69,7 @@ class TranslationPipeline(QObject):
         self._loopback_device: int | str | None = None
         self._vad_outbound: SpeechGate | None = None
         self._vad_inbound: SpeechGate | None = None
+        self._vad_outbound_filters = False
         self._vad_diag_at = 0.0
         self._vad_pass_chunks = 0
         self._vad_drop_chunks = 0
@@ -85,6 +86,7 @@ class TranslationPipeline(QObject):
         self._mic_buffer: list[bytes] = []
         self._mic_buffer_bytes: int = 0
         self._mic_buffer_max_bytes: int = 5 * 16000 * 2  # 最多 5 秒（16000Hz, 16bit, mono）
+        self._barge_in_started_at: float = 0.0
         # 文本去重：8 秒内连续相同译文只播放一次
         self._last_played_text: str = ""
         self._last_played_at: float = 0.0
@@ -205,7 +207,12 @@ class TranslationPipeline(QObject):
         self.log_message.emit(f"火山同传已就绪（{label}）")
 
         if direction == Direction.OUTBOUND:
-            self._vad_outbound = self._make_vad("mic")
+            self._validate_feedback_routes(Direction.OUTBOUND)
+            self._vad_outbound_filters = bool(getattr(self._config, "vad_enabled", True))
+            self._vad_outbound = self._make_vad(
+                "mic",
+                force=bool(self._play_outbound_voice),
+            )
             self._capture_outbound = AudioCapture(
                 Direction.OUTBOUND,
                 self._input_device,
@@ -218,6 +225,7 @@ class TranslationPipeline(QObject):
         else:
             loopback = self._resolve_loopback_device()
             self._loopback_device = loopback
+            self._validate_feedback_routes(Direction.INBOUND)
             self._vad_inbound = self._make_vad("game")
             self._capture_inbound = AudioCapture(
                 Direction.INBOUND,
@@ -259,11 +267,16 @@ class TranslationPipeline(QObject):
         if direction == Direction.OUTBOUND and self._vad_outbound is not None:
             sens = getattr(self._config, "vad_sensitivity", "medium") or "medium"
             preset = getattr(self._config, "quality_preset", "balanced") or "balanced"
-            self.log_message.emit(f"麦克风 VAD 已启用（{sens} · 档位 {preset}）")
+            backend = self._vad_outbound.backend
+            mode = "过滤+抢话" if self._vad_outbound_filters else "抢话检测"
+            self.log_message.emit(
+                f"麦克风 VAD 已启用（{backend}/{sens} · 档位 {preset} · {mode}）"
+            )
         elif direction == Direction.INBOUND and self._vad_inbound is not None:
             sens = getattr(self._config, "vad_sensitivity", "medium") or "medium"
             preset = getattr(self._config, "quality_preset", "balanced") or "balanced"
-            self.log_message.emit(f"游戏字幕 VAD 已启用（{sens} · 档位 {preset}）")
+            backend = self._vad_inbound.backend
+            self.log_message.emit(f"游戏字幕 VAD 已启用（{backend}/{sens} · 档位 {preset}）")
         elif direction == Direction.INBOUND:
             self.log_message.emit("游戏字幕 VAD 已关闭（视频/游戏人声更完整）")
 
@@ -312,21 +325,91 @@ class TranslationPipeline(QObject):
             "请打开「高级」，在「游戏声音」里手动选择正在播放视频的扬声器/耳机 Loopback。"
         )
 
-    def _make_vad(self, profile: str) -> SpeechGate | None:
+    def _device_name(self, device: int | str | None, *, kind: str) -> str:
+        if device in (None, ""):
+            return ""
+        try:
+            if kind == "output":
+                for d in AudioPlayer.list_devices():
+                    did = d.get("index", d.get("id"))
+                    if str(did) == str(device):
+                        return str(d.get("name", ""))
+            else:
+                from src.audio.stream import list_audio_devices
+
+                for d in list_audio_devices().get("input", []):
+                    did = d.get("index", d.get("id"))
+                    if str(did) == str(device):
+                        return str(d.get("name", ""))
+                for d in AudioCapture.list_input_devices():
+                    did = d.get("index", d.get("id"))
+                    if str(did) == str(device):
+                        return str(d.get("name", ""))
+        except Exception as exc:
+            logger.debug(f"device name lookup failed ({kind}): {exc}")
+        return str(device)
+
+    def _validate_feedback_routes(self, direction: Direction) -> None:
+        """Block routes where app playback would be captured by the game channel."""
+        inbound_active = self._inbound_active or direction == Direction.INBOUND
+        voice_playback = self._play_outbound_voice or self._play_inbound_voice
+        if not inbound_active or not voice_playback:
+            return
+
+        try:
+            from src.audio.device_guard import (
+                is_process_exclude_capture,
+                is_system_loopback_capture,
+                shares_physical_output_path,
+            )
+
+            output_name = self._device_name(self._output_device, kind="output")
+            loopback_name = self._device_name(self._loopback_device, kind="input")
+            if shares_physical_output_path(
+                output_name=output_name,
+                output_device=self._output_device,
+                loopback_name=loopback_name,
+                loopback_device=self._loopback_device,
+            ):
+                raise EngineLoadError(
+                    "语音输出与游戏字幕捕获共用同一虚拟线或扬声器 Loopback，"
+                    "会造成回灌。请改用「免驱动（排除本应用）」捕获，"
+                    "或把译文输出到 CABLE Input / 另一只设备。"
+                )
+            if (
+                self._output_device is None
+                and is_system_loopback_capture(loopback_name, self._loopback_device)
+                and not is_process_exclude_capture(loopback_name, self._loopback_device)
+            ):
+                raise EngineLoadError(
+                    "语音输出为默认设备，游戏字幕使用经典 Loopback，"
+                    "无法保证不会捕获本应用声音。请改用「免驱动（排除本应用）」"
+                    "或明确选择 CABLE Input / 另一只输出设备。"
+                )
+        except EngineLoadError:
+            raise
+        except Exception as exc:
+            logger.debug(f"feedback route validation skipped: {exc}")
+
+    def _make_vad(self, profile: str, *, force: bool = False) -> SpeechGate | None:
         if profile == "game":
-            if not bool(getattr(self._config, "vad_game_enabled", False)):
+            if not force and not bool(getattr(self._config, "vad_game_enabled", True)):
                 return None
-        elif not bool(getattr(self._config, "vad_enabled", True)):
+        elif not force and not bool(getattr(self._config, "vad_enabled", True)):
             return None
         sens = getattr(self._config, "vad_sensitivity", "medium") or "medium"
         open_ms = int(getattr(self._config, "vad_open_ms", 80) or 80)
         hangover_ms = int(getattr(self._config, "vad_hangover_ms", 600) or 600)
+        backend = getattr(self._config, "vad_backend", "auto") or "auto"
+        preroll_ms = int(getattr(self._config, "vad_preroll_ms", 300) or 300)
         return SpeechGate(
             profile=profile,
             sensitivity=str(sens),
             sample_rate=16000,
             open_ms=open_ms,
             hangover_ms=hangover_ms,
+            backend=str(backend),
+            preroll_ms=preroll_ms,
         )
 
     def _ensure_ducker(self) -> None:
@@ -334,14 +417,14 @@ class TranslationPipeline(QObject):
             return
         from src.audio.session_ducker import SessionDucker
 
-        mode = getattr(self._config, "original_audio", "duck") or "duck"
+        mode = getattr(self._config, "original_audio", "mix") or "mix"
         gain = float(getattr(self._config, "duck_gain", 0.2) or 0.2)
         self._ducker = SessionDucker(mode=mode, duck_gain=gain)
 
     def _refresh_ducker_config(self) -> None:
         if self._ducker is None:
             return
-        mode = getattr(self._config, "original_audio", "duck") or "duck"
+        mode = getattr(self._config, "original_audio", "mix") or "mix"
         gain = float(getattr(self._config, "duck_gain", 0.2) or 0.2)
         self._ducker.configure(mode=mode, duck_gain=gain)
 
@@ -366,6 +449,8 @@ class TranslationPipeline(QObject):
                     self._capture_outbound.stop()
                 self._capture_outbound = None
             self._vad_outbound = None
+            self._vad_outbound_filters = False
+            self._barge_in_started_at = 0.0
             self._outbound_active = False
             self._play_outbound_voice = False
         else:
@@ -666,7 +751,8 @@ class TranslationPipeline(QObject):
         # --- inbound（游戏字幕）走原始路径 ---
         gate = self._vad_inbound
         if gate is not None:
-            ok = gate.accept(pcm)
+            result = gate.process(pcm)
+            ok = result.passed
             if ok:
                 self._vad_pass_chunks += 1
             else:
@@ -678,10 +764,12 @@ class TranslationPipeline(QObject):
                 total = self._vad_pass_chunks + self._vad_drop_chunks
                 if total:
                     msg = (
-                        f"游戏捕获电平 RMS={st.rms:.4f} "
+                        f"游戏捕获电平 {st.backend} RMS={st.rms:.4f} "
                         f"VAD={'开' if st.open else '关'} "
                         f"近5秒送出 {self._vad_pass_chunks}/{total}"
                     )
+                    if st.backend == "silero":
+                        msg += f" prob={st.speech_prob:.2f}"
                     if st.rms < 0.002:
                         msg += " · 几乎无声，请确认「游戏声音」选的是正在播放视频的扬声器 Loopback"
                     elif self._vad_pass_chunks == 0:
@@ -691,6 +779,9 @@ class TranslationPipeline(QObject):
                     self._vad_drop_chunks = 0
             if not ok:
                 return
+            if result.opened_now and result.preroll:
+                self._volc.send_audio(name, result.preroll + pcm)
+                return
         self._volc.send_audio(name, pcm)
 
     def _handle_mic_with_feedback_suppression(self, pcm: bytes) -> None:
@@ -699,14 +790,39 @@ class TranslationPipeline(QObject):
         关键点：buffer 写入必须在录音线程**快**（O(1)），
         否则会卡住采集。实际回放放在主流程外。
         """
-        in_silence = time.time() < self._tts_playing_until
+        now = time.time()
+        gate = self._vad_outbound
+        result = gate.process(pcm) if gate is not None else None
+        in_silence = now < self._tts_playing_until
         if not in_silence:
+            self._barge_in_started_at = 0.0
             # 窗口已解除：先把 buffer 残留（来自上次静音期）回放，再发当前帧
             self._flush_mic_buffer()
-            self._send_mic_pcm(pcm)
+            self._send_mic_pcm(pcm, gate_result=result)
             return
 
         # TTS 正在播放：缓存当前帧
+        if result is not None and result.opened_now and result.preroll:
+            self._append_mic_buffer(result.preroll)
+        self._append_mic_buffer(pcm)
+
+        if result is None or not result.passed:
+            self._barge_in_started_at = 0.0
+            return
+
+        if self._barge_in_started_at <= 0:
+            self._barge_in_started_at = now
+            return
+
+        barge_ms = int(getattr(self._config, "vad_barge_in_ms", 200) or 200)
+        if (now - self._barge_in_started_at) * 1000 < barge_ms:
+            return
+
+        self._end_tts_mute_for_barge_in()
+
+    def _append_mic_buffer(self, pcm: bytes) -> None:
+        if not pcm:
+            return
         with self._mic_buffer_lock:
             self._mic_buffer.append(pcm)
             self._mic_buffer_bytes += len(pcm)
@@ -717,6 +833,16 @@ class TranslationPipeline(QObject):
                 with contextlib.suppress(Exception):
                     import array as _a
                     _a.array("b", drop)  # 触发 zeroization best-effort
+
+    def _end_tts_mute_for_barge_in(self) -> None:
+        self._barge_in_started_at = 0.0
+        self._tts_playing_until = time.time()
+        if self._player is not None:
+            with contextlib.suppress(Exception):
+                self._player.clear_queue()
+        self.log_message.emit("检测到抢话，提前结束 TTS 静音")
+        logger.info("Barge-in detected; ending TTS mute early")
+        self._flush_mic_buffer()
 
     def _flush_mic_buffer(self) -> None:
         """把缓存的麦克风音频批量送回翻译引擎。"""
@@ -734,11 +860,17 @@ class TranslationPipeline(QObject):
         except Exception as exc:
             logger.debug(f"flush mic buffer failed: {exc}")
 
-    def _send_mic_pcm(self, pcm: bytes) -> None:
+    def _send_mic_pcm(self, pcm: bytes, *, gate_result: object | None = None) -> None:
         """正常路径：实时发送麦克风音频（窗口已解除）。"""
         if self._volc is None or "outbound" not in self._volc.clients:
             return
-        # outbound 不做 VAD（实时性要求），全部送出
+        if self._vad_outbound is not None and self._vad_outbound_filters:
+            result = gate_result if gate_result is not None else self._vad_outbound.process(pcm)
+            if not getattr(result, "passed", False):
+                return
+            preroll = getattr(result, "preroll", b"") if getattr(result, "opened_now", False) else b""
+            if preroll:
+                pcm = preroll + pcm
         with contextlib.suppress(Exception):
             self._volc.send_audio("outbound", pcm)
 

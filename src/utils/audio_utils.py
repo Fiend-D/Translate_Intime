@@ -84,13 +84,13 @@ def enhance_clarity(
     cutoff = min(presence_hz, nyq * 0.85)
     if cutoff < nyq and presence_db > 0:
         try:
-            from scipy.signal import butter, filtfilt
+            from scipy.signal import butter, sosfiltfilt
 
             # 使用零相位滤波 (filtfilt)：前向+后向各一次，无相位偏移，无振铃
             sos = butter(
                 2, cutoff / nyq, btype="high", output="sos"
             )
-            high = filtfilt(sos, out.astype(np.float64)).astype(np.float32)
+            high = sosfiltfilt(sos, out.astype(np.float64)).astype(np.float32)
             additive_gain = 10.0 ** (presence_db / 20.0) - 1.0
             out = out + high * additive_gain
         except Exception:

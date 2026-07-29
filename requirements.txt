@@ -4,6 +4,7 @@ sounddevice>=0.4.6
 soundfile>=0.12.1
 numpy>=1.26
 scipy>=1.12
+onnxruntime>=1.17
 pydantic>=2.5
 loguru>=0.7
 httpx>=0.26

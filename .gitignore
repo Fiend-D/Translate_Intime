@@ -1,10 +1,13 @@
 # ---- Local models / caches ----
-models/
+/models/
 checkpoints/
 *.pth
 *.pt
 *.bin
 *.onnx
+!resource/
+!resource/vad/
+!resource/vad/.gitkeep
 *.safetensors
 torch_cache/
 transformers_cache/
