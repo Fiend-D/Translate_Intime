@@ -20,10 +20,14 @@ class _FakeEngine:
         self.engine_id = "volc"
         self.active_directions = frozenset({Direction.OUTBOUND})
         self.sent: list[bytes] = []
+        self.pending: list[Direction] = []
 
     def send_pcm(self, direction: Direction, data: bytes) -> None:
         assert direction == Direction.OUTBOUND
         self.sent.append(data)
+
+    def notify_pcm_pending(self, direction: Direction) -> None:
+        self.pending.append(direction)
 
     def close(self) -> None:
         return None
@@ -70,3 +74,25 @@ def test_barge_in_clears_tts_and_flushes_buffer(tmp_path) -> None:
     assert pipeline._engine.sent
     assert silence in pipeline._engine.sent[0]
     assert loud in pipeline._engine.sent[0]
+
+
+def test_feedback_buffer_limit_flushes_all_audio_instead_of_dropping(tmp_path) -> None:
+    pipeline = TranslationPipeline(
+        AppConfigModel(log_dir=str(tmp_path / "logs"), vad_enabled=False)
+    )
+    engine = _FakeEngine()
+    player = _FakePlayer()
+    player.is_playing = True
+    pipeline._engine = engine
+    pipeline._player = player
+
+    first = _pcm(1000)
+    second = _pcm(2000)
+    pipeline._feedback_buffer_max_bytes = len(first) + 1
+    pipeline._handle_pcm_with_feedback_suppression(Direction.OUTBOUND, first)
+    pipeline._handle_pcm_with_feedback_suppression(Direction.OUTBOUND, second)
+
+    assert engine.pending == [Direction.OUTBOUND, Direction.OUTBOUND]
+    assert player.cleared is True
+    assert engine.sent == [first + second]
+    assert pipeline._feedback_buffer_bytes[Direction.OUTBOUND] == 0

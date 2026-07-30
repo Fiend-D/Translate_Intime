@@ -48,6 +48,7 @@ class AudioCapture:
         self._audio_stream = None
         # Optional low-latency sink (e.g. Volc). When set, PCM bypasses the Qt tick queue.
         self.on_pcm: Callable[[bytes], None] | None = None
+        self.on_error: Callable[[Exception], None] | None = None
 
     def list_devices(self) -> list[dict[str, Any]]:
         return self.list_input_devices()
@@ -151,6 +152,10 @@ class AudioCapture:
                 samples = self._audio_stream.read_chunk()
             except Exception as exc:
                 logger.warning(f"AudioStream read failed ({self.direction.value}): {exc}")
+                self._running = False
+                if self.on_error is not None:
+                    with contextlib.suppress(Exception):
+                        self.on_error(exc)
                 break
             if samples is None:
                 import time as _time
@@ -194,7 +199,8 @@ class AudioCapture:
                 self._pyaudio.terminate()
             self._pyaudio = None
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            if self._thread is not threading.current_thread():
+                self._thread.join(timeout=2.0)
             self._thread = None
         if self._audio_stream is not None:
             with contextlib.suppress(Exception):

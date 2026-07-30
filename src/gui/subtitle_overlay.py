@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Callable, override
+from collections.abc import Callable
+from typing import override
 
-from PyQt6.QtCore import QPoint, QPropertyAnimation, QRect, Qt, QEasingCurve, QSize
+from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, QSize, Qt, QTimer
 from PyQt6.QtGui import (
     QColor,
     QCursor,
@@ -72,6 +73,11 @@ class SubtitleOverlay(QWidget):
         self._current_orig = ""
         self._current_trans = ""
         self._was_final = True
+        self._pending_final_pair: tuple[str, str] | None = None
+        self._finalize_timer = QTimer(self)
+        self._finalize_timer.setSingleShot(True)
+        self._finalize_timer.setInterval(800)
+        self._finalize_timer.timeout.connect(self._confirm_pending_final)
         self._dragging = False
         self._resizing = False
         self._drag_offset = QPoint()
@@ -290,6 +296,13 @@ class SubtitleOverlay(QWidget):
     def set_text(self, original: str, translated: str, *, is_final: bool = True) -> None:
         orig = original or ""
         trans = translated or ""
+        incoming_pair = (orig, trans)
+        if (
+            self._finalize_timer.isActive()
+            and self._pending_final_pair is not None
+            and self._pending_final_pair != incoming_pair
+        ):
+            self._confirm_pending_final()
         # After a finalized line, a new utterance archives the previous one
         if (
             self._history_cap > 0
@@ -302,30 +315,49 @@ class SubtitleOverlay(QWidget):
 
         self._current_orig = orig
         self._current_trans = trans
-        self._was_final = is_final
         self._original.setText(orig if self._show_original else "")
         self._translated.setText(trans)
-        # Interim: instant update (豆包式跟打); final: soft fade confirm
-        if is_final:
-            alpha = int(self._opacity * 255)
-            self._translated.setStyleSheet(
-                f"color: rgba(255,255,255,{alpha}); "
-                f"font-size: {self._font_size}px; font-weight: 600; background: transparent;"
-            )
-            self._anim.stop()
-            self._fade.setOpacity(0.45)
-            self._anim.setStartValue(0.45)
-            self._anim.setEndValue(1.0)
-            self._anim.start()
-        else:
-            alpha = int(self._opacity * 200)
-            self._translated.setStyleSheet(
-                f"color: rgba(255,255,255,{alpha}); "
-                f"font-size: {self._font_size}px; font-weight: 500; background: transparent;"
-            )
-            self._anim.stop()
-            self._fade.setOpacity(0.92)
+        # A translated pair stays visually "in progress" for a short reading
+        # window before the final confirmation animation and history rollover.
+        if is_final and self._pending_final_pair != incoming_pair:
+            self._pending_final_pair = incoming_pair
+            self._was_final = False
+            self._apply_interim_style()
+            self._finalize_timer.start()
+        elif not is_final:
+            self._pending_final_pair = None
+            self._finalize_timer.stop()
+            self._was_final = False
+            self._apply_interim_style()
         # Re-fit history if current block height changed
+        self._render_history()
+
+    def _apply_interim_style(self) -> None:
+        alpha = int(self._opacity * 200)
+        self._translated.setStyleSheet(
+            f"color: rgba(255,255,255,{alpha}); "
+            f"font-size: {self._font_size}px; font-weight: 500; background: transparent;"
+        )
+        self._anim.stop()
+        self._fade.setOpacity(0.92)
+
+    def _confirm_pending_final(self) -> None:
+        pair = self._pending_final_pair
+        if pair is None or pair != (self._current_orig, self._current_trans):
+            return
+        self._pending_final_pair = None
+        self._finalize_timer.stop()
+        self._was_final = True
+        alpha = int(self._opacity * 255)
+        self._translated.setStyleSheet(
+            f"color: rgba(255,255,255,{alpha}); "
+            f"font-size: {self._font_size}px; font-weight: 600; background: transparent;"
+        )
+        self._anim.stop()
+        self._fade.setOpacity(0.45)
+        self._anim.setStartValue(0.45)
+        self._anim.setEndValue(1.0)
+        self._anim.start()
         self._render_history()
 
     def set_font_size(self, size: int) -> None:

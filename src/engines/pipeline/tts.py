@@ -223,7 +223,7 @@ class AutoTts:
     ) -> None:
         self._prefer = (prefer or "auto").lower()
         self._kokoro = kokoro or KokoroOnnxTts(
-            voice_en=voice_en or "af_heart",
+            voice_en=voice_en or "af_bella",
             voice_zh=voice_zh or "zf_xiaoxiao",
         )
         self._edge = edge or EdgePcmTts()

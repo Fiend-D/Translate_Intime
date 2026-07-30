@@ -6,16 +6,25 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.request import urlretrieve
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import numpy as np
 
+from src.engines.pipeline.sentence_split import (
+    ensure_terminal_punct,
+    is_punct_only,
+    split_sentences,
+)
 from src.utils.audio_utils import float32_to_pcm16, resample
 from src.utils.logger import logger
 
 _TARGET_SR = 16000
 _CACHE_ROOT = Path.home() / ".cache" / "translator_intime" / "kokoro"
 _LOG_INTERVAL_SEC = 30.0
+_INTER_SENTENCE_SILENCE_MS = 120
+_DOWNLOAD_CHUNK_BYTES = 1024 * 256
+_DOWNLOAD_TIMEOUT_SECONDS = 120
 
 _GH_MIRRORS = (
     "https://ghfast.top/https://github.com",
@@ -55,7 +64,7 @@ _ZH_VOICES_URLS = _mirror(
     "model-files-v1.1/voices-v1.1-zh.bin"
 )
 
-DEFAULT_VOICE_EN = "af_heart"
+DEFAULT_VOICE_EN = "af_bella"
 DEFAULT_VOICE_ZH = "zf_xiaoxiao"
 _ZH_VOICE_FALLBACKS = (
     "zf_xiaoxiao",
@@ -66,12 +75,17 @@ _ZH_VOICE_FALLBACKS = (
 )
 
 
+def _silence_pcm(ms: int, *, sample_rate: int = _TARGET_SR) -> bytes:
+    samples = max(0, int(sample_rate * ms / 1000.0))
+    return b"\x00\x00" * samples
+
+
 class KokoroOnnxTts:
     """Lazy-download Kokoro ONNX TTS.
 
     ``configured`` is True when at least the English model is loaded.
-    Chinese assets are loaded when present; otherwise zh falls back to en voice
-    with a clear log note.
+    Chinese requires the zh model; if missing, synthesize returns None for zh
+    so AutoTts can fall back to edge-tts (never English voice reading Chinese).
     """
 
     def __init__(
@@ -80,12 +94,14 @@ class KokoroOnnxTts:
         cache_dir: Path | str | None = None,
         voice_en: str = DEFAULT_VOICE_EN,
         voice_zh: str = DEFAULT_VOICE_ZH,
+        speed: float = 0.92,
         auto_download: bool = True,
         device_preference: str = "auto",
     ) -> None:
         self._cache_dir = Path(cache_dir) if cache_dir else _CACHE_ROOT
         self._voice_en = (voice_en or DEFAULT_VOICE_EN).strip() or DEFAULT_VOICE_EN
         self._voice_zh = (voice_zh or DEFAULT_VOICE_ZH).strip() or DEFAULT_VOICE_ZH
+        self._speed = float(max(0.7, min(1.3, speed)))
         self._auto_download = auto_download
         self._device_preference = (device_preference or "auto").strip().lower()
         self._started = False
@@ -94,7 +110,7 @@ class KokoroOnnxTts:
         self._loading = False
         self._zh_ready = False
         self._last_err_at = 0.0
-        self._zh_fallback_logged = False
+        self._zh_missing_logged = False
         self._lock = threading.Lock()
         self._kokoro_en: Any = None
         self._kokoro_zh: Any = None
@@ -136,15 +152,39 @@ class KokoroOnnxTts:
 
     def synthesize(self, text: str, *, language: str) -> bytes | None:
         text = (text or "").strip()
-        if not text or not self._started:
+        if not text or is_punct_only(text) or not self._started:
             return None
         if not self._ready:
             if not self._failed:
                 self.start_loading()
             return None
         lang = (language or "en")[:2].lower()
+        # Never synthesize Chinese with the English model — let AutoTts use edge-tts.
+        if lang == "zh" and not self._zh_ready:
+            if not self._zh_missing_logged:
+                self._zh_missing_logged = True
+                logger.warning(
+                    "Kokoro 中文模型不可用，跳过 EN 音色朗读中文（将回退 edge-tts）"
+                )
+            return None
         try:
-            return self._synthesize_locked(text, lang=lang)
+            sentences = split_sentences(text, min_chars=1)
+            if not sentences:
+                sentences = [text]
+            chunks: list[bytes] = []
+            for _i, sentence in enumerate(sentences):
+                if is_punct_only(sentence):
+                    continue
+                unit = ensure_terminal_punct(sentence)
+                pcm = self._synthesize_locked(unit, lang=lang)
+                if not pcm:
+                    continue
+                if chunks:
+                    chunks.append(_silence_pcm(_INTER_SENTENCE_SILENCE_MS))
+                chunks.append(pcm)
+            if not chunks:
+                return None
+            return b"".join(chunks)
         except Exception as exc:
             now = time.time()
             if now - self._last_err_at >= _LOG_INTERVAL_SEC:
@@ -156,15 +196,12 @@ class KokoroOnnxTts:
         with self._lock:
             if lang == "zh" and self._kokoro_zh is not None:
                 samples, sr = self._create_zh(text)
+            elif lang == "zh":
+                return None
             elif self._kokoro_en is not None:
-                if lang == "zh" and not self._zh_fallback_logged:
-                    self._zh_fallback_logged = True
-                    logger.info(
-                        "Kokoro 中文模型不可用，暂用英文音色合成（音质可能不佳）"
-                    )
                 voice = self._pick_voice(lang)
                 samples, sr = self._kokoro_en.create(
-                    text, voice=voice, speed=1.0
+                    text, voice=voice, speed=self._speed
                 )
             else:
                 return None
@@ -177,14 +214,14 @@ class KokoroOnnxTts:
         if self._zh_g2p is not None:
             phonemes, _ = self._zh_g2p(text)
             return self._kokoro_zh.create(
-                phonemes, voice=voice, speed=1.0, is_phonemes=True
+                phonemes, voice=voice, speed=self._speed, is_phonemes=True
             )
         try:
             return self._kokoro_zh.create(
-                text, voice=voice, speed=1.0, lang="cmn"
+                text, voice=voice, speed=self._speed, lang="cmn"
             )
         except TypeError:
-            return self._kokoro_zh.create(text, voice=voice, speed=1.0)
+            return self._kokoro_zh.create(text, voice=voice, speed=self._speed)
 
     def _pick_voice(self, lang: str) -> str:
         if lang == "zh":
@@ -193,6 +230,8 @@ class KokoroOnnxTts:
             return self._voice_en
         if "af_bella" in self._en_voices:
             return "af_bella"
+        if "af_heart" in self._en_voices:
+            return "af_heart"
         return next(iter(sorted(self._en_voices)), self._voice_en)
 
     def _pick_zh_voice(self) -> str:
@@ -229,8 +268,10 @@ class KokoroOnnxTts:
             self._failed = not ok
             self._loading = False
         if ok:
-            zh = "含中文" if self._zh_ready else "仅英文（中文将回退）"
-            logger.info(f"Kokoro TTS 已就绪（{zh}）: {self._cache_dir}")
+            zh = "含中文" if self._zh_ready else "仅英文（中文将回退 edge-tts）"
+            logger.info(
+                f"Kokoro TTS 已就绪（{zh}）speed={self._speed:.2f}: {self._cache_dir}"
+            )
         else:
             logger.warning("Kokoro 不可用，将尝试 edge-tts 回退（若已安装）")
 
@@ -295,11 +336,12 @@ class KokoroOnnxTts:
                         zh_g2p = misaki_zh.ZHG2P()
                     except Exception:
                         zh_g2p = None
-                        logger.info(
-                            "未安装 misaki[zh]，中文将直接送入 Kokoro（建议: pip install 'misaki[zh]'）"
+                        logger.warning(
+                            "未安装 misaki[zh]，中文韵律可能偏硬；"
+                            "建议: pip install 'misaki[zh]'"
                         )
                 except Exception as exc:
-                    logger.warning(f"Kokoro 中文模型加载失败，将回退英文: {exc}")
+                    logger.warning(f"Kokoro 中文模型加载失败，中文将回退 edge-tts: {exc}")
                     kokoro_zh = None
 
             with self._lock:
@@ -357,22 +399,23 @@ class KokoroOnnxTts:
                 logger.warning(f"Kokoro 文件缺失且禁用下载: {path}")
             return False
         url_list = [urls] if isinstance(urls, str) else list(urls)
-        from src.utils.proxy_env import prepare_model_download_env
+        from src.utils.proxy_env import prepare_model_download_env, without_proxy
 
         prepare_model_download_env()
         path.parent.mkdir(parents=True, exist_ok=True)
         last_exc: Exception | None = None
-        for url in url_list:
-            try:
-                logger.info(f"正在下载 Kokoro: {url}")
-                tmp = path.with_suffix(path.suffix + ".part")
-                urlretrieve(url, tmp)
-                tmp.replace(path)
-                logger.info(f"Kokoro 已保存: {path}")
-                return True
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(f"Kokoro 镜像失败（{url}）: {exc}")
+        with without_proxy():
+            for url in url_list:
+                try:
+                    logger.info(f"正在下载 Kokoro: {url}")
+                    tmp = path.with_suffix(path.suffix + ".part")
+                    self._download_url(url, tmp)
+                    tmp.replace(path)
+                    logger.info(f"Kokoro 已保存: {path}")
+                    return True
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(f"Kokoro 镜像失败（{url}）: {exc}")
         if required:
             logger.warning(f"Kokoro 下载失败: {last_exc}")
             err = str(last_exc).lower() if last_exc else ""
@@ -380,7 +423,28 @@ class KokoroOnnxTts:
                 logger.warning(
                     "代理相关失败提示: 请改用 Clash HTTP 端口 "
                     "(http://127.0.0.1:7890)，或 pip install PySocks"
+                    "；或取消 TRANSLATOR_INTIME_USE_PROXY 以直连下载"
                 )
             return False
         logger.info(f"Kokoro 可选资源下载跳过/失败: {last_exc}")
         return False
+
+    @staticmethod
+    def _download_url(url: str, target: Path) -> None:
+        """Download atomically with a timeout and Content-Length validation."""
+        target.unlink(missing_ok=True)
+        request = Request(url, headers={"User-Agent": "translator-intime/1.0"})
+        with urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
+            content_length = response.headers.get("Content-Length")
+            expected = int(content_length) if content_length and content_length.isdigit() else None
+            written = 0
+            with target.open("wb") as output:
+                while chunk := response.read(_DOWNLOAD_CHUNK_BYTES):
+                    output.write(chunk)
+                    written += len(chunk)
+        if expected is not None and written != expected:
+            target.unlink(missing_ok=True)
+            raise URLError(f"下载长度不匹配: got={written} expected={expected}")
+        if written <= 0:
+            target.unlink(missing_ok=True)
+            raise URLError("下载文件为空")

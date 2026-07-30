@@ -264,8 +264,11 @@ class FasterWhisperAsr:
         compute_type = _resolve_compute_type(device)
         cache_dir = whisper_cache_dir(self._model_id)
 
-        # 设置 HF 镜像 (优先 hf-mirror.com)
+        # 设置 HF 镜像 (优先 hf-mirror.com)，并绕过系统代理直连下载
+        from src.utils.proxy_env import prepare_model_download_env, without_proxy
+
         cache_dir.mkdir(parents=True, exist_ok=True)
+        prepare_model_download_env()
         prev_endpoint = os.environ.get("HF_ENDPOINT", "")
         if not prev_endpoint:
             os.environ["HF_ENDPOINT"] = _HF_ENDPOINTS[0]
@@ -275,12 +278,13 @@ class FasterWhisperAsr:
             f"compute={compute_type} cache={cache_dir}"
         )
         try:
-            self._model = WhisperModel(
-                self._whisper_size,
-                device=device,
-                compute_type=compute_type,
-                download_root=str(cache_dir),
-            )
+            with without_proxy():
+                self._model = WhisperModel(
+                    self._whisper_size,
+                    device=device,
+                    compute_type=compute_type,
+                    download_root=str(cache_dir),
+                )
         finally:
             # 恢复 HF_ENDPOINT (如果之前没设置)
             if not prev_endpoint:

@@ -3,11 +3,11 @@
 import contextlib
 import threading
 import time
+from collections.abc import Callable
 from queue import Queue
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
-import sounddevice as sd
 
 from src.utils.audio_utils import (
     bytes_to_pcm16_array,
@@ -20,6 +20,13 @@ from src.utils.logger import logger
 _TTS_SR = 16000
 
 
+def _sounddevice() -> Any:
+    """Import PortAudio bindings only when playback/device access is requested."""
+    import sounddevice
+
+    return sounddevice
+
+
 class AudioPlayer:
     """Plays PCM16 audio bytes to a selected output device."""
 
@@ -28,7 +35,7 @@ class AudioPlayer:
         self._queue: Queue[bytes] = Queue()
         self._running = False
         self._thread: threading.Thread | None = None
-        self._stream: sd.OutputStream | None = None
+        self._stream: Any | None = None
         self._stream_key: tuple[object, int, int] | None = None
         self._stream_lock = threading.Lock()
         self._device_sr = _TTS_SR
@@ -42,6 +49,7 @@ class AudioPlayer:
     def _query_device(self) -> None:
         """查询目标设备的实际采样率和声道数，优先升级到 WASAPI 2ch 版本。"""
         try:
+            sd = _sounddevice()
             dev = self.device_id
             if isinstance(dev, str):
                 # Linux Pulse sink 名称，无法直接查询
@@ -56,10 +64,8 @@ class AudioPlayer:
             # 如果选中的是 MME/DirectSound 且声道 > 2，查找同名的 WASAPI 2ch 版本
             api_name = ""
             if api_idx >= 0:
-                try:
+                with contextlib.suppress(Exception):
                     api_name = sd.query_hostapis(api_idx).get("name", "")
-                except Exception:
-                    pass
 
             if api_name in ("MME", "Windows DirectSound") and ch > 2:
                 wasapi_dev = self._find_wasapi_device(name)
@@ -82,6 +88,7 @@ class AudioPlayer:
     def _find_wasapi_device(name: str) -> int | None:
         """查找同名设备的 WASAPI 2ch 版本。"""
         try:
+            sd = _sounddevice()
             for i, d in enumerate(sd.query_devices()):
                 if d.get("max_output_channels", 0) != 2:
                     continue
@@ -111,6 +118,7 @@ class AudioPlayer:
             return list_output_devices()
         except Exception:
             # Fallback: plain sounddevice enumeration if the helper is missing.
+            sd = _sounddevice()
             devices: list[dict[str, Any]] = []
             for i, info in enumerate(sd.query_devices()):
                 if info.get("max_output_channels", 0) > 0:
@@ -185,10 +193,8 @@ class AudioPlayer:
             finally:
                 # 通知外部该段真实播放耗时（覆盖段间开销/重采样延迟）
                 if self.on_segment_finished is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         self.on_segment_finished(time.time() - t0)
-                    except Exception:
-                        pass
                 secure_clear(bytearray(data))
 
     def set_device(self, device_id: int | str | None) -> None:
@@ -243,7 +249,8 @@ class AudioPlayer:
             return None
         return device
 
-    def _ensure_stream_locked(self) -> sd.OutputStream:
+    def _ensure_stream_locked(self) -> Any:
+        sd = _sounddevice()
         device = self._resolve_device()
         key = (device, self._device_sr, self._device_ch)
         if self._stream is not None and self._stream_key == key and self._stream.active:

@@ -59,22 +59,30 @@ class AppConfigModel(BaseModel):
 
     # Economy mode (Fun-ASR + NLLB local MT + Kokoro TTS)
     economy_dashscope_api_key: str = ""
-    economy_asr_backend: Literal["dashscope", "local", "live_captions"] = "live_captions"
+    # UI combo uses dashscope / local / live_captions; sherpa|whisper are aliases of local.
+    economy_asr_backend: Literal[
+        "dashscope", "local", "live_captions", "sherpa", "whisper"
+    ] = "live_captions"
     economy_asr_model: str = "fun-asr-realtime"  # DashScope model (dashscope backend)
     economy_asr_local_model: str = "faster-whisper-medium"
     economy_mt_backend: Literal["auto", "nllb", "argos", "mymemory"] = "nllb"
     economy_tts_backend: Literal["auto", "kokoro", "edge"] = "kokoro"
     economy_nllb_model: str = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
     economy_offline_setup_done: bool = False  # first-run offline model dialog completed
-    economy_kokoro_voice_en: str = "af_heart"
+    economy_kokoro_voice_en: str = "af_bella"
     economy_kokoro_voice_zh: str = "zf_xiaoxiao"
+    economy_kokoro_speed: float = Field(default=0.92, ge=0.7, le=1.3)
+    economy_sentence_min_chars: int = Field(default=4, ge=1, le=40)
+    economy_sentence_pause_ms: int = Field(default=900, ge=300, le=3000)
+    economy_sentence_max_wait_ms: int = Field(default=2800, ge=1200, le=10000)
     # 设备偏好: auto (自动检测) / cpu / cuda
     device_preference: Literal["auto", "cpu", "cuda"] = "auto"
     economy_utterance_silence_ms: int = Field(default=300, ge=50, le=5000)
     economy_utterance_min_ms: int = Field(default=400, ge=50, le=10000)
     economy_utterance_max_ms: int = Field(default=8000, ge=500, le=60000)
-    # 连续音频软切分: 累积 ≥soft_split_ms 且尾部 RMS <tail_rms 时立即切分
-    economy_utterance_soft_split_ms: int = Field(default=5000, ge=500, le=60000)
+    # 连续音频软切分: 累积 ≥soft_split_ms 且近 soft_split_quiet_ms 窗口 RMS <tail_rms
+    economy_utterance_soft_split_ms: int = Field(default=6000, ge=500, le=60000)
+    economy_utterance_soft_split_quiet_ms: int = Field(default=280, ge=50, le=2000)
     economy_utterance_tail_rms: float = Field(default=0.003, ge=0.0005, le=0.05)
 
     hotwords: list[str] = Field(default_factory=list)
@@ -126,10 +134,9 @@ class AppConfigModel(BaseModel):
         return result
 
     @model_validator(mode="after")
-    def _languages_must_differ(self) -> "AppConfigModel":
+    def _languages_must_differ(self) -> AppConfigModel:
         if self.source_language == self.target_language:
             raise ValueError("source_language and target_language must be different")
         # Keep use_volc aligned with translation_mode for older readers.
         object.__setattr__(self, "use_volc", self.translation_mode == "volc")
         return self
-

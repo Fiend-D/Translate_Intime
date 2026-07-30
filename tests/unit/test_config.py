@@ -1,8 +1,11 @@
 """Unit tests for configuration validation."""
 
+import json
+
 import pytest
 
 from src.models.config import AppConfigModel
+from src.utils import config_manager
 
 
 def test_default_config_is_valid() -> None:
@@ -11,6 +14,7 @@ def test_default_config_is_valid() -> None:
     assert config.target_language == "en"
     assert config.use_volc is True
     assert config.translation_mode == "volc"
+    assert config.economy_asr_backend == "live_captions"
 
 
 def test_translation_mode_economy_sets_use_volc_false() -> None:
@@ -42,3 +46,167 @@ def test_window_positions_validation() -> None:
 def test_invalid_window_position_key() -> None:
     with pytest.raises(ValueError, match="Invalid window position keys"):
         AppConfigModel(subtitle_window_positions={"unknown": (0, 0, 100, 100)})
+
+
+def test_load_config_preserves_intentional_dashscope(tmp_path, monkeypatch) -> None:
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    cfg_file = cfg_dir / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "source_language": "zh",
+                "target_language": "en",
+                "translation_mode": "economy",
+                "economy_asr_backend": "dashscope",
+                "economy_dashscope_api_key": "sk-keep",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
+    loaded = config_manager.load_config()
+    assert loaded.economy_asr_backend == "dashscope"
+    assert loaded.economy_dashscope_api_key == "sk-keep"
+
+
+def test_load_config_maps_sherpa_whisper_aliases(tmp_path, monkeypatch) -> None:
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    cfg_file = cfg_dir / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "source_language": "zh",
+                "target_language": "en",
+                "economy_asr_backend": "whisper",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
+    loaded = config_manager.load_config()
+    assert loaded.economy_asr_backend == "local"
+
+
+def test_validate_config_allows_economy_local_without_dashscope() -> None:
+    ok, msg = config_manager.validate_config(
+        AppConfigModel(
+            translation_mode="economy",
+            economy_asr_backend="local",
+            economy_dashscope_api_key="",
+        )
+    )
+    assert ok is True
+    assert msg == ""
+
+
+def test_load_config_ignores_unavailable_keyring(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps({"source_language": "zh", "target_language": "en"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
+    monkeypatch.setattr(
+        config_manager.keyring,
+        "get_password",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("no backend")),
+    )
+
+    loaded = config_manager.load_config()
+
+    assert loaded.volc_api_key == ""
+
+
+def test_legacy_yaml_app_id_is_not_used_as_api_key(tmp_path, monkeypatch) -> None:
+    yaml_path = tmp_path / "config" / "default_config.yaml"
+    yaml_path.parent.mkdir()
+    yaml_path.write_text(
+        "translation:\n  source_lang: zh\n  target_lang: en\n  volc_app_id: app-id-only\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    loaded = config_manager._seed_from_yaml_defaults()
+
+    assert loaded is not None
+    assert loaded.volc_api_key == ""
+    assert loaded.volc_console_app_id == "app-id-only"
+
+
+def test_merge_config_updates_preserves_engine_only_settings() -> None:
+    original = AppConfigModel(
+        economy_kokoro_speed=1.08,
+        economy_sentence_min_chars=9,
+        economy_sentence_pause_ms=1350,
+        economy_sentence_max_wait_ms=3600,
+        economy_utterance_soft_split_ms=7400,
+        economy_utterance_soft_split_quiet_ms=420,
+        economy_utterance_tail_rms=0.006,
+    )
+
+    updated = config_manager.merge_config_updates(original, subtitle_font_size=30)
+
+    assert updated.subtitle_font_size == 30
+    assert updated.economy_kokoro_speed == 1.08
+    assert updated.economy_sentence_min_chars == 9
+    assert updated.economy_sentence_pause_ms == 1350
+    assert updated.economy_sentence_max_wait_ms == 3600
+    assert updated.economy_utterance_soft_split_ms == 7400
+    assert updated.economy_utterance_soft_split_quiet_ms == 420
+    assert updated.economy_utterance_tail_rms == 0.006
+
+
+def test_new_economy_settings_survive_save_load_round_trip(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
+    original = AppConfigModel(
+        translation_mode="economy",
+        economy_asr_backend="local",
+        economy_asr_local_model="faster-whisper-medium",
+        economy_kokoro_voice_en="am_michael",
+        economy_kokoro_speed=1.08,
+        economy_sentence_min_chars=9,
+        economy_sentence_pause_ms=1350,
+        economy_sentence_max_wait_ms=3600,
+        economy_utterance_soft_split_ms=7400,
+        economy_utterance_soft_split_quiet_ms=420,
+        economy_utterance_tail_rms=0.006,
+    )
+
+    config_manager.save_config(original)
+    loaded = config_manager.load_config()
+
+    assert loaded == original
+
+
+def test_explicit_legacy_looking_values_are_not_migrated_after_save(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
+    original = AppConfigModel(
+        translation_mode="economy",
+        economy_asr_backend="local",
+        economy_asr_local_model="auto",
+        economy_kokoro_voice_en="af_heart",
+        economy_utterance_silence_ms=450,
+        economy_utterance_max_ms=12000,
+        economy_utterance_soft_split_ms=5000,
+    )
+
+    config_manager.save_config(original)
+    loaded = config_manager.load_config()
+
+    assert loaded == original
+
+
+def test_merge_config_updates_revalidates_values() -> None:
+    config = AppConfigModel(source_language="zh", target_language="en")
+
+    with pytest.raises(ValueError, match="must be different"):
+        config_manager.merge_config_updates(config, source_language="en")

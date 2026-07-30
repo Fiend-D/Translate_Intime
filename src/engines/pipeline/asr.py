@@ -6,9 +6,11 @@ import os
 import tempfile
 import time
 import wave
+from contextlib import suppress
 from pathlib import Path
 from typing import Protocol
 
+from src.engines.pipeline.sentence_split import is_cjk_majority
 from src.utils.logger import logger
 
 _STUB_MSG = "经济模式尚未配置 ASR（需要 DashScope API Key）"
@@ -73,13 +75,16 @@ class DashScopeAsr:
         *,
         api_key: str,
         model: str = "fun-asr-realtime",
+        hotwords: list[str] | None = None,
     ) -> None:
         self._api_key = (api_key or "").strip()
         self._model = (model or "fun-asr-realtime").strip() or "fun-asr-realtime"
+        self._hotwords = [h.strip() for h in (hotwords or []) if h and str(h).strip()]
         self._started = False
         self._dashscope = None
         self._Recognition = None
         self._import_warned = False
+        self._hotword_warned = False
         self._last_err_at = 0.0
         self._configured = False
         self._try_import()
@@ -157,6 +162,82 @@ class DashScopeAsr:
             wf.writeframes(pcm)
         return path
 
+    def _recognition_kwargs(
+        self,
+        *,
+        model: str,
+        fmt: str,
+        language_hints: list[str],
+        callback=None,  # noqa: ANN001
+    ) -> dict:
+        kwargs: dict = {
+            "model": model,
+            "format": fmt,
+            "sample_rate": 16000,
+            "callback": callback,
+            "language_hints": language_hints,
+        }
+        # Semantic punctuation improves sentence boundaries for Fun-ASR / Paraformer.
+        for key, value in (
+            ("semantic_punctuation_enabled", True),
+            ("semantic_punctuation", True),
+        ):
+            kwargs[key] = value
+
+        if self._hotwords:
+            # Try common DashScope vocabulary / phrase kwargs; drop unsupported later.
+            phrase = " ".join(self._hotwords)
+            for key, value in (
+                ("vocabulary_id", None),
+                ("phrase_list", self._hotwords),
+                ("hotwords", phrase),
+                ("hotword", phrase),
+            ):
+                if value is not None:
+                    kwargs[key] = value
+        return kwargs
+
+    def _build_recognition(self, kwargs: dict):
+        assert self._Recognition is not None
+        # Drop unknown kwargs one-by-one if the SDK rejects them.
+        attempt = dict(kwargs)
+        optional_keys = (
+            "semantic_punctuation_enabled",
+            "semantic_punctuation",
+            "phrase_list",
+            "hotwords",
+            "hotword",
+            "vocabulary_id",
+        )
+        last_exc: TypeError | None = None
+        for _ in range(len(optional_keys) + 1):
+            try:
+                return self._Recognition(**attempt)
+            except TypeError as exc:
+                last_exc = exc
+                msg = str(exc)
+                dropped = False
+                for key in optional_keys:
+                    if key in attempt and (key in msg or "unexpected" in msg.lower()):
+                        if key in ("phrase_list", "hotwords", "hotword", "vocabulary_id"):
+                            if self._hotwords and not self._hotword_warned:
+                                self._hotword_warned = True
+                                logger.info(
+                                    "DashScope Recognition 不支持热词参数，已忽略 hotwords"
+                                )
+                        attempt.pop(key, None)
+                        dropped = True
+                        break
+                if not dropped:
+                    for key in optional_keys:
+                        attempt.pop(key, None)
+                    try:
+                        return self._Recognition(**attempt)
+                    except TypeError as exc2:
+                        raise exc2 from last_exc
+        assert last_exc is not None
+        raise last_exc
+
     def _call_recognition(
         self,
         path: Path,
@@ -164,26 +245,17 @@ class DashScopeAsr:
         *,
         model_override: str | None = None,
     ) -> str | None:
-        assert self._Recognition is not None
         model = model_override or self._model
-        kwargs: dict = {
-            "model": model,
-            "format": "wav",
-            "sample_rate": 16000,
-            "callback": None,
-        }
-        # language_hints is mainly for paraformer-realtime-v2; harmless to pass when supported.
-        if "paraformer" in model or model_override:
-            kwargs["language_hints"] = language_hints
-        recognition = self._Recognition(**kwargs)
+        kwargs = self._recognition_kwargs(
+            model=model, fmt="wav", language_hints=language_hints, callback=None
+        )
+        recognition = self._build_recognition(kwargs)
 
         if hasattr(recognition, "call"):
             result = recognition.call(str(path))
             return self._parse_result(result)
 
         # Streaming fallback: start / send_audio_frame / stop
-        from http import HTTPStatus
-
         sentences: list[str] = []
 
         class _Cb:
@@ -204,13 +276,13 @@ class DashScopeAsr:
             def on_complete(self) -> None:
                 return None
 
-        recognition = self._Recognition(
+        stream_kwargs = self._recognition_kwargs(
             model=model,
-            format="pcm",
-            sample_rate=16000,
+            fmt="pcm",
+            language_hints=language_hints,
             callback=_Cb(),
-            **({"language_hints": language_hints} if "paraformer" in model else {}),
         )
+        recognition = self._build_recognition(stream_kwargs)
         recognition.start()
         try:
             with open(path, "rb") as f:
@@ -225,7 +297,18 @@ class DashScopeAsr:
             with suppress(Exception):
                 recognition.stop()
             raise
-        joined = "".join(sentences).strip()
+        return self._join_sentences(sentences)
+
+    @staticmethod
+    def _join_sentences(parts: list[str]) -> str | None:
+        cleaned = [p.strip() for p in parts if p and p.strip()]
+        if not cleaned:
+            return None
+        blob = "".join(cleaned)
+        if is_cjk_majority(blob):
+            joined = "".join(cleaned).strip()
+        else:
+            joined = " ".join(cleaned).strip()
         return joined or None
 
     @staticmethod
@@ -265,7 +348,7 @@ class DashScopeAsr:
                     elif isinstance(item, str) and item.strip():
                         parts.append(item.strip())
                 if parts:
-                    return "".join(parts)
+                    return DashScopeAsr._join_sentences(parts)
             if isinstance(sentence, dict):
                 t = (sentence.get("text") or sentence.get("sentence") or "").strip()
                 if t:
@@ -284,7 +367,7 @@ class DashScopeAsr:
                         if t:
                             parts.append(t)
                 if parts:
-                    return "".join(parts)
+                    return DashScopeAsr._join_sentences(parts)
             if isinstance(s, dict):
                 return (s.get("text") or "").strip() or None
             if isinstance(s, str):

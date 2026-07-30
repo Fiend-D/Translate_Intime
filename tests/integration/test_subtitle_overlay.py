@@ -20,6 +20,15 @@ def test_overlay_set_text(overlay):
     assert overlay._translated.text() == "Hello"
 
 
+def test_final_translation_has_reading_grace(overlay, qtbot):
+    overlay.set_text("hello", "你好", is_final=True)
+    assert overlay._was_final is False
+
+    qtbot.waitUntil(lambda: overlay._was_final, timeout=1500)
+
+    assert overlay._was_final is True
+
+
 def test_overlay_lock_toggles_mouse_transparency(overlay):
     assert not overlay.is_locked()
     overlay.set_locked(True)

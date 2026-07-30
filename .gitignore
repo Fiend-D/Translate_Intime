@@ -8,6 +8,7 @@ checkpoints/
 *.bin
 *.onnx
 *.safetensors
+*.part
 # Local downloaded assets under resource/ (keep placeholder .gitkeep)
 resource/mt/
 resource/nllb/*
@@ -33,8 +34,6 @@ __pycache__/
 venv/
 ENV/
 env/
-.venv
-venv
 build/
 develop-eggs/
 dist/
@@ -132,6 +131,7 @@ _cursor.md
 .codex/
 agent-transcripts/
 .agent-tools/
+memory-bank/
 
 # ---- Misc ----
 *.tmp

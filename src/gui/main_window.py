@@ -55,13 +55,14 @@ from src.core.pipeline import TranslationPipeline
 from src.core.usage_tracker import UsageState, UsageTracker
 from src.core.volc_engine import VOLC_VOICE_OPTIONS
 from src.gui.music_sidebar import MusicSidebarOverlay
+from src.gui.settings_dirty import wire_dirty_tracking
 from src.gui.styles import ThemeMode, get_stylesheet
 from src.gui.subtitle_overlay import SubtitleOverlay
 from src.gui.toast import show_toast
 from src.models.config import AppConfigModel
 from src.models.enums import Direction
 from src.models.subtitle import SubtitleEntry
-from src.utils.config_manager import load_config, save_config
+from src.utils.config_manager import load_config, merge_config_updates, save_config
 from src.utils.hotkeys import AppHotkeys, DEFAULT_HOTKEYS, GlobalHotkeys, HOTKEY_LABELS, HotkeyBridge
 from src.utils.logger import logger
 
@@ -168,6 +169,7 @@ class MainWindow(QMainWindow):
         self._lang_signals_wired = False
         self._current_tab_index = 0
         self._suppress_tab_guard = False
+        self._model_loading_names: tuple[str, ...] = ()
         self._wheel_filter = _WheelBlockFilter(self)
 
         self._setup_ui()
@@ -230,8 +232,13 @@ class MainWindow(QMainWindow):
         self._chk_show_game.toggled.connect(self._on_show_overlay_toggled)
         self._chk_enable_mic.toggled.connect(self._on_enable_toggled)
         self._chk_enable_game.toggled.connect(self._on_enable_toggled)
+        self._wire_dirty_tracking()
         self._on_enable_toggled()
         self._refresh_unlock_button()
+
+    def _wire_dirty_tracking(self) -> None:
+        """Refresh unsaved-state UI for every current and future settings control."""
+        wire_dirty_tracking(self, self._update_save_button)
 
     def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
         """Allow panel content to scroll instead of crushing text when short."""
@@ -1400,10 +1407,11 @@ class MainWindow(QMainWindow):
             )
         if hasattr(self, "_cmb_asr_backend"):
             self._cmb_asr_backend.blockSignals(True)
-            self._select_combo_data(
-                self._cmb_asr_backend,
-                getattr(cfg, "economy_asr_backend", "live_captions") or "live_captions",
-            )
+            asr_ui = getattr(cfg, "economy_asr_backend", "live_captions") or "live_captions"
+            # Combo only has local|live_captions|dashscope; map aliases for display.
+            if asr_ui in ("sherpa", "whisper"):
+                asr_ui = "local"
+            self._select_combo_data(self._cmb_asr_backend, asr_ui)
             self._cmb_asr_backend.blockSignals(False)
         if hasattr(self, "_cmb_local_asr_model"):
             self._cmb_local_asr_model.blockSignals(True)
@@ -1603,19 +1611,12 @@ class MainWindow(QMainWindow):
         self._suppress_tab_guard = False
         self._current_tab_index = index
 
-    def _effective_original_audio(self) -> str:
-        mode = self._cmb_original_audio.currentData() or "mix"
-        if (
-            mode == "duck"
-            and self._chk_enable_game.isChecked()
-            and self._chk_show_game.isChecked()
-            and not self._chk_play_game.isChecked()
-        ):
-            return "mix"
-        return str(mode)
-
     def _collect_config_from_ui(self) -> AppConfigModel:
-        return AppConfigModel(
+        # Merge into the complete loaded model. Engine-only/new settings that do
+        # not have controls on this screen must not reset when the user saves an
+        # unrelated UI option.
+        return merge_config_updates(
+            self._config,
             source_language=self._cmb_mic_source.currentData(),
             target_language=self._cmb_mic_target.currentData(),
             subtitle_font_size=self._spn_font.value(),
@@ -1676,13 +1677,22 @@ class MainWindow(QMainWindow):
                 getattr(self._config, "economy_offline_setup_done", False)
             ),
             economy_kokoro_voice_en=getattr(
-                self._config, "economy_kokoro_voice_en", "af_heart"
+                self._config, "economy_kokoro_voice_en", "af_bella"
             )
-            or "af_heart",
+            or "af_bella",
             economy_kokoro_voice_zh=getattr(
                 self._config, "economy_kokoro_voice_zh", "zf_xiaoxiao"
             )
             or "zf_xiaoxiao",
+            economy_kokoro_speed=float(
+                getattr(self._config, "economy_kokoro_speed", 0.92) or 0.92
+            ),
+            economy_sentence_min_chars=int(
+                getattr(self._config, "economy_sentence_min_chars", 4) or 4
+            ),
+            economy_sentence_pause_ms=int(
+                getattr(self._config, "economy_sentence_pause_ms", 900) or 900
+            ),
             device_preference=(
                 self._cmb_device_pref.currentData()
                 if hasattr(self, "_cmb_device_pref")
@@ -1699,7 +1709,11 @@ class MainWindow(QMainWindow):
                 getattr(self._config, "economy_utterance_max_ms", 8000) or 8000
             ),
             economy_utterance_soft_split_ms=int(
-                getattr(self._config, "economy_utterance_soft_split_ms", 5000) or 5000
+                getattr(self._config, "economy_utterance_soft_split_ms", 6000) or 6000
+            ),
+            economy_utterance_soft_split_quiet_ms=int(
+                getattr(self._config, "economy_utterance_soft_split_quiet_ms", 280)
+                or 280
             ),
             economy_utterance_tail_rms=float(
                 getattr(self._config, "economy_utterance_tail_rms", 0.003) or 0.003
@@ -1730,7 +1744,9 @@ class MainWindow(QMainWindow):
             vad_barge_in_ms=int(getattr(self._config, "vad_barge_in_ms", 200) or 200),
             quality_preset=self._cmb_quality.currentData() or "balanced",
             capture_backend=self._cmb_capture_backend.currentData() or "auto",
-            original_audio=self._effective_original_audio(),
+            # Persist the user's selected policy even when the current channel
+            # state means ducking is temporarily inactive.
+            original_audio=self._cmb_original_audio.currentData() or "mix",
             duck_gain=float(self._spn_duck_gain.value()),
             volc_session_rotate_minutes=int(self._spn_rotate.value()),
             dota_coach_enabled=self._chk_dota_coach.isChecked(),
@@ -1801,29 +1817,48 @@ class MainWindow(QMainWindow):
         else:
             self._append_log(msg)
         if mode == "economy":
-            asr_pref = getattr(self._config, "economy_asr_backend", "live_captions") or "live_captions"
-            if asr_pref in ("local", "live_captions"):
+            from src.engines.pipeline.engine import (
+                LOCAL_ASR_BACKENDS,
+                resolve_dashscope_api_key,
+                resolve_economy_asr_backend,
+            )
+
+            # Prefer live combo selection so toast matches what the user sees.
+            asr_pref = ""
+            if hasattr(self, "_cmb_asr_backend") and self._cmb_asr_backend.currentData():
+                asr_pref = str(self._cmb_asr_backend.currentData())
+            asr_pref = asr_pref or resolve_economy_asr_backend(self._config)
+            if asr_pref in LOCAL_ASR_BACKENDS:
                 if asr_pref == "live_captions":
                     self._append_log(
                         "经济模式已使用 Windows Live Captions（系统级ASR），无需 API Key"
                     )
                 else:
+                    import sys
+
+                    raw = getattr(self._config, "economy_asr_backend", "") or ""
+                    if raw == "live_captions" and not sys.platform.startswith("win"):
+                        self._append_log(
+                            "Live Captions 仅支持 Windows；已自动切换为本地 ASR"
+                        )
                     self._append_log(
                         "经济模式已使用本地 ASR，无需 DashScope API Key"
                     )
-            else:
-                key = ""
-                if hasattr(self, "_txt_dashscope_key"):
-                    key = self._txt_dashscope_key.text().strip()
-                key = key or (
-                    getattr(self._config, "economy_dashscope_api_key", "") or ""
-                ).strip()
-                import os as _os
-
-                if not key and not (_os.environ.get("DASHSCOPE_API_KEY") or "").strip():
-                    warn = "经济模式需要 DashScope API Key（设置页填写或环境变量 DASHSCOPE_API_KEY），或切换为「本地 ASR」"
-                    self._append_log(warn)
-                    show_toast(warn)
+            elif not (
+                (
+                    self._txt_dashscope_key.text().strip()
+                    if hasattr(self, "_txt_dashscope_key")
+                    else ""
+                )
+                or resolve_dashscope_api_key(self._config)
+            ):
+                warn = (
+                    "经济模式云端 ASR 需要 DashScope API Key"
+                    "（设置页填写或环境变量 DASHSCOPE_API_KEY），"
+                    "或切换为「本地 ASR / Live Captions」"
+                )
+                self._append_log(warn)
+                show_toast(warn)
 
     def _ensure_economy_offline_setup(self) -> bool:
         """Show first-run offline model dialog if needed. Returns False if cancelled."""
@@ -1936,7 +1971,20 @@ class MainWindow(QMainWindow):
         )
         self._persist_config()
 
-        label = "本地 sherpa-onnx" if backend == "local" else "云端 DashScope"
+        if backend == "live_captions":
+            label = "Windows Live Captions"
+            import sys
+
+            if not sys.platform.startswith("win"):
+                warn = (
+                    "Live Captions 仅支持 Windows；Linux/macOS 将自动使用本地 ASR"
+                )
+                self._append_log(warn)
+                show_toast(warn)
+        elif backend in ("local", "sherpa", "whisper"):
+            label = "本地 ASR（faster-whisper / sherpa-onnx）"
+        else:
+            label = "云端 DashScope Fun-ASR"
         msg = f"已切换 ASR 后端为 {label}，将在下次启动通道时生效"
         if stopped:
             msg = f"已切换 ASR 后端为 {label}，通道已停止；重新开启后生效"
@@ -2656,8 +2704,7 @@ class MainWindow(QMainWindow):
             mode = pipeline.mode
             badge = "火山" if mode == "volc" else "经济"
             self._badge.setText(badge)
-            self._progress.setRange(0, 100)
-            self._progress.setValue(100)
+            self._update_model_loading_indicator()
             self._btn_stop.setEnabled(True)
             mode_label = "火山" if mode == "volc" else "经济"
             self._append_log(f"{label}通道已启动（{mode_label}）")
@@ -2703,9 +2750,6 @@ class MainWindow(QMainWindow):
 
         if not self._pipeline.active_channels():
             self._timer.stop()
-            with contextlib.suppress(Exception):
-                self._pipeline.stop()
-            self._pipeline = None
             self._btn_stop.setEnabled(False)
             self._progress.setVisible(False)
             self._status_label.setText("状态：已停止")
@@ -2780,8 +2824,8 @@ class MainWindow(QMainWindow):
         """Stop all channels."""
         self._timer.stop()
         if self._pipeline is not None:
-            self._pipeline.stop()
-            self._pipeline = None
+            for direction in list(self._pipeline.active_channels()):
+                self._pipeline.stop_channel(direction)
         self._close_overlays()
         self._refresh_channel_buttons()
         self._on_enable_toggled()
@@ -2833,6 +2877,28 @@ class MainWindow(QMainWindow):
     def _on_process_tick(self) -> None:
         if self._pipeline is not None:
             self._pipeline.process_tick()
+            self._update_model_loading_indicator()
+
+    def _update_model_loading_indicator(self) -> None:
+        """Keep model download/loading visible instead of showing a false 100%."""
+        names = self._pipeline.loading_models if self._pipeline is not None else ()
+        if names:
+            if names != self._model_loading_names:
+                detail = "、".join(names)
+                message = f"正在下载或加载模型：{detail}（首次使用需等待，通道可继续运行）"
+                self._append_log(message)
+                show_toast(message, ms=3500)
+            self._model_loading_names = names
+            self._progress.setVisible(True)
+            self._progress.setRange(0, 0)
+            self._status_label.setText(f"状态：正在准备 {"、".join(names)}")
+            return
+
+        if self._model_loading_names:
+            self._append_log(f"模型已就绪：{'、'.join(self._model_loading_names)}")
+            self._progress.setRange(0, 100)
+            self._progress.setValue(100)
+        self._model_loading_names = ()
 
     def _on_status_changed(self, status: str) -> None:
         mapping = {
@@ -3219,6 +3285,10 @@ class MainWindow(QMainWindow):
                 self._resource_monitor.stop()
         self._hotkeys.stop()
         self._on_stop()
+        if self._pipeline is not None:
+            with contextlib.suppress(Exception):
+                self._pipeline.stop()
+            self._pipeline = None
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self._wheel_filter)

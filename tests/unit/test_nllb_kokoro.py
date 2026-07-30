@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.engines.base import EngineCallbacks
@@ -37,6 +40,32 @@ def test_nllb_model_slug() -> None:
     assert "/" not in model_slug(DEFAULT_NLLB_MODEL)
 
 
+def test_model_files_ready_false_with_only_tokenizer(tmp_path) -> None:
+    cache = tmp_path / "nllb"
+    cache.mkdir()
+    (cache / "config.json").write_text("{}", encoding="utf-8")
+    (cache / "README.md").write_text("nllb", encoding="utf-8")
+    mt = NllbCt2Mt(
+        model_id=DEFAULT_NLLB_MODEL,
+        cache_dir=cache,
+        auto_download=False,
+    )
+    assert mt._model_files_ready() is False
+
+
+def test_model_files_ready_true_with_model_bin(tmp_path) -> None:
+    cache = tmp_path / "nllb"
+    cache.mkdir()
+    (cache / "config.json").write_text("{}", encoding="utf-8")
+    (cache / "model.bin").write_bytes(b"\0" * (1_000_000 + 1))
+    mt = NllbCt2Mt(
+        model_id=DEFAULT_NLLB_MODEL,
+        cache_dir=cache,
+        auto_download=False,
+    )
+    assert mt._model_files_ready() is True
+
+
 def test_nllb_translate_none_while_not_ready(tmp_path) -> None:
     mt = NllbCt2Mt(
         model_id=DEFAULT_NLLB_MODEL,
@@ -50,13 +79,35 @@ def test_nllb_translate_none_while_not_ready(tmp_path) -> None:
     mt.stop()
 
 
+def test_nllb_download_restores_hf_endpoint(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_ENDPOINT", "https://user-endpoint.example")
+    fake_hub = SimpleNamespace(
+        snapshot_download=MagicMock(side_effect=RuntimeError("download failed"))
+    )
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    mt = NllbCt2Mt(
+        model_id=DEFAULT_NLLB_MODEL,
+        cache_dir=tmp_path / "nllb",
+        auto_download=True,
+    )
+
+    assert mt._download_model() is False
+    assert os.environ["HF_ENDPOINT"] == "https://user-endpoint.example"
+
+
 def test_config_economy_defaults() -> None:
     cfg = AppConfigModel(translation_mode="economy")
     assert cfg.economy_mt_backend == "nllb"
     assert cfg.economy_tts_backend == "kokoro"
     assert "nllb-200" in cfg.economy_nllb_model
-    assert cfg.economy_kokoro_voice_en == "af_heart"
+    assert cfg.economy_kokoro_voice_en == "af_bella"
     assert cfg.economy_kokoro_voice_zh == "zf_xiaoxiao"
+    assert cfg.economy_kokoro_speed == 0.92
+    assert cfg.economy_sentence_min_chars == 4
+    assert cfg.economy_sentence_pause_ms == 900
+    assert cfg.economy_sentence_max_wait_ms == 2800
+    assert cfg.economy_utterance_soft_split_ms == 6000
+    assert cfg.economy_utterance_soft_split_quiet_ms == 280
 
 
 def test_build_economy_backends_prefers_nllb_kokoro(tmp_path) -> None:

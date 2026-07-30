@@ -56,10 +56,12 @@
 
 ## 引擎说明
 
-当前底层为**火山引擎 AST 2.0** 实时同传（WebSocket + Protobuf）：
+当前提供两条翻译路径：火山 AST 2.0 端到端同传，以及经济模式的 ASR → MT → TTS 级联：
 
-* 支持 S2T（字幕）与 S2S（语音输出）
-* 热词、术语、语速、音色在开启通道时生效；改完后需重新开通道
+* 火山模式支持 S2T（字幕）与 S2S（语音输出）。
+* 经济模式支持 DashScope、Windows Live Captions、faster-whisper/sherpa ASR，NLLB 等 MT，
+  Kokoro/Edge TTS；本地模型首次使用可能需要下载。
+* 热词、术语、语速、音色在开启通道时生效；改完后需重新开通道。
 
 备选引擎（如通义 Qwen LiveTranslate、腾讯实时语音翻译等）规划中，便于货比三家；尚未接入 UI。
 
@@ -140,8 +142,11 @@ run.bat           # Windows
 ### 测试
 
 ```bash
-pytest
+QT_QPA_PLATFORM=offscreen pytest
 ```
+
+无显示器的 Linux/CI 环境必须设置 `QT_QPA_PLATFORM=offscreen`；真实音频设备和模型下载仍需
+在目标机器单独验证。
 
 ## 项目结构
 

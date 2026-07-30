@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,14 @@ if _keyring is None:
     keyring.errors = _NullKeyringErrors()
 
 
+def _get_keyring_password(username: str) -> str | None:
+    """Read a legacy secret without making configuration loading depend on keyring."""
+    try:
+        return keyring.get_password(_SERVICE_NAME, username)
+    except Exception:
+        return None
+
+
 def _config_path() -> Path:
     path = Path.home() / ".config" / "translator_intime"
     path.mkdir(parents=True, exist_ok=True)
@@ -67,38 +75,40 @@ def load_config() -> AppConfigModel:
     data.pop("engine", None)
     data.pop("model_cache_dir", None)
 
-    # Migrate legacy ASR backend → live_captions (推荐默认, 仅 Win11 22H2+)
-    # 旧版本默认 "dashscope" 或 "local", 需 API Key 或下载模型.
-    # Windows Live Captions 系统级 ASR, 零占用高准确率, 接近辅助字幕水平.
-    legacy_backend = data.get("economy_asr_backend", "")
-    if legacy_backend in ("", "dashscope"):
-        data["economy_asr_backend"] = "live_captions"
+    # Migrate missing ASR backend → platform default.
+    # Windows: live_captions; Linux/macOS: local (Live Captions is Win-only).
+    # Do NOT rewrite intentional "dashscope" — that broke cloud ASR after save/reload
+    # and made the UI look local while can_start still demanded a DashScope key
+    # when combo selection failed to match aliases.
+    legacy_backend = data.get("economy_asr_backend", None)
+    if legacy_backend in (None, ""):
+        data["economy_asr_backend"] = "live_captions" if sys.platform.startswith("win") else "local"
+    elif legacy_backend == "live_captions" and not sys.platform.startswith("win"):
+        # Persisted Win-only default is useless on Linux — fall back to local ASR.
+        data["economy_asr_backend"] = "local"
+    elif legacy_backend in ("sherpa", "whisper"):
+        # UI combo only exposes "local"; keep model choice via economy_asr_local_model.
+        data["economy_asr_backend"] = "local"
 
-    # Migrate legacy ASR model id → faster-whisper-medium (本地模型默认)
-    # 旧版本默认 "auto" / SenseVoice / 双语模型, 对游戏实况噪声鲁棒性差.
-    # faster-whisper (Whisper medium) 接近辅助字幕准确率, 噪声鲁棒性最好.
-    legacy_local_model = data.get("economy_asr_local_model", "")
-    if legacy_local_model in (
-        "auto",
-        "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-        "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
-    ):
+    # Only fill a missing local model. ``auto`` / SenseVoice / Zipformer remain
+    # valid user-selectable options and must survive save → reload unchanged.
+    if not data.get("economy_asr_local_model"):
         data["economy_asr_local_model"] = "faster-whisper-medium"
 
-    # Migrate legacy utterance params → 新默认值 (降低尾部静音, 减少 SenseVoice 幻听)
-    # 旧默认 silence=450 / max=12000 会让过长的尾部静音送入模型, 触发语气词幻听.
-    if data.get("economy_utterance_silence_ms") == 450:
-        data["economy_utterance_silence_ms"] = 300
-    if data.get("economy_utterance_max_ms") == 12000:
-        data["economy_utterance_max_ms"] = 8000
-    # soft_split_ms 旧默认 3000 太激进, 游戏原声每 3 秒切一次产生大量噪点片段;
-    # 迁移到 5000 减少切分频率.
-    if data.get("economy_utterance_soft_split_ms") in (None, 3000):
-        data["economy_utterance_soft_split_ms"] = 5000
+    # New defaults apply only when a field is absent. Value-based migrations
+    # cannot distinguish an old default from a deliberate advanced setting.
+    if data.get("economy_utterance_soft_split_ms") is None:
+        data["economy_utterance_soft_split_ms"] = 6000
+    if data.get("economy_utterance_soft_split_quiet_ms") is None:
+        data["economy_utterance_soft_split_quiet_ms"] = 280
+    if data.get("economy_kokoro_speed") is None:
+        data["economy_kokoro_speed"] = 0.92
+    if not data.get("economy_kokoro_voice_en"):
+        data["economy_kokoro_voice_en"] = "af_bella"
 
     # Best-effort: migrate old keyring volcengine secret into volc_api_key once
     if not data.get("volc_api_key"):
-        legacy = keyring.get_password(_SERVICE_NAME, "volcengine")
+        legacy = _get_keyring_password("volcengine")
         if legacy:
             data["volc_api_key"] = legacy
 
@@ -156,8 +166,11 @@ def _seed_from_yaml_defaults() -> AppConfigModel | None:
             output_device=audio.get("output_device"),
             loopback_device=audio.get("game_output_device"),
             use_volc=True,
-            volc_api_key=str(translation.get("volc_app_id", "") or ""),
+            # A legacy App ID is not an AST 2.0 API key. Preserve it only for
+            # display/migration instead of letting credential checks accept it.
+            volc_api_key=str(translation.get("volc_api_key", "") or ""),
             volc_access_token=str(translation.get("volc_access_token", "") or ""),
+            volc_console_app_id=str(translation.get("volc_app_id", "") or ""),
             theme_mode="dark",
         )
     except Exception:
@@ -175,6 +188,20 @@ def save_config(config: AppConfigModel) -> None:
             raise
     with config_file.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def merge_config_updates(config: AppConfigModel, **updates: Any) -> AppConfigModel:
+    """Apply UI changes without dropping settings unknown to that UI version.
+
+    The settings window only owns a subset of the configuration. Starting from
+    the complete current model means newly-added engine tuning fields survive an
+    unrelated Save click even before dedicated controls are added for them.
+    Re-validating the merged mapping also avoids ``model_copy(update=...)``
+    silently accepting invalid values.
+    """
+    data = config.model_dump(mode="python")
+    data.update(updates)
+    return AppConfigModel.model_validate(data)
 
 
 def validate_config(config: AppConfigModel) -> tuple[bool, str]:

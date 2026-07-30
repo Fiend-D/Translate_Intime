@@ -34,6 +34,7 @@ class DirectionState:
     last_text: str = ""
     last_source: str = ""
     last_translated: str = ""
+    utterance_started_at: float = 0.0
 
 
 class TranslationPipeline(QObject):
@@ -64,7 +65,6 @@ class TranslationPipeline(QObject):
         self._play_outbound_voice = False
         self._play_inbound_voice = False
         self._engine: TranslationEngine | None = None
-        self._session_started_at = 0.0
         self._input_device: int | str | None = None
         self._output_device: int | str | None = None
         self._loopback_device: int | str | None = None
@@ -93,14 +93,20 @@ class TranslationPipeline(QObject):
             Direction.OUTBOUND: 0,
             Direction.INBOUND: 0,
         }
-        self._feedback_buffer_max_bytes: int = 5 * 16000 * 2  # 每方向最多 5 秒
+        self._feedback_buffer_max_bytes: int = 5 * 16000 * 2  # 每方向最多延迟 5 秒
         self._barge_in_started_at: dict[Direction, float] = {
             Direction.OUTBOUND: 0.0,
             Direction.INBOUND: 0.0,
         }
         # 文本去重：8 秒内连续相同译文只播放一次
-        self._last_played_text: str = ""
-        self._last_played_at: float = 0.0
+        self._last_played_text: dict[Direction, str] = {
+            Direction.OUTBOUND: "",
+            Direction.INBOUND: "",
+        }
+        self._last_played_at: dict[Direction, float] = {
+            Direction.OUTBOUND: 0.0,
+            Direction.INBOUND: 0.0,
+        }
         self._text_dedup_window_sec: float = 8.0
         self._skip_next_audio_for: set[Direction] = set()
         # 保护 buffer 写入的锁（on_pcm 在录音线程被调用）
@@ -127,6 +133,13 @@ class TranslationPipeline(QObject):
             channels.append(Direction.INBOUND)
         return channels
 
+    @property
+    def loading_models(self) -> tuple[str, ...]:
+        """Local economy backends currently downloading/loading, if any."""
+        engine = self._engine
+        names = getattr(engine, "loading_models", ()) if engine is not None else ()
+        return tuple(str(name) for name in names)
+
     def has_volc_credentials(self) -> bool:
         key, token, auth = resolve_volc_credentials(
             self._config.volc_api_key,
@@ -148,12 +161,23 @@ class TranslationPipeline(QObject):
         """Whether a channel may be started under the current engine mode."""
         mode = self.mode
         if mode == "economy":
-            from src.engines.pipeline.engine import resolve_dashscope_api_key
+            from src.engines.pipeline.engine import (
+                economy_asr_requires_dashscope,
+                resolve_dashscope_api_key,
+                resolve_economy_asr_backend,
+            )
 
+            asr_pref = resolve_economy_asr_backend(self._config)
+            # Local / Live Captions / sherpa / whisper do not need DashScope.
+            if not economy_asr_requires_dashscope(self._config):
+                if asr_pref == "live_captions":
+                    return True, "经济模式：Windows Live Captions + NLLB 本地翻译 + Kokoro TTS"
+                return True, "经济模式：本地 ASR + NLLB 本地翻译 + Kokoro TTS"
             if not resolve_dashscope_api_key(self._config):
                 return (
                     False,
-                    "请先填写 DashScope API Key（经济模式）或设置环境变量 DASHSCOPE_API_KEY。",
+                    "请先填写 DashScope API Key（经济模式）或设置环境变量 DASHSCOPE_API_KEY，"
+                    "或切换为「本地 ASR / Live Captions」。",
                 )
             return True, "经济模式：阿里云 Fun-ASR + NLLB 本地翻译 + Kokoro TTS"
         if mode == "volc":
@@ -295,11 +319,15 @@ class TranslationPipeline(QObject):
             else self._play_inbound_voice
         )
         if not engine.start_direction(direction, play_voice=voice):
-            hint = (
-                "请检查 API Key / 网络。"
-                if mode == "volc"
-                else "请检查 DashScope Key / 是否已安装 dashscope。"
-            )
+            if mode == "volc":
+                hint = "请检查 API Key / 网络。"
+            else:
+                from src.engines.pipeline.engine import economy_asr_requires_dashscope
+
+                if economy_asr_requires_dashscope(self._config):
+                    hint = "请检查 DashScope Key / 是否已安装 dashscope。"
+                else:
+                    hint = "请检查本地 ASR / Live Captions 是否可用（见日志）。"
             raise EngineLoadError(f"{engine_label}连接失败（{label}）。{hint}")
 
         if opening_session:
@@ -326,6 +354,9 @@ class TranslationPipeline(QObject):
             self._capture_outbound.on_pcm = lambda pcm: self._engine_direct_pcm(
                 Direction.OUTBOUND, pcm
             )
+            self._capture_outbound.on_error = lambda exc: self._on_capture_error(
+                Direction.OUTBOUND, exc
+            )
             self._capture_outbound.start()
             self._outbound_active = True
         else:
@@ -342,6 +373,9 @@ class TranslationPipeline(QObject):
             self._capture_inbound.on_pcm = lambda pcm: self._engine_direct_pcm(
                 Direction.INBOUND, pcm
             )
+            self._capture_inbound.on_error = lambda exc: self._on_capture_error(
+                Direction.INBOUND, exc
+            )
             self._capture_inbound.start()
             self._inbound_active = True
             self.log_message.emit(f"游戏声音捕获设备：{loopback!r}")
@@ -356,7 +390,6 @@ class TranslationPipeline(QObject):
 
         was_running = self._running
         self._running = True
-        self._session_started_at = time.time()
         if not was_running:
             self._session = TranslationSession(
                 outbound_enabled=self._outbound_active,
@@ -549,8 +582,6 @@ class TranslationPipeline(QObject):
         if self._engine is not None:
             with contextlib.suppress(Exception):
                 self._engine.stop_direction(direction)
-            if not self._engine.active_directions:
-                self.close_engine()
 
         if direction == Direction.OUTBOUND:
             if self._capture_outbound is not None:
@@ -628,23 +659,64 @@ class TranslationPipeline(QObject):
         self.status_changed.emit("stopped")
         logger.info("Translation session stopped")
 
+    def _on_capture_error(self, direction: Direction, exc: Exception) -> None:
+        """Mark a direction unavailable when its device read loop exits."""
+        capture = (
+            self._capture_outbound
+            if direction == Direction.OUTBOUND
+            else self._capture_inbound
+        )
+        if capture is not None:
+            with contextlib.suppress(Exception):
+                capture.stop()
+            if direction == Direction.OUTBOUND:
+                self._capture_outbound = None
+            else:
+                self._capture_inbound = None
+        if self._engine is not None:
+            with contextlib.suppress(Exception):
+                self._engine.stop_direction(direction)
+        if direction == Direction.OUTBOUND:
+            self._outbound_active = False
+        else:
+            self._inbound_active = False
+        message = f"{direction.value} 音频设备已断开，通道已暂停：{exc}"
+        logger.warning(message)
+        self.engine_status_changed.emit(direction.value, self.mode, "error")
+        self.error_occurred.emit(message)
+        self.status_changed.emit("running" if self.active_channels() else "paused")
+
     def _on_engine_source(self, direction: Direction, text: str, is_final: bool) -> None:
-        del is_final
-        if not text.strip():
-            return
         dp = self._directions.get(direction)
         if dp is None:
             return
-        dp.last_source = text.strip()
-        self._emit_engine_subtitle(direction, is_final=False)
+        cleaned = (text or "").strip()
+        # Empty final clears sticky partial (e.g. MT failed after source partial).
+        if not cleaned:
+            if is_final:
+                dp.last_source = ""
+                dp.last_translated = ""
+                dp.last_text = ""
+                dp.utterance_started_at = 0.0
+            return
+        if dp.utterance_started_at <= 0:
+            dp.utterance_started_at = time.monotonic()
+        dp.last_source = cleaned
+        # Economy may send source final per sentence; pass is_final through.
+        self._emit_engine_subtitle(direction, is_final=bool(is_final))
 
     def _on_engine_translated(self, direction: Direction, text: str, is_final: bool) -> None:
-        if not text.strip():
-            return
         dp = self._directions.get(direction)
         if dp is None:
             return
-        cleaned = text.strip()
+        cleaned = (text or "").strip()
+        # Empty final clears sticky partial after MT failure.
+        if not cleaned:
+            if is_final:
+                dp.last_source = ""
+                dp.last_translated = ""
+                dp.last_text = ""
+            return
         # 规范化：去标点/空格，用于回灌识别
         normalized = "".join(ch for ch in cleaned if ch.isalnum())
 
@@ -653,15 +725,17 @@ class TranslationPipeline(QObject):
             now = time.time()
             if (
                 normalized
-                and normalized == self._last_played_text
-                and now - self._last_played_at < self._text_dedup_window_sec
+                and normalized == self._last_played_text[direction]
+                and now - self._last_played_at[direction] < self._text_dedup_window_sec
             ):
-                # 整句丢弃后续所有 TTS 段（直到下次句边界）
+                # Skip audio but still refresh subtitle overlay.
                 self._skip_next_audio_for.add(direction)
+                dp.last_translated = cleaned
+                self._emit_engine_subtitle(direction, is_final=is_final)
                 return
             if normalized:
-                self._last_played_text = normalized
-                self._last_played_at = now
+                self._last_played_text[direction] = normalized
+                self._last_played_at[direction] = now
             # 真正的"新句"：解除句级丢弃标记
             self._skip_next_audio_for.discard(direction)
 
@@ -684,7 +758,10 @@ class TranslationPipeline(QObject):
             entry = SubtitleEntry(
                 direction=direction,
                 original_text=original or "…",
-                translated_text=translated or "…",
+                translated_text=(
+                    translated
+                    or ("正在翻译…" if self.mode == "economy" and original else "…")
+                ),
                 is_final=is_final,
             )
         except ValueError:
@@ -692,10 +769,12 @@ class TranslationPipeline(QObject):
         self.subtitle_ready.emit(entry)
         if is_final:
             self._subtitle_logger.log(entry)
-            latency_ms = int((time.time() - self._session_started_at) * 1000) % 100000
-            self.latency_reported.emit(min(latency_ms, 9999) if latency_ms > 0 else 0)
+            if dp.utterance_started_at > 0:
+                latency_ms = int((time.monotonic() - dp.utterance_started_at) * 1000)
+                self.latency_reported.emit(max(0, min(latency_ms, 9999)))
             dp.last_source = ""
             dp.last_translated = ""
+            dp.utterance_started_at = 0.0
 
     def _on_engine_audio(self, direction: Direction, data: bytes) -> None:
         if not data:
@@ -807,9 +886,21 @@ class TranslationPipeline(QObject):
             return
 
         # TTS 正在播放：缓存当前帧
+        # Economy utterance segmentation must see capture activity even though
+        # the PCM itself is held back, otherwise every TTS segment creates a
+        # false 300 ms end-of-speech gap and cuts words at arbitrary positions.
+        notify_pending = getattr(self._engine, "notify_pcm_pending", None)
+        if callable(notify_pending):
+            with contextlib.suppress(Exception):
+                notify_pending(direction)
+
+        overflow = False
         if result is not None and result.opened_now and result.preroll:
-            self._append_feedback_buffer(direction, result.preroll)
-        self._append_feedback_buffer(direction, pcm)
+            overflow = self._append_feedback_buffer(direction, result.preroll)
+        overflow = self._append_feedback_buffer(direction, pcm) or overflow
+        if overflow:
+            self._end_tts_mute_for_buffer_limit(direction)
+            return
 
         if result is None or not result.passed:
             self._barge_in_started_at[direction] = 0.0
@@ -848,20 +939,25 @@ class TranslationPipeline(QObject):
         self._vad_pass_chunks = 0
         self._vad_drop_chunks = 0
 
-    def _append_feedback_buffer(self, direction: Direction, pcm: bytes) -> None:
+    def _append_feedback_buffer(self, direction: Direction, pcm: bytes) -> bool:
         if not pcm:
-            return
+            return False
         with self._feedback_buffer_lock:
             buf = self._feedback_buffers[direction]
             buf.append(pcm)
             self._feedback_buffer_bytes[direction] += len(pcm)
-            # 超过上限：丢弃最早一段（FIFO），保留最近 5 秒
-            if self._feedback_buffer_bytes[direction] > self._feedback_buffer_max_bytes:
-                drop = buf.pop(0)
-                self._feedback_buffer_bytes[direction] -= len(drop)
-                with contextlib.suppress(Exception):
-                    import array as _a
-                    _a.array("b", drop)  # 触发 zeroization best-effort
+            return self._feedback_buffer_bytes[direction] > self._feedback_buffer_max_bytes
+
+    def _end_tts_mute_for_buffer_limit(self, direction: Direction) -> None:
+        """Prefer complete input over TTS once the feedback delay reaches its cap."""
+        self._barge_in_started_at[direction] = 0.0
+        self._tts_playing_until = time.time()
+        if self._player is not None:
+            with contextlib.suppress(Exception):
+                self._player.clear_queue()
+        self.log_message.emit("输入语音持续，已停止译文播放以保证字幕完整")
+        logger.info(f"Feedback buffer limit reached ({direction.value}); preserving input")
+        self._flush_feedback_buffer(direction)
 
     def _end_tts_mute_for_barge_in(self, direction: Direction) -> None:
         self._barge_in_started_at[direction] = 0.0

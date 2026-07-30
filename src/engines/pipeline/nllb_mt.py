@@ -140,6 +140,15 @@ class NllbCt2Mt:
                 logger.warning(f"NLLB translate failed: {exc}")
             return None
 
+    def translate_sentences(
+        self, sentences: list[str], *, source_lang: str, target_lang: str
+    ) -> list[str | None]:
+        """Translate each sentence independently (better quality than one blob)."""
+        return [
+            self.translate(s, source_lang=source_lang, target_lang=target_lang)
+            for s in sentences
+        ]
+
     def _translate_locked(self, text: str, *, src_code: str, tgt_code: str) -> str | None:
         with self._lock:
             if self._translator is None or self._tokenizer is None:
@@ -151,10 +160,12 @@ class NllbCt2Mt:
                 tokenizer.src_lang = src_code
             token_ids = tokenizer.encode(text)
             source_tokens = tokenizer.convert_ids_to_tokens(token_ids)
+            # Shorter sentences benefit from a slightly wider beam.
+            beam_size = 5 if len(text) < 40 else 4
             results = translator.translate_batch(
                 [source_tokens],
                 target_prefix=[[tgt_code]],
-                beam_size=4,
+                beam_size=beam_size,
                 max_decoding_length=256,
             )
             if not results or not results[0].hypotheses:
@@ -189,7 +200,7 @@ class NllbCt2Mt:
     def _load(self) -> bool:
         try:
             import ctranslate2  # noqa: F401
-            from transformers import AutoTokenizer
+            import transformers  # noqa: F401
         except ImportError as exc:
             logger.warning(
                 f"NLLB 依赖缺失（ctranslate2/transformers）: {exc}；"
@@ -204,26 +215,63 @@ class NllbCt2Mt:
         self._device = device
         self._compute_type = compute_type
         try:
-            import ctranslate2
-
-            translator = ctranslate2.Translator(
-                str(self._cache_dir),
-                device=device,
-                compute_type=compute_type,
-            )
-            # 模型已在本地时, 从本地目录加载 tokenizer, 避免网络请求
-            tokenizer = AutoTokenizer.from_pretrained(
-                str(self._cache_dir) if self._model_files_ready() else TOKENIZER_ID,
-                local_files_only=self._model_files_ready(),
+            translator, tokenizer = self._open_translator_and_tokenizer(
+                device, compute_type
             )
         except Exception as exc:
             logger.warning(f"NLLB Translator/Tokenizer 初始化失败: {exc}")
-            return False
+            msg = str(exc).lower()
+            missing_weights = "model.bin" in msg or "unable to open file" in msg
+            if not (missing_weights and self._auto_download):
+                return False
+            logger.info("NLLB 模型不完整（缺少 model.bin），将重新下载")
+            if not self._download_model():
+                return False
+            try:
+                translator, tokenizer = self._open_translator_and_tokenizer(
+                    device, compute_type
+                )
+            except Exception as exc2:
+                logger.warning(f"NLLB Translator/Tokenizer 初始化失败: {exc2}")
+                return False
 
         with self._lock:
             self._translator = translator
             self._tokenizer = tokenizer
         return True
+
+    def _open_translator_and_tokenizer(
+        self, device: str, compute_type: str
+    ) -> tuple[Any, Any]:
+        import warnings
+
+        import ctranslate2
+        from transformers import AutoTokenizer
+
+        translator = ctranslate2.Translator(
+            str(self._cache_dir),
+            device=device,
+            compute_type=compute_type,
+        )
+        # 模型已在本地时, 从本地目录加载 tokenizer, 避免网络请求。
+        # NLLB 推理走 CTranslate2，不需要 PyTorch；屏蔽 transformers 的误导告警。
+        ready = self._model_files_ready()
+        tok_source = str(self._cache_dir) if ready else TOKENIZER_ID
+        kwargs: dict[str, Any] = {"local_files_only": ready}
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*PyTorch was not found.*",
+                category=UserWarning,
+            )
+            try:
+                # 新版 transformers 对部分 tokenizer.json 正则有误报，需显式修复。
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tok_source, fix_mistral_regex=True, **kwargs
+                )
+            except TypeError:
+                tokenizer = AutoTokenizer.from_pretrained(tok_source, **kwargs)
+        return translator, tokenizer
 
     def _pick_device(self) -> tuple[str, str]:
         pref = self._device_preference
@@ -251,20 +299,28 @@ class NllbCt2Mt:
             return "cpu", "int8"
 
     def _model_files_ready(self) -> bool:
-        # CTranslate2 models typically include model.bin / model.npz / shared_vocabulary.
+        # Require real CTranslate2 weights (>1MB), not just tokenizer/config.
         if not self._cache_dir.is_dir():
             return False
-        names = {p.name for p in self._cache_dir.iterdir()}
-        has_weights = any(
-            n == "model.bin" or n.startswith("model.") or n.startswith("model_")
-            for n in names
-        )
-        has_config = "config.json" in names
-        return has_weights or (has_config and len(names) >= 2)
+        min_size = 1_000_000
+        for path in self._cache_dir.iterdir():
+            if not path.is_file():
+                continue
+            name = path.name
+            is_weight = (
+                name == "model.bin"
+                or name == "model.npz"
+                or (name.startswith("model") and name.endswith(".bin"))
+            )
+            if is_weight and path.stat().st_size > min_size:
+                return True
+        return False
 
     def _ensure_model_files(self) -> bool:
         if self._model_files_ready():
             return True
+        if self._cache_dir.is_dir() and any(self._cache_dir.iterdir()):
+            logger.info("NLLB 模型不完整（缺少 model.bin），将重新下载")
         if not self._auto_download:
             logger.warning(f"NLLB 模型目录为空且禁用下载: {self._cache_dir}")
             return False
@@ -280,10 +336,11 @@ class NllbCt2Mt:
             return False
         import os
 
-        from src.utils.proxy_env import prepare_model_download_env
+        from src.utils.proxy_env import prepare_model_download_env, without_proxy
 
-        # 提前设置 HF 镜像，避免先走默认源超时再重试
-        if not os.environ.get("HF_ENDPOINT"):
+        # 提前设置 HF 镜像，避免先走默认源超时再重试；下载后恢复进程环境。
+        previous_endpoint = os.environ.get("HF_ENDPOINT")
+        if not previous_endpoint:
             os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
             logger.info("已预设 HF 镜像: https://hf-mirror.com")
 
@@ -292,23 +349,31 @@ class NllbCt2Mt:
         logger.info(f"正在下载 NLLB 模型 {self._model_id} → {self._cache_dir}")
 
         def _try_download(repo_id: str, cache_dir) -> bool:
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=str(cache_dir),
-            )
+            with without_proxy():
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(cache_dir),
+                )
             return self._model_files_ready()
 
         try:
-            if _try_download(self._model_id, self._cache_dir):
-                logger.info(f"NLLB 模型已保存: {self._cache_dir}")
-                return True
-        except Exception as exc:
-            logger.warning(f"NLLB 模型下载失败: {exc}")
-            err = str(exc).lower()
-            if "socks" in err or "proxy" in err:
-                logger.warning(
-                    "代理相关失败提示: 请改用 Clash HTTP 端口 "
-                    "(http://127.0.0.1:7890)，或 pip install PySocks"
-                )
+            try:
+                if _try_download(self._model_id, self._cache_dir):
+                    logger.info(f"NLLB 模型已保存: {self._cache_dir}")
+                    return True
+            except Exception as exc:
+                logger.warning(f"NLLB 模型下载失败: {exc}")
+                err = str(exc).lower()
+                if "socks" in err or "proxy" in err:
+                    logger.warning(
+                        "代理相关失败提示: 请改用 Clash HTTP 端口 "
+                        "(http://127.0.0.1:7890)，或 pip install PySocks"
+                        "；或取消 TRANSLATOR_INTIME_USE_PROXY 以直连下载"
+                    )
+        finally:
+            if previous_endpoint is None:
+                os.environ.pop("HF_ENDPOINT", None)
+            else:
+                os.environ["HF_ENDPOINT"] = previous_endpoint
         # 不再强制降级到 600M；保留用户选择的模型，等下次重试或网络恢复后重新下载。
         return False
