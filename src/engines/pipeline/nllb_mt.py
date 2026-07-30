@@ -12,7 +12,9 @@ from src.utils.logger import logger
 
 DEFAULT_NLLB_MODEL = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
 TOKENIZER_ID = "facebook/nllb-200-distilled-600M"
-_CACHE_ROOT = Path.home() / ".cache" / "translator_intime" / "nllb"
+# 模型统一存放在项目内 resource/nllb/<model_slug>/ 下，便于随项目迁移与打包。
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_CACHE_ROOT = _PROJECT_ROOT / "resource" / "nllb"
 _LICENSE_NOTE = (
     "NLLB-200 许可证为 CC-BY-NC（非商业研究用途）。请仅在合规场景下使用。"
 )
@@ -59,10 +61,12 @@ class NllbCt2Mt:
         model_id: str = DEFAULT_NLLB_MODEL,
         cache_dir: Path | str | None = None,
         auto_download: bool = True,
+        device_preference: str = "auto",
     ) -> None:
         self._model_id = (model_id or DEFAULT_NLLB_MODEL).strip()
         self._cache_dir = Path(cache_dir) if cache_dir else nllb_cache_dir(self._model_id)
         self._auto_download = auto_download
+        self._device_preference = (device_preference or "auto").strip().lower()
         self._started = False
         self._ready = False
         self._failed = False
@@ -207,7 +211,11 @@ class NllbCt2Mt:
                 device=device,
                 compute_type=compute_type,
             )
-            tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
+            # 模型已在本地时, 从本地目录加载 tokenizer, 避免网络请求
+            tokenizer = AutoTokenizer.from_pretrained(
+                str(self._cache_dir) if self._model_files_ready() else TOKENIZER_ID,
+                local_files_only=self._model_files_ready(),
+            )
         except Exception as exc:
             logger.warning(f"NLLB Translator/Tokenizer 初始化失败: {exc}")
             return False
@@ -218,10 +226,18 @@ class NllbCt2Mt:
         return True
 
     def _pick_device(self) -> tuple[str, str]:
+        pref = self._device_preference
         try:
             import ctranslate2
 
-            if int(ctranslate2.get_cuda_device_count() or 0) <= 0:
+            cuda_count = int(ctranslate2.get_cuda_device_count() or 0)
+            # 用户强制 CPU
+            if pref == "cpu":
+                return "cpu", "int8"
+            # auto 或 cuda: 无 GPU 时回退 CPU
+            if cuda_count <= 0:
+                if pref == "cuda":
+                    logger.warning("用户选择了 CUDA 但未检测到可用 GPU，回退 CPU")
                 return "cpu", "int8"
             cuda_types = set(ctranslate2.get_supported_compute_types("cuda") or [])
             if "int8_float16" in cuda_types:
@@ -266,20 +282,26 @@ class NllbCt2Mt:
 
         from src.utils.proxy_env import prepare_model_download_env
 
+        # 提前设置 HF 镜像，避免先走默认源超时再重试
+        if not os.environ.get("HF_ENDPOINT"):
+            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+            logger.info("已预设 HF 镜像: https://hf-mirror.com")
+
         prepare_model_download_env()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"正在下载 NLLB 模型 {self._model_id} → {self._cache_dir}")
 
-        def _try_download() -> None:
+        def _try_download(repo_id: str, cache_dir) -> bool:
             snapshot_download(
-                repo_id=self._model_id,
-                local_dir=str(self._cache_dir),
+                repo_id=repo_id,
+                local_dir=str(cache_dir),
             )
+            return self._model_files_ready()
 
         try:
-            _try_download()
-            logger.info(f"NLLB 模型已保存: {self._cache_dir}")
-            return self._model_files_ready()
+            if _try_download(self._model_id, self._cache_dir):
+                logger.info(f"NLLB 模型已保存: {self._cache_dir}")
+                return True
         except Exception as exc:
             logger.warning(f"NLLB 模型下载失败: {exc}")
             err = str(exc).lower()
@@ -288,26 +310,5 @@ class NllbCt2Mt:
                     "代理相关失败提示: 请改用 Clash HTTP 端口 "
                     "(http://127.0.0.1:7890)，或 pip install PySocks"
                 )
-            already_mirror = (
-                os.environ.get("HF_ENDPOINT", "").rstrip("/").lower()
-                == "https://hf-mirror.com"
-            )
-            if already_mirror:
-                return False
-            # Common CN fallback when default Hugging Face is unreachable.
-            logger.info("改用 HF 镜像 https://hf-mirror.com 重试一次…")
-            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-            try:
-                prepare_model_download_env()
-                _try_download()
-                logger.info(f"NLLB 模型已保存（镜像）: {self._cache_dir}")
-                return self._model_files_ready()
-            except Exception as exc2:
-                logger.warning(f"NLLB 镜像下载仍失败: {exc2}")
-                err2 = str(exc2).lower()
-                if "socks" in err2 or "proxy" in err2:
-                    logger.warning(
-                        "代理相关失败提示: 请改用 Clash HTTP 端口 "
-                        "(http://127.0.0.1:7890)，或 pip install PySocks"
-                    )
-                return False
+        # 不再强制降级到 600M；保留用户选择的模型，等下次重试或网络恢复后重新下载。
+        return False

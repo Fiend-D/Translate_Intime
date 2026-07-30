@@ -23,6 +23,12 @@ pycaw>=20240210; platform_system=="Windows"
 
 # Economy mode cloud ASR (Fun-ASR / Paraformer via DashScope)
 dashscope>=1.20
+# Economy local ASR (sherpa-onnx streaming Zipformer / SenseVoice offline)
+sherpa-onnx>=1.10
+# Economy local ASR (faster-whisper, CTranslate2 加速 Whisper)
+faster-whisper>=1.0
+# Economy ASR: Windows Live Captions (UI Automation, 仅 Win11 22H2+)
+uiautomation>=2.0
 # Economy local MT (NLLB via CTranslate2)
 ctranslate2>=4.0
 transformers>=4.40
@@ -32,6 +38,9 @@ PySocks>=1.7
 socksio>=1.0
 # Economy local TTS (Kokoro ONNX); edge-tts kept for typed translate + fallback
 kokoro-onnx>=0.4
+# Resource monitoring (CPU/RAM) and NVIDIA GPU monitoring
+psutil>=5.9
+pynvml>=11.0
 # Optional Chinese G2P for Kokoro v1.1-zh: pip install 'misaki[zh]'
 # Optional local MT fallback (heavy): pip install argostranslate
 # Optional offline TTS fallback: pip install pyttsx3

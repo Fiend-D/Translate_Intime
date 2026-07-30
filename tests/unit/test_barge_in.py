@@ -32,6 +32,8 @@ class _FakeEngine:
 class _FakePlayer:
     def __init__(self) -> None:
         self.cleared = False
+        self.is_playing = False
+        self.queue_size = 0
 
     def clear_queue(self) -> None:
         self.cleared = True
@@ -58,10 +60,10 @@ def test_barge_in_clears_tts_and_flushes_buffer(tmp_path) -> None:
 
     silence = _pcm(0)
     loud = _pcm(3000)
-    pipeline._handle_mic_with_feedback_suppression(silence)
-    pipeline._handle_mic_with_feedback_suppression(loud)
-    pipeline._barge_in_started_at = time.time() - 0.1
-    pipeline._handle_mic_with_feedback_suppression(loud)
+    pipeline._handle_pcm_with_feedback_suppression(Direction.OUTBOUND, silence)
+    pipeline._handle_pcm_with_feedback_suppression(Direction.OUTBOUND, loud)
+    pipeline._barge_in_started_at[Direction.OUTBOUND] = time.time() - 0.1
+    pipeline._handle_pcm_with_feedback_suppression(Direction.OUTBOUND, loud)
 
     assert pipeline._player.cleared is True
     assert pipeline._tts_playing_until <= time.time()

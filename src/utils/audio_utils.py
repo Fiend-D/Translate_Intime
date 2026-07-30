@@ -38,10 +38,10 @@ def enhance_clarity(
     sr: int,
     *,
     target_peak_db: float = -3.0,
-    max_boost_db: float = 12.0,
-    presence_db: float = 2.0,
+    max_boost_db: float = 6.0,
+    presence_db: float = 1.0,
     presence_hz: float = 3000.0,
-    noise_floor_db: float = -30.0,
+    noise_floor_db: float = -45.0,
 ) -> np.ndarray:
     """Boost loudness and vocal presence for virtual-cable / small-speaker playback.
 
@@ -56,6 +56,9 @@ def enhance_clarity(
       4. **Soft-limit** (tanh) to keep within [-1, 1] without hard clipping.
 
     Operates on a 1-D float32 array. Returns float32.
+
+    Note: 参数已调温和 (2026-07), 避免破坏 Kokoro TTS 的自然音质.
+    仅在输出到虚拟声卡 (VB-Cable/Voicemeeter) 时由调用方启用.
     """
     if audio.size == 0 or audio.ndim != 1:
         return audio
@@ -97,7 +100,7 @@ def enhance_clarity(
             pass
 
     # --- Step 4: Soft limit ---
-    out = np.tanh(out * 1.15) / 1.15
+    out = np.tanh(out * 1.05) / 1.05
 
     return out.astype(np.float32)
 

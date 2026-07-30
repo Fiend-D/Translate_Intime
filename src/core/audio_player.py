@@ -33,6 +33,7 @@ class AudioPlayer:
         self._stream_lock = threading.Lock()
         self._device_sr = _TTS_SR
         self._device_ch = 2
+        self._device_name: str = ""
         self._query_device()
         # 回调：每次一段播放结束后调用，传入该段真实播放时长（秒）
         # 用途：外部可以据此延长麦克风回灌静音窗口
@@ -73,6 +74,7 @@ class AudioPlayer:
 
             self._device_sr = int(info.get("default_samplerate", _TTS_SR))
             self._device_ch = min(max(int(info.get("max_output_channels", 2)), 1), 2)
+            self._device_name = str(info.get("name", ""))
         except Exception:
             pass
 
@@ -151,6 +153,19 @@ class AudioPlayer:
             secure_clear(bytearray(data))
         self._close_stream()
 
+    @property
+    def is_playing(self) -> bool:
+        """True if there's pending audio in queue or an active stream."""
+        if not self._queue.empty():
+            return True
+        with self._stream_lock:
+            return self._stream is not None and self._stream.active
+
+    @property
+    def queue_size(self) -> int:
+        """Number of pending PCM chunks in the queue."""
+        return self._queue.qsize()
+
     def play(self, pcm16_bytes: bytes) -> None:
         """Enqueue PCM16 mono audio for playback."""
         if pcm16_bytes:
@@ -182,13 +197,28 @@ class AudioPlayer:
         self._query_device()
         self._close_stream()
 
+    def _is_virtual_device(self) -> bool:
+        """True if output device is a virtual cable (VB-Cable / Voicemeeter).
+
+        These devices route audio to meeting software whose noise gate / AGC
+        degrades low-level TTS, so enhance_clarity is needed.
+        Physical speakers / headphones skip it to preserve natural TTS timbre.
+        """
+        name = (self._device_name or "").lower()
+        if not name:
+            return False
+        markers = ("cable", "voicemeeter", "vb-audio", "virtual")
+        return any(m in name for m in markers)
+
     def _play_immediate(self, pcm16_bytes: bytes) -> None:
         # int16 → float32
         samples = bytes_to_pcm16_array(pcm16_bytes).astype(np.float32) / 32768.0
 
-        # 提升响度与人声清晰度（针对 VB-Cable 等虚拟声卡：信号电平最大化 +
-        # 高频 presence 补偿 + 软限幅，避免对端降噪/AGC 误伤）
-        samples = enhance_clarity(samples, _TTS_SR)
+        # 仅对虚拟声卡 (VB-Cable / Voicemeeter) 应用 enhance_clarity:
+        # 这类设备的对端 (会议软件) 会做降噪/AGC, 需要最大化电平 + 高频补偿.
+        # 直接输出到物理音响/耳机时跳过, 保留 Kokoro TTS 的自然音质.
+        if self._is_virtual_device():
+            samples = enhance_clarity(samples, _TTS_SR)
 
         # 重采样到设备实际采样率（避免 PortAudio 低质量重采样）
         if self._device_sr != _TTS_SR:

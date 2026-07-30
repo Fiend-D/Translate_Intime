@@ -59,22 +59,29 @@ class AppConfigModel(BaseModel):
 
     # Economy mode (Fun-ASR + NLLB local MT + Kokoro TTS)
     economy_dashscope_api_key: str = ""
-    economy_asr_model: str = "fun-asr-realtime"  # or paraformer-realtime-v2
+    economy_asr_backend: Literal["dashscope", "local", "live_captions"] = "live_captions"
+    economy_asr_model: str = "fun-asr-realtime"  # DashScope model (dashscope backend)
+    economy_asr_local_model: str = "faster-whisper-medium"
     economy_mt_backend: Literal["auto", "nllb", "argos", "mymemory"] = "nllb"
     economy_tts_backend: Literal["auto", "kokoro", "edge"] = "kokoro"
     economy_nllb_model: str = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
     economy_offline_setup_done: bool = False  # first-run offline model dialog completed
     economy_kokoro_voice_en: str = "af_heart"
     economy_kokoro_voice_zh: str = "zf_xiaoxiao"
-    economy_utterance_silence_ms: int = Field(default=450, ge=50, le=5000)
+    # 设备偏好: auto (自动检测) / cpu / cuda
+    device_preference: Literal["auto", "cpu", "cuda"] = "auto"
+    economy_utterance_silence_ms: int = Field(default=300, ge=50, le=5000)
     economy_utterance_min_ms: int = Field(default=400, ge=50, le=10000)
-    economy_utterance_max_ms: int = Field(default=12000, ge=500, le=60000)
+    economy_utterance_max_ms: int = Field(default=8000, ge=500, le=60000)
+    # 连续音频软切分: 累积 ≥soft_split_ms 且尾部 RMS <tail_rms 时立即切分
+    economy_utterance_soft_split_ms: int = Field(default=5000, ge=500, le=60000)
+    economy_utterance_tail_rms: float = Field(default=0.003, ge=0.0005, le=0.05)
 
     hotwords: list[str] = Field(default_factory=list)
     glossary: dict[str, str] = Field(default_factory=dict)
     subtitle_history_lines: int = Field(default=2, ge=0, le=40)
     show_original_in_overlay: bool = True
-    overlay_locked: bool = False
+    overlay_locked: dict[str, bool] = Field(default_factory=dict)
     theme_mode: Literal["dark", "light", "system"] = "dark"
     hotkeys: HotkeyConfig = Field(default_factory=HotkeyConfig)
 

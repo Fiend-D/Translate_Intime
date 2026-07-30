@@ -15,9 +15,12 @@ import numpy as np
 
 from src.utils.logger import logger
 
-SILERO_VAD_URL = (
-    "https://raw.githubusercontent.com/snakers4/silero-vad/master/files/silero_vad.onnx"
-)
+SILERO_VAD_URLS = [
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+    "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+    "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+]
+SILERO_VAD_URL = SILERO_VAD_URLS[0]
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_PATH = _PROJECT_ROOT / "resource" / "vad" / "silero_vad.onnx"
 
@@ -111,15 +114,17 @@ class SileroVadEngine:
             return False
 
     def _download_model(self) -> bool:
-        try:
-            self.model_path.parent.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Silero VAD 模型缺失，开始下载: {self.download_url}")
-            urlretrieve(self.download_url, self.model_path)
-            logger.info(f"Silero VAD 模型已保存: {self.model_path}")
-            return True
-        except Exception as exc:
-            logger.warning(f"Silero VAD 模型下载失败，回退 RMS VAD: {exc}")
-            return False
+        self.model_path.parent.mkdir(parents=True, exist_ok=True)
+        for url in SILERO_VAD_URLS:
+            try:
+                logger.info(f"Silero VAD 模型缺失，尝试下载: {url}")
+                urlretrieve(url, self.model_path)
+                logger.info(f"Silero VAD 模型已保存: {self.model_path}")
+                return True
+            except Exception as exc:
+                logger.warning(f"Silero VAD 模型下载失败（{url}）: {exc}")
+        logger.warning("Silero VAD 所有镜像下载均失败，回退 RMS VAD")
+        return False
 
     def _build_inputs(self, x: np.ndarray) -> dict[str, np.ndarray]:
         names = self._input_names

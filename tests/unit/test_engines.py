@@ -50,7 +50,11 @@ def test_factory_creates_economy(tmp_path):
 
 def test_economy_start_send_stop_close(tmp_path):
     """Without DashScope key, factory ASR is unconfigured and start fails."""
-    config = AppConfigModel(log_dir=str(tmp_path / "logs"), translation_mode="economy")
+    config = AppConfigModel(
+        log_dir=str(tmp_path / "logs"),
+        translation_mode="economy",
+        economy_asr_backend="dashscope",
+    )
     engine = create_engine("economy", config, _callbacks())
     assert engine.start_direction(Direction.OUTBOUND, play_voice=False) is False
     engine.close()

@@ -67,6 +67,35 @@ def load_config() -> AppConfigModel:
     data.pop("engine", None)
     data.pop("model_cache_dir", None)
 
+    # Migrate legacy ASR backend → live_captions (推荐默认, 仅 Win11 22H2+)
+    # 旧版本默认 "dashscope" 或 "local", 需 API Key 或下载模型.
+    # Windows Live Captions 系统级 ASR, 零占用高准确率, 接近辅助字幕水平.
+    legacy_backend = data.get("economy_asr_backend", "")
+    if legacy_backend in ("", "dashscope"):
+        data["economy_asr_backend"] = "live_captions"
+
+    # Migrate legacy ASR model id → faster-whisper-medium (本地模型默认)
+    # 旧版本默认 "auto" / SenseVoice / 双语模型, 对游戏实况噪声鲁棒性差.
+    # faster-whisper (Whisper medium) 接近辅助字幕准确率, 噪声鲁棒性最好.
+    legacy_local_model = data.get("economy_asr_local_model", "")
+    if legacy_local_model in (
+        "auto",
+        "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
+    ):
+        data["economy_asr_local_model"] = "faster-whisper-medium"
+
+    # Migrate legacy utterance params → 新默认值 (降低尾部静音, 减少 SenseVoice 幻听)
+    # 旧默认 silence=450 / max=12000 会让过长的尾部静音送入模型, 触发语气词幻听.
+    if data.get("economy_utterance_silence_ms") == 450:
+        data["economy_utterance_silence_ms"] = 300
+    if data.get("economy_utterance_max_ms") == 12000:
+        data["economy_utterance_max_ms"] = 8000
+    # soft_split_ms 旧默认 3000 太激进, 游戏原声每 3 秒切一次产生大量噪点片段;
+    # 迁移到 5000 减少切分频率.
+    if data.get("economy_utterance_soft_split_ms") in (None, 3000):
+        data["economy_utterance_soft_split_ms"] = 5000
+
     # Best-effort: migrate old keyring volcengine secret into volc_api_key once
     if not data.get("volc_api_key"):
         legacy = keyring.get_password(_SERVICE_NAME, "volcengine")

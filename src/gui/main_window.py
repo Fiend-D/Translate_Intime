@@ -125,6 +125,11 @@ class MainWindow(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_process_tick)
         self._timer.setInterval(30)
+        # 资源监控定时器 (独立于 _timer, 间隔 1.5s)
+        self._resource_monitor: Any = None
+        self._resource_timer = QTimer(self)
+        self._resource_timer.timeout.connect(self._on_resource_tick)
+        self._resource_timer.setInterval(1500)
         self._overlays: dict[Direction, SubtitleOverlay] = {}
         self._corpus_hotwords: list[str] = list(getattr(self._config, "hotwords", None) or [])
         self._corpus_glossary: dict[str, str] = dict(getattr(self._config, "glossary", None) or {})
@@ -172,6 +177,7 @@ class MainWindow(QMainWindow):
         self._app_hotkeys = AppHotkeys(self, self._on_hotkey)
         self._apply_theme()
         self._load_config_into_ui()
+        self._start_resource_monitor()
         self._apply_hotkeys()
         self._refresh_usage_chip(self._usage_tracker.state)
         self._update_save_button()
@@ -851,13 +857,55 @@ class MainWindow(QMainWindow):
 
         self._txt_dashscope_key = QLineEdit()
         self._txt_dashscope_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._txt_dashscope_key.setPlaceholderText("DashScope API Key（经济模式）")
+        self._txt_dashscope_key.setPlaceholderText("DashScope API Key（经济模式云端 ASR）")
         self._txt_dashscope_key.setToolTip(
-            "经济模式 ASR 使用阿里云百炼 DashScope Key；也可设置环境变量 DASHSCOPE_API_KEY。"
+            "经济模式云端 ASR 使用阿里云百炼 DashScope Key；也可设置环境变量 DASHSCOPE_API_KEY。\n"
+            "切换为「本地 ASR」后此项可不填。"
         )
         layout.addWidget(self._txt_dashscope_key)
+
+        # ASR 后端选择: 云端 dashscope / 本地 sherpa-onnx
+        asr_row = QHBoxLayout()
+        asr_row.addWidget(self._field_label("ASR 后端"))
+        self._cmb_asr_backend = QComboBox()
+        self._prep_combo(self._cmb_asr_backend)
+        self._cmb_asr_backend.addItem("Windows Live Captions（系统级，推荐）", "live_captions")
+        self._cmb_asr_backend.addItem("本地模型（faster-whisper / sherpa-onnx）", "local")
+        self._cmb_asr_backend.addItem("云端 DashScope Fun-ASR", "dashscope")
+        self._cmb_asr_backend.setToolTip(
+            "Live Captions：系统级ASR，零占用高准确率，仅Win11 22H2+；\n"
+            "本地：下载模型到 resource/asr/，离线运行；\n"
+            "云端：需 DashScope API Key，按量计费。"
+        )
+        self._cmb_asr_backend.currentIndexChanged.connect(self._on_asr_backend_changed)
+        asr_row.addWidget(self._cmb_asr_backend, 1)
+        layout.addLayout(asr_row)
+
+        # 本地 ASR 模型选择 (sherpa-onnx)
+        local_asr_row = QHBoxLayout()
+        local_asr_row.addWidget(self._field_label("本地 ASR 模型"))
+        self._cmb_local_asr_model = QComboBox()
+        self._prep_combo(self._cmb_local_asr_model)
+        from src.engines.pipeline.model_catalog import (
+            ASR_OPTIONS,
+            NLLB_OPTIONS,
+            format_kokoro_info,
+            format_option_label,
+        )
+        for opt in ASR_OPTIONS:
+            self._cmb_local_asr_model.addItem(format_option_label(opt), opt.id)
+        self._cmb_local_asr_model.setToolTip(
+            "本地 sherpa-onnx 流式 ASR 模型。缓存至 项目内 resource/asr/。\n"
+            "更改后立即生效（运行中会停止通道）。"
+        )
+        self._cmb_local_asr_model.currentIndexChanged.connect(
+            self._on_local_asr_model_changed
+        )
+        local_asr_row.addWidget(self._cmb_local_asr_model, 1)
+        layout.addLayout(local_asr_row)
+
         economy_tip = QLabel(
-            "经济模式 = Fun-ASR + NLLB本地翻译 + Kokoro语音（首次运行后台下载模型）"
+            "经济模式 = ASR + NLLB本地翻译 + Kokoro语音（首次运行后台下载模型）"
         )
         economy_tip.setObjectName("fieldLabel")
         economy_tip.setWordWrap(True)
@@ -866,17 +914,12 @@ class MainWindow(QMainWindow):
         nllb_row.addWidget(self._field_label("NLLB 模型"))
         self._cmb_nllb_model = QComboBox()
         self._prep_combo(self._cmb_nllb_model)
-        from src.engines.pipeline.model_catalog import (
-            NLLB_OPTIONS,
-            format_kokoro_info,
-            format_option_label,
-        )
 
         for opt in NLLB_OPTIONS:
             self._cmb_nllb_model.addItem(format_option_label(opt), opt.id)
         self._cmb_nllb_model.setToolTip(
             "本地 NLLB CTranslate2 模型。更改后立即生效（运行中会停止通道）；\n"
-            "模型缓存至 ~/.cache/translator_intime/nllb/"
+            "模型缓存至 项目内 resource/nllb/"
         )
         self._cmb_nllb_model.currentIndexChanged.connect(self._on_nllb_model_changed)
         nllb_row.addWidget(self._cmb_nllb_model, 1)
@@ -885,6 +928,36 @@ class MainWindow(QMainWindow):
         self._lbl_kokoro_info.setObjectName("fieldLabel")
         self._lbl_kokoro_info.setWordWrap(True)
         layout.addWidget(self._lbl_kokoro_info)
+
+        # 设备偏好 (CPU/GPU)
+        from src.utils.device_utils import detect_cuda_available, get_device_options
+
+        device_row = QHBoxLayout()
+        device_row.addWidget(self._field_label("推理设备"))
+        self._cmb_device_pref = QComboBox()
+        self._prep_combo(self._cmb_device_pref)
+        for label, value in get_device_options():
+            self._cmb_device_pref.addItem(label, value)
+        self._cmb_device_pref.setToolTip(
+            "选择本地模型 (ASR/MT/TTS) 的推理设备。\n"
+            "自动：有 NVIDIA GPU 时用 GPU，否则 CPU；\n"
+            "CPU：强制 CPU（兼容性最好）；\n"
+            "GPU (CUDA)：强制 GPU（需 NVIDIA 显卡 + CUDA onnxruntime）。"
+        )
+        if not detect_cuda_available():
+            self._cmb_device_pref.setToolTip(
+                "当前未检测到 NVIDIA GPU 或 CUDA onnxruntime。\n"
+                "安装 onnxruntime-gpu 和 NVIDIA 驱动后可选择 GPU。"
+            )
+        self._cmb_device_pref.currentIndexChanged.connect(self._on_device_pref_changed)
+        device_row.addWidget(self._cmb_device_pref, 1)
+        layout.addLayout(device_row)
+
+        # 实时资源占用标签
+        self._lbl_resource = QLabel("CPU 0% | RAM 0.0GB")
+        self._lbl_resource.setObjectName("fieldLabel")
+        self._lbl_resource.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self._lbl_resource)
 
         layout.addWidget(self._field_label("Dota 助手（语音教练）"))
         coach_row = QHBoxLayout()
@@ -1325,6 +1398,32 @@ class MainWindow(QMainWindow):
             self._txt_dashscope_key.setText(
                 getattr(cfg, "economy_dashscope_api_key", "") or ""
             )
+        if hasattr(self, "_cmb_asr_backend"):
+            self._cmb_asr_backend.blockSignals(True)
+            self._select_combo_data(
+                self._cmb_asr_backend,
+                getattr(cfg, "economy_asr_backend", "live_captions") or "live_captions",
+            )
+            self._cmb_asr_backend.blockSignals(False)
+        if hasattr(self, "_cmb_local_asr_model"):
+            self._cmb_local_asr_model.blockSignals(True)
+            self._select_combo_data(
+                self._cmb_local_asr_model,
+                getattr(
+                    cfg,
+                    "economy_asr_local_model",
+                    "faster-whisper-medium",
+                )
+                or "faster-whisper-medium",
+            )
+            self._cmb_local_asr_model.blockSignals(False)
+        if hasattr(self, "_cmb_device_pref"):
+            self._cmb_device_pref.blockSignals(True)
+            self._select_combo_data(
+                self._cmb_device_pref,
+                getattr(cfg, "device_preference", "auto") or "auto",
+            )
+            self._cmb_device_pref.blockSignals(False)
         if hasattr(self, "_cmb_nllb_model"):
             self._cmb_nllb_model.blockSignals(True)
             self._select_combo_data(
@@ -1541,8 +1640,25 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "_txt_dashscope_key")
                 else getattr(self._config, "economy_dashscope_api_key", "")
             ),
+            economy_asr_backend=(
+                self._cmb_asr_backend.currentData()
+                if hasattr(self, "_cmb_asr_backend") and self._cmb_asr_backend.currentData()
+                else getattr(self._config, "economy_asr_backend", "live_captions")
+                or "live_captions"
+            ),
             economy_asr_model=getattr(self._config, "economy_asr_model", "fun-asr-realtime")
             or "fun-asr-realtime",
+            economy_asr_local_model=(
+                self._cmb_local_asr_model.currentData()
+                if hasattr(self, "_cmb_local_asr_model")
+                and self._cmb_local_asr_model.currentData()
+                else getattr(
+                    self._config,
+                    "economy_asr_local_model",
+                    "faster-whisper-medium",
+                )
+                or "faster-whisper-medium"
+            ),
             economy_mt_backend=getattr(self._config, "economy_mt_backend", "nllb") or "nllb",
             economy_tts_backend=getattr(self._config, "economy_tts_backend", "kokoro")
             or "kokoro",
@@ -1567,14 +1683,26 @@ class MainWindow(QMainWindow):
                 self._config, "economy_kokoro_voice_zh", "zf_xiaoxiao"
             )
             or "zf_xiaoxiao",
+            device_preference=(
+                self._cmb_device_pref.currentData()
+                if hasattr(self, "_cmb_device_pref")
+                and self._cmb_device_pref.currentData()
+                else getattr(self._config, "device_preference", "auto") or "auto"
+            ),
             economy_utterance_silence_ms=int(
-                getattr(self._config, "economy_utterance_silence_ms", 450) or 450
+                getattr(self._config, "economy_utterance_silence_ms", 300) or 300
             ),
             economy_utterance_min_ms=int(
                 getattr(self._config, "economy_utterance_min_ms", 400) or 400
             ),
             economy_utterance_max_ms=int(
-                getattr(self._config, "economy_utterance_max_ms", 12000) or 12000
+                getattr(self._config, "economy_utterance_max_ms", 8000) or 8000
+            ),
+            economy_utterance_soft_split_ms=int(
+                getattr(self._config, "economy_utterance_soft_split_ms", 5000) or 5000
+            ),
+            economy_utterance_tail_rms=float(
+                getattr(self._config, "economy_utterance_tail_rms", 0.003) or 0.003
             ),
             volc_access_token=self._txt_volc_token.text().strip(),
             volc_speaker_id=self._cmb_volc_voice.currentData() or "",
@@ -1673,18 +1801,29 @@ class MainWindow(QMainWindow):
         else:
             self._append_log(msg)
         if mode == "economy":
-            key = ""
-            if hasattr(self, "_txt_dashscope_key"):
-                key = self._txt_dashscope_key.text().strip()
-            key = key or (
-                getattr(self._config, "economy_dashscope_api_key", "") or ""
-            ).strip()
-            import os as _os
+            asr_pref = getattr(self._config, "economy_asr_backend", "live_captions") or "live_captions"
+            if asr_pref in ("local", "live_captions"):
+                if asr_pref == "live_captions":
+                    self._append_log(
+                        "经济模式已使用 Windows Live Captions（系统级ASR），无需 API Key"
+                    )
+                else:
+                    self._append_log(
+                        "经济模式已使用本地 ASR，无需 DashScope API Key"
+                    )
+            else:
+                key = ""
+                if hasattr(self, "_txt_dashscope_key"):
+                    key = self._txt_dashscope_key.text().strip()
+                key = key or (
+                    getattr(self._config, "economy_dashscope_api_key", "") or ""
+                ).strip()
+                import os as _os
 
-            if not key and not (_os.environ.get("DASHSCOPE_API_KEY") or "").strip():
-                warn = "经济模式需要 DashScope API Key（设置页填写或环境变量 DASHSCOPE_API_KEY）"
-                self._append_log(warn)
-                show_toast(warn)
+                if not key and not (_os.environ.get("DASHSCOPE_API_KEY") or "").strip():
+                    warn = "经济模式需要 DashScope API Key（设置页填写或环境变量 DASHSCOPE_API_KEY），或切换为「本地 ASR」"
+                    self._append_log(warn)
+                    show_toast(warn)
 
     def _ensure_economy_offline_setup(self) -> bool:
         """Show first-run offline model dialog if needed. Returns False if cancelled."""
@@ -1761,6 +1900,160 @@ class MainWindow(QMainWindow):
             msg = "已切换本地翻译模型，通道已停止；重新开启后生效"
         self._append_log(msg)
         show_toast(msg)
+
+    def _on_asr_backend_changed(self) -> None:
+        """切换经济模式 ASR 后端 (云端/本地)，运行中会停止通道。"""
+        if not hasattr(self, "_cmb_asr_backend"):
+            return
+        backend = self._cmb_asr_backend.currentData()
+        if not backend:
+            return
+        current = getattr(self._config, "economy_asr_backend", "live_captions") or "live_captions"
+        if backend == current:
+            return
+
+        stopped = False
+        mode = getattr(self._config, "translation_mode", "volc") or "volc"
+        if mode == "economy" and self._pipeline is not None:
+            if self._pipeline.active_channels():
+                with contextlib.suppress(Exception):
+                    self._pipeline.stop()
+                stopped = True
+                self._timer.stop()
+                self._btn_stop.setEnabled(False)
+                self._progress.setVisible(False)
+                self._badge.setText("Idle")
+                self._refresh_channel_buttons()
+                self._on_enable_toggled()
+            with contextlib.suppress(Exception):
+                self._pipeline.close_engine()
+            self._pipeline._config = self._pipeline._config.model_copy(
+                update={"economy_asr_backend": backend}
+            )
+
+        self._config = self._config.model_copy(
+            update={"economy_asr_backend": backend}
+        )
+        self._persist_config()
+
+        label = "本地 sherpa-onnx" if backend == "local" else "云端 DashScope"
+        msg = f"已切换 ASR 后端为 {label}，将在下次启动通道时生效"
+        if stopped:
+            msg = f"已切换 ASR 后端为 {label}，通道已停止；重新开启后生效"
+        self._append_log(msg)
+        show_toast(msg)
+
+    def _on_local_asr_model_changed(self) -> None:
+        """切换本地 sherpa-onnx ASR 模型，运行中会停止通道。"""
+        if not hasattr(self, "_cmb_local_asr_model"):
+            return
+        model_id = self._cmb_local_asr_model.currentData()
+        if not model_id:
+            return
+        current = getattr(self._config, "economy_asr_local_model", "") or ""
+        if model_id == current:
+            return
+
+        stopped = False
+        mode = getattr(self._config, "translation_mode", "volc") or "volc"
+        if mode == "economy" and self._pipeline is not None:
+            if self._pipeline.active_channels():
+                with contextlib.suppress(Exception):
+                    self._pipeline.stop()
+                stopped = True
+                self._timer.stop()
+                self._btn_stop.setEnabled(False)
+                self._progress.setVisible(False)
+                self._badge.setText("Idle")
+                self._refresh_channel_buttons()
+                self._on_enable_toggled()
+            with contextlib.suppress(Exception):
+                self._pipeline.close_engine()
+            self._pipeline._config = self._pipeline._config.model_copy(
+                update={"economy_asr_local_model": model_id}
+            )
+
+        self._config = self._config.model_copy(
+            update={"economy_asr_local_model": model_id}
+        )
+        self._persist_config()
+
+        msg = "已切换本地 ASR 模型，将在下次启动通道时生效"
+        if stopped:
+            msg = "已切换本地 ASR 模型，通道已停止；重新开启后生效"
+        self._append_log(msg)
+        show_toast(msg)
+
+    def _on_device_pref_changed(self) -> None:
+        """切换推理设备 (CPU/GPU/auto)，运行中会停止通道。"""
+        if not hasattr(self, "_cmb_device_pref"):
+            return
+        pref = self._cmb_device_pref.currentData()
+        if not pref:
+            return
+        current = getattr(self._config, "device_preference", "auto") or "auto"
+        if pref == current:
+            return
+
+        stopped = False
+        mode = getattr(self._config, "translation_mode", "volc") or "volc"
+        if mode == "economy" and self._pipeline is not None:
+            if self._pipeline.active_channels():
+                with contextlib.suppress(Exception):
+                    self._pipeline.stop()
+                stopped = True
+                self._timer.stop()
+                self._btn_stop.setEnabled(False)
+                self._progress.setVisible(False)
+                self._badge.setText("Idle")
+                self._refresh_channel_buttons()
+                self._on_enable_toggled()
+            with contextlib.suppress(Exception):
+                self._pipeline.close_engine()
+            self._pipeline._config = self._pipeline._config.model_copy(
+                update={"device_preference": pref}
+            )
+
+        self._config = self._config.model_copy(update={"device_preference": pref})
+        self._persist_config()
+
+        label_map = {"auto": "自动", "cpu": "CPU", "cuda": "GPU (CUDA)"}
+        label = label_map.get(pref, pref)
+        msg = f"已切换推理设备为 {label}，将在下次启动通道时生效"
+        if stopped:
+            msg = f"已切换推理设备为 {label}，通道已停止；重新开启后生效"
+        self._append_log(msg)
+        show_toast(msg)
+
+    def _resolve_output_device_name(self) -> str:
+        """根据当前 output_device 配置返回可读的设备名 (而非索引数字)."""
+        try:
+            if hasattr(self, "_cmb_output"):
+                idx = self._cmb_output.currentIndex()
+                if idx >= 0:
+                    text = self._cmb_output.itemText(idx)
+                    if text:
+                        return text
+        except Exception:
+            pass
+        out_dev = getattr(self._config, "output_device", None)
+        if out_dev is None:
+            return "系统默认"
+        return f"设备 #{out_dev}"
+
+    def _start_resource_monitor(self) -> None:
+        """启动后台资源监控 (CPU/RAM/GPU), 定时刷新标签."""
+        from src.utils.device_utils import ResourceMonitor
+
+        self._resource_monitor = ResourceMonitor(interval_ms=1500)
+        self._resource_monitor.start()
+        self._resource_timer.start()
+
+    def _on_resource_tick(self) -> None:
+        """定时刷新资源占用标签."""
+        if not hasattr(self, "_lbl_resource") or self._resource_monitor is None:
+            return
+        self._lbl_resource.setText(self._resource_monitor.format_text())
 
     def _refresh_corpus_label(self) -> None:
         hw = getattr(self, "_corpus_hotwords", None) or []
@@ -2371,7 +2664,10 @@ class MainWindow(QMainWindow):
             if mode == "economy" and reason:
                 self._append_log(reason)
             if play_voice:
-                self._append_log(f"{label}已开启语音输出")
+                out_dev_name = self._resolve_output_device_name()
+                self._append_log(
+                    f"{label}已开启语音输出 → 输出设备: {out_dev_name}"
+                )
             self._on_enable_toggled()
         except Exception as exc:
             self._append_log(f"{label}启动失败: {exc}")
@@ -2917,6 +3213,10 @@ class MainWindow(QMainWindow):
         if self._music_sidebar is not None:
             self._music_sidebar.close()
             self._music_sidebar = None
+        with contextlib.suppress(Exception):
+            self._resource_timer.stop()
+            if self._resource_monitor is not None:
+                self._resource_monitor.stop()
         self._hotkeys.stop()
         self._on_stop()
         app = QApplication.instance()

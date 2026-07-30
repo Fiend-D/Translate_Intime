@@ -10,6 +10,10 @@ checkpoints/
 *.safetensors
 # Local downloaded assets under resource/ (keep placeholder .gitkeep)
 resource/mt/
+resource/nllb/*
+!resource/nllb/.gitkeep
+resource/asr/*
+!resource/asr/.gitkeep
 resource/vad/*.onnx
 !resource/vad/.gitkeep
 torch_cache/

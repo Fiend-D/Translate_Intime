@@ -17,21 +17,40 @@ _TARGET_SR = 16000
 _CACHE_ROOT = Path.home() / ".cache" / "translator_intime" / "kokoro"
 _LOG_INTERVAL_SEC = 30.0
 
+_GH_MIRRORS = (
+    "https://ghfast.top/https://github.com",
+    "https://gh-proxy.com/https://github.com",
+    "https://github.com",
+)
+
+
+def _mirror(url: str) -> list[str]:
+    """Return mirrored download URLs for GitHub release assets."""
+    marker = "https://github.com"
+    if not url.startswith(marker):
+        return [url]
+    suffix = url[len(marker) :]
+    out: list[str] = []
+    for m in _GH_MIRRORS:
+        out.append(m.rstrip("/") + suffix)
+    return out
+
+
 # English / multilingual v1.0
-_EN_MODEL_URL = (
+_EN_MODEL_URLS = _mirror(
     "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
     "model-files-v1.0/kokoro-v1.0.onnx"
 )
-_EN_VOICES_URL = (
+_EN_VOICES_URLS = _mirror(
     "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
     "model-files-v1.0/voices-v1.0.bin"
 )
 # Chinese v1.1-zh
-_ZH_MODEL_URL = (
+_ZH_MODEL_URLS = _mirror(
     "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
     "model-files-v1.1/kokoro-v1.1-zh.onnx"
 )
-_ZH_VOICES_URL = (
+_ZH_VOICES_URLS = _mirror(
     "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
     "model-files-v1.1/voices-v1.1-zh.bin"
 )
@@ -62,11 +81,13 @@ class KokoroOnnxTts:
         voice_en: str = DEFAULT_VOICE_EN,
         voice_zh: str = DEFAULT_VOICE_ZH,
         auto_download: bool = True,
+        device_preference: str = "auto",
     ) -> None:
         self._cache_dir = Path(cache_dir) if cache_dir else _CACHE_ROOT
         self._voice_en = (voice_en or DEFAULT_VOICE_EN).strip() or DEFAULT_VOICE_EN
         self._voice_zh = (voice_zh or DEFAULT_VOICE_ZH).strip() or DEFAULT_VOICE_ZH
         self._auto_download = auto_download
+        self._device_preference = (device_preference or "auto").strip().lower()
         self._started = False
         self._ready = False
         self._failed = False
@@ -222,55 +243,95 @@ class KokoroOnnxTts:
             )
             return False
 
-        en_model = self._cache_dir / "kokoro-v1.0.onnx"
-        en_voices = self._cache_dir / "voices-v1.0.bin"
-        zh_model = self._cache_dir / "kokoro-v1.1-zh.onnx"
-        zh_voices = self._cache_dir / "voices-v1.1-zh.bin"
+        # kokoro-onnx 内部用 onnxruntime.InferenceSession 但不暴露 provider 参数,
+        # 通过临时 monkey-patch 注入 CUDA provider 支持.
+        providers = self._resolve_providers()
+        ort_patched = False
+        if providers:
+            import onnxruntime as ort
 
-        if not self._ensure_file(en_model, _EN_MODEL_URL):
-            return False
-        if not self._ensure_file(en_voices, _EN_VOICES_URL):
-            return False
+            _orig_init = ort.InferenceSession.__init__
 
-        # Best-effort Chinese assets (optional).
-        zh_ok = self._ensure_file(zh_model, _ZH_MODEL_URL, required=False)
-        zh_ok = zh_ok and self._ensure_file(zh_voices, _ZH_VOICES_URL, required=False)
+            def _patched_init(self_s, *args, **kwargs):
+                kwargs.setdefault("providers", providers)
+                return _orig_init(self_s, *args, **kwargs)
+
+            ort.InferenceSession.__init__ = _patched_init
+            ort_patched = True
+            logger.info(f"Kokoro TTS providers={providers}")
 
         try:
-            kokoro_en = Kokoro(str(en_model), str(en_voices))
-            en_voice_ids = self._list_voices(kokoro_en)
-        except Exception as exc:
-            logger.warning(f"Kokoro 英文模型加载失败: {exc}")
-            return False
+            en_model = self._cache_dir / "kokoro-v1.0.onnx"
+            en_voices = self._cache_dir / "voices-v1.0.bin"
+            zh_model = self._cache_dir / "kokoro-v1.1-zh.onnx"
+            zh_voices = self._cache_dir / "voices-v1.1-zh.bin"
 
-        kokoro_zh = None
-        zh_voice_ids: set[str] = set()
-        zh_g2p = None
-        if zh_ok and zh_model.exists() and zh_voices.exists():
+            if not self._ensure_file(en_model, _EN_MODEL_URLS):
+                return False
+            if not self._ensure_file(en_voices, _EN_VOICES_URLS):
+                return False
+
+            # Best-effort Chinese assets (optional).
+            zh_ok = self._ensure_file(zh_model, _ZH_MODEL_URLS, required=False)
+            zh_ok = zh_ok and self._ensure_file(zh_voices, _ZH_VOICES_URLS, required=False)
+
             try:
-                kokoro_zh = Kokoro(str(zh_model), str(zh_voices))
-                zh_voice_ids = self._list_voices(kokoro_zh)
-                try:
-                    from misaki import zh as misaki_zh
-
-                    zh_g2p = misaki_zh.ZHG2P()
-                except Exception:
-                    zh_g2p = None
-                    logger.info(
-                        "未安装 misaki[zh]，中文将直接送入 Kokoro（建议: pip install 'misaki[zh]'）"
-                    )
+                kokoro_en = Kokoro(str(en_model), str(en_voices))
+                en_voice_ids = self._list_voices(kokoro_en)
             except Exception as exc:
-                logger.warning(f"Kokoro 中文模型加载失败，将回退英文: {exc}")
-                kokoro_zh = None
+                logger.warning(f"Kokoro 英文模型加载失败: {exc}")
+                return False
 
-        with self._lock:
-            self._kokoro_en = kokoro_en
-            self._kokoro_zh = kokoro_zh
-            self._zh_g2p = zh_g2p
-            self._en_voices = en_voice_ids
-            self._zh_voices = zh_voice_ids
-            self._zh_ready = kokoro_zh is not None
-        return True
+            kokoro_zh = None
+            zh_voice_ids: set[str] = set()
+            zh_g2p = None
+            if zh_ok and zh_model.exists() and zh_voices.exists():
+                try:
+                    kokoro_zh = Kokoro(str(zh_model), str(zh_voices))
+                    zh_voice_ids = self._list_voices(kokoro_zh)
+                    try:
+                        from misaki import zh as misaki_zh
+
+                        zh_g2p = misaki_zh.ZHG2P()
+                    except Exception:
+                        zh_g2p = None
+                        logger.info(
+                            "未安装 misaki[zh]，中文将直接送入 Kokoro（建议: pip install 'misaki[zh]'）"
+                        )
+                except Exception as exc:
+                    logger.warning(f"Kokoro 中文模型加载失败，将回退英文: {exc}")
+                    kokoro_zh = None
+
+            with self._lock:
+                self._kokoro_en = kokoro_en
+                self._kokoro_zh = kokoro_zh
+                self._zh_g2p = zh_g2p
+                self._en_voices = en_voice_ids
+                self._zh_voices = zh_voice_ids
+                self._zh_ready = kokoro_zh is not None
+            return True
+        finally:
+            # 恢复原始 InferenceSession, 避免 patch 泄漏到其他模块
+            if ort_patched:
+                ort.InferenceSession.__init__ = _orig_init
+
+    def _resolve_providers(self) -> list[str]:
+        """根据 preference 返回 onnxruntime providers 列表."""
+        pref = self._device_preference
+        if pref == "cpu":
+            return ["CPUExecutionProvider"]
+        # auto 或 cuda
+        try:
+            import onnxruntime as ort
+
+            available = ort.get_available_providers()
+            if any("CUDA" in p for p in available):
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        except Exception:
+            pass
+        if pref == "cuda":
+            logger.warning("用户选择了 CUDA 但 onnxruntime 无 CUDA provider，回退 CPU")
+        return ["CPUExecutionProvider"]
 
     @staticmethod
     def _list_voices(kokoro: Any) -> set[str]:
@@ -287,7 +348,7 @@ class KokoroOnnxTts:
         return set()
 
     def _ensure_file(
-        self, path: Path, url: str, *, required: bool = True
+        self, path: Path, urls: str | list[str], *, required: bool = True
     ) -> bool:
         if path.exists() and path.stat().st_size > 0:
             return True
@@ -295,26 +356,31 @@ class KokoroOnnxTts:
             if required:
                 logger.warning(f"Kokoro 文件缺失且禁用下载: {path}")
             return False
-        try:
-            from src.utils.proxy_env import prepare_model_download_env
+        url_list = [urls] if isinstance(urls, str) else list(urls)
+        from src.utils.proxy_env import prepare_model_download_env
 
-            prepare_model_download_env()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            logger.info(f"正在下载 Kokoro: {url}")
-            tmp = path.with_suffix(path.suffix + ".part")
-            urlretrieve(url, tmp)
-            tmp.replace(path)
-            logger.info(f"Kokoro 已保存: {path}")
-            return True
-        except Exception as exc:
-            if required:
-                logger.warning(f"Kokoro 下载失败: {exc}")
-                err = str(exc).lower()
-                if "socks" in err or "proxy" in err:
-                    logger.warning(
-                        "代理相关失败提示: 请改用 Clash HTTP 端口 "
-                        "(http://127.0.0.1:7890)，或 pip install PySocks"
-                    )
-            else:
-                logger.info(f"Kokoro 中文资源下载跳过/失败: {exc}")
+        prepare_model_download_env()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        last_exc: Exception | None = None
+        for url in url_list:
+            try:
+                logger.info(f"正在下载 Kokoro: {url}")
+                tmp = path.with_suffix(path.suffix + ".part")
+                urlretrieve(url, tmp)
+                tmp.replace(path)
+                logger.info(f"Kokoro 已保存: {path}")
+                return True
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(f"Kokoro 镜像失败（{url}）: {exc}")
+        if required:
+            logger.warning(f"Kokoro 下载失败: {last_exc}")
+            err = str(last_exc).lower() if last_exc else ""
+            if "socks" in err or "proxy" in err:
+                logger.warning(
+                    "代理相关失败提示: 请改用 Clash HTTP 端口 "
+                    "(http://127.0.0.1:7890)，或 pip install PySocks"
+                )
             return False
+        logger.info(f"Kokoro 可选资源下载跳过/失败: {last_exc}")
+        return False

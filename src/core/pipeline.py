@@ -77,24 +77,34 @@ class TranslationPipeline(QObject):
         self._ducker = None
 
         # --- 回灌抑制（feedback suppression） ---
-        # TTS 播放期间，麦克风音频**不丢弃**，而是缓存到 buffer。
-        # 当 TTS 静音窗口解除（玩家句间停顿够长）时，批量回放给翻译引擎。
+        # TTS 播放期间，输入音频**不丢弃**，而是缓存到 buffer。
+        # 当 TTS 静音窗口解除（句间停顿够长）时，批量回放给翻译引擎。
         # 好处：连续说话中间停顿不会被截断；同时回灌不会触发新翻译。
+        # 同时作用于 outbound (麦克风) 和 inbound (游戏字幕/loopback) 两个方向。
         self._tts_playing_until: float = 0.0
         self._tts_min_silence_sec: float = 2.0
         self._tts_silence_margin_sec: float = 0.5
-        # outbound 麦克风缓存：每次回调追加
-        self._mic_buffer: list[bytes] = []
-        self._mic_buffer_bytes: int = 0
-        self._mic_buffer_max_bytes: int = 5 * 16000 * 2  # 最多 5 秒（16000Hz, 16bit, mono）
-        self._barge_in_started_at: float = 0.0
+        # 每个方向独立的回灌缓存
+        self._feedback_buffers: dict[Direction, list[bytes]] = {
+            Direction.OUTBOUND: [],
+            Direction.INBOUND: [],
+        }
+        self._feedback_buffer_bytes: dict[Direction, int] = {
+            Direction.OUTBOUND: 0,
+            Direction.INBOUND: 0,
+        }
+        self._feedback_buffer_max_bytes: int = 5 * 16000 * 2  # 每方向最多 5 秒
+        self._barge_in_started_at: dict[Direction, float] = {
+            Direction.OUTBOUND: 0.0,
+            Direction.INBOUND: 0.0,
+        }
         # 文本去重：8 秒内连续相同译文只播放一次
         self._last_played_text: str = ""
         self._last_played_at: float = 0.0
         self._text_dedup_window_sec: float = 8.0
         self._skip_next_audio_for: set[Direction] = set()
         # 保护 buffer 写入的锁（on_pcm 在录音线程被调用）
-        self._mic_buffer_lock = threading.Lock()
+        self._feedback_buffer_lock = threading.Lock()
 
         configure_logging(Path(config.log_dir), config.debug_mode)
 
@@ -500,6 +510,10 @@ class TranslationPipeline(QObject):
         hangover_ms = int(getattr(self._config, "vad_hangover_ms", 600) or 600)
         backend = getattr(self._config, "vad_backend", "auto") or "auto"
         preroll_ms = int(getattr(self._config, "vad_preroll_ms", 300) or 300)
+        # 游戏字幕场景强制 RMS VAD: 游戏声音是混合音频 (BGM/音效/对话),
+        # Silero VAD 只检测人声, 对 BGM 和音效 prob=0 会导致全部音频被拦截.
+        if profile == "game":
+            backend = "rms"
         return SpeechGate(
             profile=profile,
             sensitivity=str(sens),
@@ -545,7 +559,7 @@ class TranslationPipeline(QObject):
                 self._capture_outbound = None
             self._vad_outbound = None
             self._vad_outbound_filters = False
-            self._barge_in_started_at = 0.0
+            self._barge_in_started_at[Direction.OUTBOUND] = 0.0
             self._outbound_active = False
             self._play_outbound_voice = False
         else:
@@ -710,15 +724,34 @@ class TranslationPipeline(QObject):
                 self._ducker.pulse()
         if self._player is not None:
             self._player.play(data)
+        else:
+            dir_label = "麦克风" if direction == Direction.OUTBOUND else "游戏"
+            logger.warning(
+                f"{dir_label}通道语音输出被丢弃：AudioPlayer 未创建 "
+                f"(output_device={self._output_device!r})"
+            )
 
     def _on_tts_segment_finished(self, played_sec: float) -> None:
         """AudioPlayer 一段播完后调用。用 wall clock 精确延长静音窗口，
         避免 TTS 多段累积下窗口不足导致回灌。"""
         if played_sec <= 0:
             return
-        candidate = time.time() + played_sec + self._tts_silence_margin_sec
+        # 段播完时, 若队列仍有待播段, 继续保持静音窗口
+        queue_remaining = self._player_queue_remaining()
+        candidate = time.time() + played_sec + queue_remaining + self._tts_silence_margin_sec
         if candidate > self._tts_playing_until:
             self._tts_playing_until = candidate
+
+    def _player_queue_remaining(self) -> float:
+        """估算 AudioPlayer 队列中剩余音频时长 (秒)."""
+        if self._player is None:
+            return 0.0
+        try:
+            qsize = self._player.queue_size
+        except Exception:
+            qsize = 0
+        # 队列里每段平均 ~1.5 秒 (经验值), 不精确但足以防止回灌
+        return qsize * 1.5
 
     def _on_engine_error(self, message: str) -> None:
         self.log_message.emit(message)
@@ -733,137 +766,150 @@ class TranslationPipeline(QObject):
             return
         if direction not in self._engine.active_directions:
             return
+        # 两个方向都走回灌抑制：TTS 播放期间音频入缓存，
+        # 窗口解除时回放给翻译引擎。
+        self._handle_pcm_with_feedback_suppression(direction, pcm)
 
-        if direction == Direction.OUTBOUND:
-            # 麦克风走回灌抑制缓冲：TTS 播放期间音频入缓存，
-            # 窗口解除时回放给翻译引擎。
-            self._handle_mic_with_feedback_suppression(pcm)
-            return
+    def _handle_pcm_with_feedback_suppression(self, direction: Direction, pcm: bytes) -> None:
+        """统一回灌抑制：TTS 播放期间入 buffer；窗口解除时回放。
 
-        # --- inbound（游戏字幕）走原始路径 ---
-        gate = self._vad_inbound
-        if gate is not None:
-            result = gate.process(pcm)
-            ok = result.passed
-            if ok:
+        同时适用于 outbound (麦克风) 和 inbound (游戏字幕/loopback) 两个方向。
+        关键点：buffer 写入必须在录音线程**快**（O(1)），
+        否则会卡住采集。实际回放放在主流程外。
+
+        回灌抑制窗口由两部分共同决定:
+        1. ``_tts_playing_until`` — 基于音频时长 + 段完成回调的估算
+        2. ``AudioPlayer.is_playing`` — 真实播放状态 (队列有数据或流活跃)
+        任一为 True 都保持静音窗口, 避免估算不准导致回灌.
+        """
+        now = time.time()
+        gate = self._vad_outbound if direction == Direction.OUTBOUND else self._vad_inbound
+        result = gate.process(pcm) if gate is not None else None
+
+        # inbound 方向的 VAD 诊断日志 (原 _engine_direct_pcm inbound 分支)
+        if direction == Direction.INBOUND and result is not None:
+            if result.passed:
                 self._vad_pass_chunks += 1
             else:
                 self._vad_drop_chunks += 1
-            now = time.time()
             if now - self._vad_diag_at >= 5.0:
                 self._vad_diag_at = now
-                st = gate.stats()
-                total = self._vad_pass_chunks + self._vad_drop_chunks
-                if total:
-                    msg = (
-                        f"游戏捕获电平 {st.backend} RMS={st.rms:.4f} "
-                        f"VAD={'开' if st.open else '关'} "
-                        f"近5秒送出 {self._vad_pass_chunks}/{total}"
-                    )
-                    if st.backend == "silero":
-                        msg += f" prob={st.speech_prob:.2f}"
-                    if st.rms < 0.002:
-                        msg += " · 几乎无声，请确认「游戏声音」选的是正在播放视频的扬声器 Loopback"
-                    elif self._vad_pass_chunks == 0:
-                        msg += " · 有声但被 VAD 拦住，可在设置把灵敏度改「宽松」或暂时关闭 VAD"
-                    self.log_message.emit(msg)
-                    self._vad_pass_chunks = 0
-                    self._vad_drop_chunks = 0
-            if not ok:
-                return
-            if result.opened_now and result.preroll:
-                self._engine.send_pcm(direction, result.preroll + pcm)
-                return
-        self._engine.send_pcm(direction, pcm)
+                self._log_inbound_vad_diag(gate)
 
-    def _handle_mic_with_feedback_suppression(self, pcm: bytes) -> None:
-        """麦克风音频：TTS 播放期间入 buffer；窗口解除时回放。
-
-        关键点：buffer 写入必须在录音线程**快**（O(1)），
-        否则会卡住采集。实际回放放在主流程外。
-        """
-        now = time.time()
-        gate = self._vad_outbound
-        result = gate.process(pcm) if gate is not None else None
-        in_silence = now < self._tts_playing_until
+        # 双重判定: 时间窗口 OR 真实播放状态
+        player_busy = self._player is not None and self._player.is_playing
+        in_silence = (now < self._tts_playing_until) or player_busy
         if not in_silence:
-            self._barge_in_started_at = 0.0
+            self._barge_in_started_at[direction] = 0.0
             # 窗口已解除：先把 buffer 残留（来自上次静音期）回放，再发当前帧
-            self._flush_mic_buffer()
-            self._send_mic_pcm(pcm, gate_result=result)
+            self._flush_feedback_buffer(direction)
+            self._send_pcm_with_preroll(direction, pcm, gate_result=result)
             return
 
         # TTS 正在播放：缓存当前帧
         if result is not None and result.opened_now and result.preroll:
-            self._append_mic_buffer(result.preroll)
-        self._append_mic_buffer(pcm)
+            self._append_feedback_buffer(direction, result.preroll)
+        self._append_feedback_buffer(direction, pcm)
 
         if result is None or not result.passed:
-            self._barge_in_started_at = 0.0
+            self._barge_in_started_at[direction] = 0.0
             return
 
-        if self._barge_in_started_at <= 0:
-            self._barge_in_started_at = now
+        if self._barge_in_started_at[direction] <= 0:
+            self._barge_in_started_at[direction] = now
             return
 
         barge_ms = int(getattr(self._config, "vad_barge_in_ms", 200) or 200)
-        if (now - self._barge_in_started_at) * 1000 < barge_ms:
+        if (now - self._barge_in_started_at[direction]) * 1000 < barge_ms:
             return
 
-        self._end_tts_mute_for_barge_in()
+        self._end_tts_mute_for_barge_in(direction)
 
-    def _append_mic_buffer(self, pcm: bytes) -> None:
+    def _log_inbound_vad_diag(self, gate: SpeechGate | None) -> None:
+        """每 5 秒输出一次游戏字幕 VAD 诊断信息。"""
+        if gate is None:
+            return
+        st = gate.stats()
+        total = self._vad_pass_chunks + self._vad_drop_chunks
+        if not total:
+            return
+        msg = (
+            f"游戏捕获电平 {st.backend} RMS={st.rms:.4f} "
+            f"VAD={'开' if st.open else '关'} "
+            f"近5秒送出 {self._vad_pass_chunks}/{total}"
+        )
+        if st.backend == "silero":
+            msg += f" prob={st.speech_prob:.2f}"
+        if st.rms < 0.002:
+            msg += " · 几乎无声，请确认「游戏声音」选的是正在播放视频的扬声器 Loopback"
+        elif self._vad_pass_chunks == 0:
+            msg += " · 有声但被 VAD 拦住，可在设置把灵敏度改「宽松」或暂时关闭 VAD"
+        self.log_message.emit(msg)
+        self._vad_pass_chunks = 0
+        self._vad_drop_chunks = 0
+
+    def _append_feedback_buffer(self, direction: Direction, pcm: bytes) -> None:
         if not pcm:
             return
-        with self._mic_buffer_lock:
-            self._mic_buffer.append(pcm)
-            self._mic_buffer_bytes += len(pcm)
+        with self._feedback_buffer_lock:
+            buf = self._feedback_buffers[direction]
+            buf.append(pcm)
+            self._feedback_buffer_bytes[direction] += len(pcm)
             # 超过上限：丢弃最早一段（FIFO），保留最近 5 秒
-            if self._mic_buffer_bytes > self._mic_buffer_max_bytes:
-                drop = self._mic_buffer.pop(0)
-                self._mic_buffer_bytes -= len(drop)
+            if self._feedback_buffer_bytes[direction] > self._feedback_buffer_max_bytes:
+                drop = buf.pop(0)
+                self._feedback_buffer_bytes[direction] -= len(drop)
                 with contextlib.suppress(Exception):
                     import array as _a
                     _a.array("b", drop)  # 触发 zeroization best-effort
 
-    def _end_tts_mute_for_barge_in(self) -> None:
-        self._barge_in_started_at = 0.0
+    def _end_tts_mute_for_barge_in(self, direction: Direction) -> None:
+        self._barge_in_started_at[direction] = 0.0
         self._tts_playing_until = time.time()
         if self._player is not None:
             with contextlib.suppress(Exception):
                 self._player.clear_queue()
-        self.log_message.emit("检测到抢话，提前结束 TTS 静音")
-        logger.info("Barge-in detected; ending TTS mute early")
-        self._flush_mic_buffer()
+        label = "麦克风" if direction == Direction.OUTBOUND else "游戏字幕"
+        self.log_message.emit(f"检测到{label}抢话，提前结束 TTS 静音")
+        logger.info(f"Barge-in detected ({direction.value}); ending TTS mute early")
+        self._flush_feedback_buffer(direction)
 
-    def _flush_mic_buffer(self) -> None:
-        """把缓存的麦克风音频批量送回翻译引擎。"""
-        with self._mic_buffer_lock:
-            if not self._mic_buffer:
+    def _flush_feedback_buffer(self, direction: Direction) -> None:
+        """把缓存的音频批量送回翻译引擎。"""
+        with self._feedback_buffer_lock:
+            buf = self._feedback_buffers[direction]
+            if not buf:
                 return
-            chunks = self._mic_buffer
-            self._mic_buffer = []
-            self._mic_buffer_bytes = 0
-        if self._engine is None or Direction.OUTBOUND not in self._engine.active_directions:
+            chunks = buf
+            self._feedback_buffers[direction] = []
+            self._feedback_buffer_bytes[direction] = 0
+        if self._engine is None or direction not in self._engine.active_directions:
             return
         try:
-            self._engine.send_pcm(Direction.OUTBOUND, b"".join(chunks))
+            self._engine.send_pcm(direction, b"".join(chunks))
         except Exception as exc:
-            logger.debug(f"flush mic buffer failed: {exc}")
+            logger.debug(f"flush feedback buffer ({direction.value}) failed: {exc}")
 
-    def _send_mic_pcm(self, pcm: bytes, *, gate_result: object | None = None) -> None:
-        """正常路径：实时发送麦克风音频（窗口已解除）。"""
-        if self._engine is None or Direction.OUTBOUND not in self._engine.active_directions:
+    def _send_pcm_with_preroll(
+        self, direction: Direction, pcm: bytes, *, gate_result: object | None = None
+    ) -> None:
+        """正常路径：实时发送音频（窗口已解除）。"""
+        if self._engine is None or direction not in self._engine.active_directions:
             return
-        if self._vad_outbound is not None and self._vad_outbound_filters:
-            result = gate_result if gate_result is not None else self._vad_outbound.process(pcm)
+        gate = self._vad_outbound if direction == Direction.OUTBOUND else self._vad_inbound
+        # outbound 受 _vad_outbound_filters 开关控制；inbound 始终应用 VAD
+        apply_vad = gate is not None and (
+            direction == Direction.INBOUND or self._vad_outbound_filters
+        )
+        if apply_vad:
+            result = gate_result if gate_result is not None else gate.process(pcm)
             if not getattr(result, "passed", False):
                 return
             preroll = getattr(result, "preroll", b"") if getattr(result, "opened_now", False) else b""
             if preroll:
                 pcm = preroll + pcm
         with contextlib.suppress(Exception):
-            self._engine.send_pcm(Direction.OUTBOUND, pcm)
+            self._engine.send_pcm(direction, pcm)
 
     def is_running(self) -> bool:
         return self._running

@@ -178,9 +178,12 @@ class AutoMt:
         argos: ArgosMt | None = None,
         mymemory: MyMemoryMt | None = None,
         nllb_model: str | None = None,
+        device_preference: str = "auto",
     ) -> None:
         self._prefer = (prefer or "auto").lower()
-        self._nllb = nllb or NllbCt2Mt(model_id=nllb_model or "")
+        self._nllb = nllb or NllbCt2Mt(
+            model_id=nllb_model or "", device_preference=device_preference
+        )
         self._argos = argos or ArgosMt()
         self._mymemory = mymemory or MyMemoryMt()
         self._started = False

@@ -63,6 +63,7 @@ def test_build_economy_backends_prefers_nllb_kokoro(tmp_path) -> None:
     cfg = AppConfigModel(
         log_dir=str(tmp_path / "logs"),
         translation_mode="economy",
+        economy_asr_backend="dashscope",
         economy_dashscope_api_key="sk-test",
     )
     with (
