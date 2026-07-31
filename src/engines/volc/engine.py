@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+from typing import Any
 
-from src.core.volc_engine import VolcASTClient, VolcRuntime, resolve_volc_credentials
+from src.core.volc_engine import Mode, VolcASTClient, VolcRuntime, resolve_volc_credentials
 from src.engines.base import EngineCallbacks, EngineMode
 from src.models.config import AppConfigModel
 from src.models.enums import Direction
@@ -36,9 +37,7 @@ class VolcTranslationEngine:
         if not api_key:
             return False
 
-        logger.info(
-            f"Volc auth mode={auth}, key_len={len(api_key)} channel={direction.value}"
-        )
+        logger.info(f"Volc auth mode={auth}, key_len={len(api_key)} channel={direction.value}")
         if self._runtime is None:
             self._runtime = VolcRuntime()
 
@@ -61,37 +60,42 @@ class VolcTranslationEngine:
             def _defer_rotate(d: Direction = direction) -> bool:
                 return bool(cb.should_defer_rotate(d))
 
-            common_kw = dict(
-                api_key=api_key,
-                access_token=access_token,
-                speech_rate=speech_rate,
-                hotwords=hotwords,
-                glossary=glossary,
-                on_error=cb.on_error,
-                on_status=cb.on_status,
-                on_usage=lambda payload, src_name=name: cb.on_usage(src_name, payload),
-                session_rotate_minutes=rotate_m,
-                should_defer_rotate=_defer_rotate,
-            )
-            mode = "s2s" if play_voice else "s2t"
+            mode: Mode = "s2s" if play_voice else "s2t"
             if direction == Direction.OUTBOUND:
                 source_language, target_language = src, tgt
             else:
                 source_language, target_language = tgt, src
 
+            def _on_usage(payload: dict[str, Any], src_name: str = name) -> None:
+                cb.on_usage(src_name, payload)
+
+            def _on_source(text: str, final: bool, d: Direction = direction) -> None:
+                cb.on_source_text(d, text, final)
+
+            def _on_translated(text: str, final: bool, d: Direction = direction) -> None:
+                cb.on_translated_text(d, text, final)
+
+            def _on_audio(data: bytes, d: Direction = direction) -> None:
+                cb.on_audio(d, data)
+
             client = VolcASTClient(
-                **common_kw,
+                api_key=api_key,
+                access_token=access_token,
                 source_language=source_language,
                 target_language=target_language,
-                mode=mode,  # type: ignore[arg-type]
+                mode=mode,
                 speaker_id=speaker_id if mode == "s2s" else "",
-                on_source_text=lambda text, final, d=direction: cb.on_source_text(
-                    d, text, final
-                ),
-                on_translated_text=lambda text, final, d=direction: cb.on_translated_text(
-                    d, text, final
-                ),
-                on_audio=lambda data, d=direction: cb.on_audio(d, data),
+                speech_rate=speech_rate,
+                hotwords=hotwords,
+                glossary=glossary,
+                on_source_text=_on_source,
+                on_translated_text=_on_translated,
+                on_audio=_on_audio,
+                on_error=cb.on_error,
+                on_status=cb.on_status,
+                on_usage=_on_usage,
+                session_rotate_minutes=rotate_m,
+                should_defer_rotate=_defer_rotate,
             )
 
             if hotwords or glossary:

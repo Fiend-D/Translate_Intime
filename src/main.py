@@ -28,7 +28,13 @@ def main() -> int:
 
     window = MainWindow()
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    except KeyboardInterrupt:
+        # Ctrl+C from a development terminal can arrive while Qt is executing
+        # any Python callback. Exit cleanly instead of blaming that callback.
+        app.quit()
+        return 130
 
 
 if __name__ == "__main__":

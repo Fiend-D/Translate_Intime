@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any
 
 
 @dataclass
@@ -75,7 +76,7 @@ class UsageTracker:
         except Exception:
             pass
 
-    def feed_usage_dict(self, source: str, payload: dict) -> None:
+    def feed_usage_dict(self, source: str, payload: dict[str, Any]) -> None:
         billing = (payload.get("response_meta") or {}).get("Billing") or {}
         items = billing.get("Items") or []
         for item in items:
@@ -102,7 +103,7 @@ class UsageTracker:
         if self._on_update:
             self._on_update(self._state)
 
-    def update_from_usage_response(self, payload: dict) -> None:
+    def update_from_usage_response(self, payload: dict[str, Any]) -> None:
         self.feed_usage_dict("", payload)
 
     def reset_session(self) -> None:

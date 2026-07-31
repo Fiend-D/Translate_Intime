@@ -6,10 +6,11 @@ from collections import deque
 from collections.abc import Callable
 from typing import override
 
-from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, QSize, Qt, QTimer
+from PyQt6.QtCore import QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect, QSize, Qt, QTimer
 from PyQt6.QtGui import (
     QColor,
     QCursor,
+    QEnterEvent,
     QFont,
     QFontMetrics,
     QMouseEvent,
@@ -141,7 +142,9 @@ class SubtitleOverlay(QWidget):
         self._history_label.setWordWrap(True)
         self._original.setWordWrap(True)
         self._translated.setWordWrap(True)
-        self._history_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+        self._history_label.setAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom
+        )
         self._original.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._translated.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -171,7 +174,8 @@ class SubtitleOverlay(QWidget):
         return font
 
     def _content_width(self) -> int:
-        m = self.layout().contentsMargins() if self.layout() else None
+        layout = self.layout()
+        m = layout.contentsMargins() if layout is not None else None
         left = m.left() if m else 20
         right = m.right() if m else 20
         return max(40, self.width() - left - right)
@@ -192,7 +196,8 @@ class SubtitleOverlay(QWidget):
         return h + 6  # gap between archived utterances
 
     def _current_block_height(self, width: int) -> int:
-        spacing = self.layout().spacing() if self.layout() else 4
+        layout = self.layout()
+        spacing = layout.spacing() if layout is not None else 4
         h = 0
         if self._show_original and self._current_orig:
             orig_font = QFont(self._translated.font())
@@ -437,7 +442,11 @@ class SubtitleOverlay(QWidget):
         rect = self.rect().adjusted(1, 1, -1, -1)
 
         # Frosted dark lyric plate
-        alpha = int(self._opacity * 170) if not self._hover or self._locked else int(self._opacity * 200)
+        alpha = (
+            int(self._opacity * 170)
+            if not self._hover or self._locked
+            else int(self._opacity * 200)
+        )
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(20, 20, 24, alpha))
         painter.drawRoundedRect(rect, 16, 16)
@@ -461,13 +470,13 @@ class SubtitleOverlay(QWidget):
             )
 
     @override
-    def enterEvent(self, event) -> None:
+    def enterEvent(self, event: QEnterEvent | None) -> None:
         self._hover = True
         self.update()
         super().enterEvent(event)
 
     @override
-    def leaveEvent(self, event) -> None:
+    def leaveEvent(self, event: QEvent | None) -> None:
         self._hover = False
         self.update()
         super().leaveEvent(event)
@@ -507,7 +516,10 @@ class SubtitleOverlay(QWidget):
         elif self._resizing:
             delta = event.globalPosition().toPoint() - self._resize_start
             new_geom = self._start_geometry.adjusted(0, 0, delta.x(), delta.y())
-            if new_geom.width() >= self.minimumWidth() and new_geom.height() >= self.minimumHeight():
+            if (
+                new_geom.width() >= self.minimumWidth()
+                and new_geom.height() >= self.minimumHeight()
+            ):
                 self.setGeometry(new_geom)
         else:
             pos = event.pos()

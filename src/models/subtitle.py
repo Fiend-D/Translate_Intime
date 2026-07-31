@@ -15,4 +15,3 @@ class SubtitleEntry(BaseModel):
     translated_text: str
     is_final: bool = True
     timestamp: datetime = Field(default_factory=datetime.now)
-

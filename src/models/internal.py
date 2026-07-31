@@ -13,4 +13,3 @@ class AudioChunk:
     sample_rate: int
     channels: int
     data: bytes
-

@@ -75,7 +75,7 @@
 
 1. Tracker 先启动，并在设置中配置好 AI Key。
 2. InTime 开启**麦克风通道**，面板勾选「Dota 助手」。
-3. 默认快捷键 `Ctrl+Alt+C`：进入待命 → 说话等定稿 → 自动把**原文** POST 到 `/ai/ask`；再按一次取消待命。
+3. 默认快捷键 `Ctrl+Alt+K`：进入待命 → 说话等定稿 → 自动把**原文** POST 到 `/ai/ask`；再按一次取消待命。
 4. 回复会出现在 Tracker 悬浮窗；InTime 也会 toast 摘要。
 
 注意：待命期间麦克风同传仍会走你原来的虚拟声卡链路；若不想让队友听到提问，可暂时关掉「播放译文」或改用仅识别的用法。
@@ -117,13 +117,13 @@
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+uv sync --frozen
 ```
 
 开发依赖（可选）：
 
 ```bash
-pip install -r requirements-dev.txt
+uv sync --frozen --group dev
 ```
 
 ### 启动 GUI
@@ -167,7 +167,25 @@ QT_QPA_PLATFORM=offscreen pytest
 
 * 本项目是桌面音频翻译与字幕工具，不注入游戏。
 * 语音服务账号与 Key 需自行准备；云端同传依赖网络与额度。
-* 打包安装包与自动更新：有发布需求时再做（当前以源码运行为主）。
+## Windows 一键打包
+
+双击项目根目录的 `build_exe.bat`，脚本会创建或复用 `.venv`、安装缺失依赖并生成：
+
+```text
+dist/SoundFerry.exe
+dist/SoundFerry.exe.sha256
+```
+
+命令行方式：
+
+```powershell
+python build.py --clean --install-deps
+python build.py --clean --debug  # 保留控制台窗口，便于排查启动错误
+python build.py --dry-run        # 只查看 PyInstaller 命令
+```
+
+ASR/NLLB 大模型不会打进单文件 EXE。打包版首次下载后会持久化到
+`%LOCALAPPDATA%\SoundFerry\resource`。也可以在 EXE 同级创建 `resource` 目录，作为便携模型目录。
 
 ## License
 

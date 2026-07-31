@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.core.dota_coach import DotaCoachBridge, DEFAULT_COACH_URL
+from src.core.dota_coach import DEFAULT_COACH_URL, DotaCoachBridge
 
 
 def test_ask_rejects_empty() -> None:

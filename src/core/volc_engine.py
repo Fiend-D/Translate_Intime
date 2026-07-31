@@ -26,12 +26,12 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from python_protogen.common.events_pb2 import Type
-from python_protogen.products.understanding.ast.ast_service_pb2 import (
+from python_protogen.common.events_pb2 import Type  # type: ignore[attr-defined]  # noqa: E402
+from python_protogen.products.understanding.ast.ast_service_pb2 import (  # type: ignore[attr-defined]  # noqa: E402
     TranslateRequest,
     TranslateResponse,
 )
-from src.utils.logger import logger
+from src.utils.logger import logger  # noqa: E402
 
 WS_URL = "wss://openspeech.bytedance.com/api/v4/ast/v2/translate"
 DEFAULT_RESOURCE_ID = "volc.service_type.10053"
@@ -44,7 +44,7 @@ _SILENCE_FRAME = b"\x00" * _FRAME_BYTES
 _AUDIO_QUEUE_MAX = 50  # ~1s of 80ms-ish chunks; drop-oldest when full
 
 
-def drop_oldest_put(queue: asyncio.Queue, item: bytes | None) -> None:
+def drop_oldest_put(queue: asyncio.Queue[bytes | None], item: bytes | None) -> None:
     """Non-blocking put that drops the oldest item when the queue is full."""
     try:
         queue.put_nowait(item)
@@ -53,6 +53,7 @@ def drop_oldest_put(queue: asyncio.Queue, item: bytes | None) -> None:
             queue.get_nowait()
         with contextlib.suppress(asyncio.QueueFull):
             queue.put_nowait(item)
+
 
 # s2s：空字符串 = 复刻原音色；公版音色仅目标语为 zh/en 时可用
 VOLC_VOICE_OPTIONS: list[tuple[str, str]] = [
@@ -78,9 +79,7 @@ def resolve_volc_credentials(
         or os.environ.get("VOLC_APPID", "")
     ).strip()
     token = (
-        access_token
-        or os.environ.get("VOLC_ACCESS_TOKEN", "")
-        or os.environ.get("VOLC_TOKEN", "")
+        access_token or os.environ.get("VOLC_ACCESS_TOKEN", "") or os.environ.get("VOLC_TOKEN", "")
     ).strip()
 
     if not key:
@@ -117,7 +116,7 @@ class VolcASTClient:
         on_audio: Callable[[bytes], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         on_status: Callable[[str], None] | None = None,
-        on_usage: Callable[[dict], None] | None = None,
+        on_usage: Callable[[dict[str, Any]], None] | None = None,
         session_rotate_minutes: int = 12,
         should_defer_rotate: Callable[[], bool] | None = None,
     ) -> None:
@@ -152,9 +151,9 @@ class VolcASTClient:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._http: aiohttp.ClientSession | None = None
         self._audio_queue: asyncio.Queue[bytes | None] | None = None
-        self._sender_task: asyncio.Task | None = None
-        self._receiver_task: asyncio.Task | None = None
-        self._rotate_task: asyncio.Task | None = None
+        self._sender_task: asyncio.Task[None] | None = None
+        self._receiver_task: asyncio.Task[None] | None = None
+        self._rotate_task: asyncio.Task[None] | None = None
         self._session_started = asyncio.Event()
         self._running = False
         self._reconnect_attempts = 0
@@ -194,9 +193,7 @@ class VolcASTClient:
                 )
                 log_id = self._extract_log_id()
                 used = [h for h in headers if h.startswith("X-Api-")]
-                self._emit_status(
-                    f"火山已连接 ({'/'.join(used)}; logid={log_id})"
-                )
+                self._emit_status(f"火山已连接 ({'/'.join(used)}; logid={log_id})")
                 break
             except Exception as exc:
                 last_error = exc
@@ -234,7 +231,9 @@ class VolcASTClient:
             self._rotate_task is None or self._rotate_task.done()
         ):
             self._rotate_task = asyncio.create_task(self._rotate_loop())
-        self._emit_status(f"火山会话已启动 mode={self.mode} {self.source_language}->{self.target_language}")
+        self._emit_status(
+            f"火山会话已启动 mode={self.mode} {self.source_language}->{self.target_language}"
+        )
         return True
 
     async def _abort_connect_attempt(self, *, keep_alive: bool) -> None:
@@ -394,9 +393,7 @@ class VolcASTClient:
                         await self._send_frame(bytes(pending) + (b"\x00" * pad))
                         pending.clear()
                     with contextlib.suppress(Exception):
-                        await self._ws.send_bytes(
-                            self._build_finish_request().SerializeToString()
-                        )
+                        await self._ws.send_bytes(self._build_finish_request().SerializeToString())
                     break
 
                 # Wait briefly for more audio; keepalive only when fully idle
@@ -435,7 +432,11 @@ class VolcASTClient:
                     self._handle_response(msg.data)
                 elif msg.type == aiohttp.WSMsgType.TEXT:
                     self._emit_status(f"火山文本帧: {msg.data[:200]}")
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
                     break
         except asyncio.CancelledError:
             raise

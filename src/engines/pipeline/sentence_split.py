@@ -66,9 +66,7 @@ def _period_is_boundary(text: str, index: int) -> bool:
         return False
 
     next_non_space = text[index + 1 :].lstrip()[:1]
-    return not (
-        next_non_space and _INITIAL_RE.search(prefix) and next_non_space.isupper()
-    )
+    return not (next_non_space and _INITIAL_RE.search(prefix) and next_non_space.isupper())
 
 
 def _raw_sentences(text: str) -> list[str]:
@@ -89,9 +87,7 @@ def _raw_sentences(text: str) -> list[str]:
             continue
 
         end = index + 1
-        while end < len(text) and (
-            text[end] in _TERMINAL_PUNCT or text[end] in _CLOSING_PUNCT
-        ):
+        while end < len(text) and (text[end] in _TERMINAL_PUNCT or text[end] in _CLOSING_PUNCT):
             end += 1
         part = text[start:end].strip()
         if part:
@@ -128,9 +124,8 @@ def split_sentences(text: str, *, min_chars: int = 4) -> list[str]:
             continue
         previous_is_complete = merged[-1][-1:] in _TERMINAL_PUNCT
         part_is_complete = part[-1:] in _TERMINAL_PUNCT
-        if (
-            (_effective_len(part) < min_n and not part_is_complete)
-            or (_effective_len(merged[-1]) < min_n and not previous_is_complete)
+        if (_effective_len(part) < min_n and not part_is_complete) or (
+            _effective_len(merged[-1]) < min_n and not previous_is_complete
         ):
             merged[-1] = f"{merged[-1]}{part}".strip()
         else:

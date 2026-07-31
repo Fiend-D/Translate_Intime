@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from src.models.enums import Direction
 
@@ -19,7 +20,7 @@ class EngineCallbacks:
     on_audio: Callable[[Direction, bytes], None]
     on_error: Callable[[str], None]
     on_status: Callable[[str], None]
-    on_usage: Callable[[str, dict], None]
+    on_usage: Callable[[str, dict[str, Any]], None]
     on_engine_status: Callable[[Direction, str, str], None]
     should_defer_rotate: Callable[[Direction], bool]
 

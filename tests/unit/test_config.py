@@ -4,8 +4,30 @@ import json
 
 import pytest
 
+from src.core.exceptions import ConfigValidationError
 from src.models.config import AppConfigModel
 from src.utils import config_manager
+
+
+class _MemoryKeyring:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.values.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.values[(service, username)] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        self.values.pop((service, username), None)
+
+
+@pytest.fixture(autouse=True)
+def memory_keyring(monkeypatch) -> _MemoryKeyring:
+    backend = _MemoryKeyring()
+    monkeypatch.setattr(config_manager, "keyring", backend)
+    return backend
 
 
 def test_default_config_is_valid() -> None:
@@ -210,3 +232,90 @@ def test_merge_config_updates_revalidates_values() -> None:
 
     with pytest.raises(ValueError, match="must be different"):
         config_manager.merge_config_updates(config, source_language="en")
+
+
+def test_save_stores_secrets_only_in_keyring(tmp_path, monkeypatch, memory_keyring) -> None:
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    config = AppConfigModel(
+        volc_api_key="volc-key",
+        volc_access_token="volc-token",
+        volc_iam_ak="iam-ak",
+        volc_iam_sk="iam-sk",
+        economy_dashscope_api_key="dashscope-key",
+    )
+
+    config_manager.save_config(config)
+
+    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+    for field, username in config_manager._SECRET_FIELDS.items():
+        assert field not in saved
+        assert memory_keyring.get_password(config_manager._SERVICE_NAME, username) == getattr(
+            config, field
+        )
+
+
+def test_load_migrates_plaintext_secrets_and_scrubs_json(
+    tmp_path, monkeypatch, memory_keyring
+) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "source_language": "zh",
+                "target_language": "en",
+                "volc_api_key": "legacy-volc",
+                "economy_dashscope_api_key": "legacy-dashscope",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda config: config)
+
+    loaded = config_manager.load_config()
+
+    assert loaded.volc_api_key == "legacy-volc"
+    assert loaded.economy_dashscope_api_key == "legacy-dashscope"
+    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert "volc_api_key" not in saved
+    assert "economy_dashscope_api_key" not in saved
+    assert (
+        memory_keyring.get_password(config_manager._SERVICE_NAME, "volc_api_key") == "legacy-volc"
+    )
+
+
+def test_save_fails_without_secure_storage(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(config_manager, "_set_keyring_password", lambda *_args: False)
+
+    with pytest.raises(ConfigValidationError, match="系统凭据管理器"):
+        config_manager.save_config(AppConfigModel(volc_api_key="must-not-leak"))
+
+    assert not cfg_file.exists()
+
+
+def test_blank_secret_preserves_existing_keyring_value(
+    tmp_path, monkeypatch, memory_keyring
+) -> None:
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    memory_keyring.set_password(config_manager._SERVICE_NAME, "volc_api_key", "keep-me")
+
+    config_manager.save_config(AppConfigModel(volc_api_key=""))
+
+    assert memory_keyring.get_password(config_manager._SERVICE_NAME, "volc_api_key") == "keep-me"
+
+
+def test_explicit_secret_clear_deletes_keyring_value(tmp_path, monkeypatch, memory_keyring) -> None:
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    memory_keyring.set_password(config_manager._SERVICE_NAME, "volc_api_key", "delete-me")
+
+    config_manager.save_config(
+        AppConfigModel(volc_api_key=""),
+        clear_secret_fields={"volc_api_key"},
+    )
+
+    assert memory_keyring.get_password(config_manager._SERVICE_NAME, "volc_api_key") is None

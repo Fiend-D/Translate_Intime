@@ -63,6 +63,7 @@ class TranscriptDialog(QDialog):
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setWordWrap(True)
         header = self._table.horizontalHeader()
+        assert header is not None
         header.setStretchLastSection(True)
         header.resizeSection(0, 150)
         header.resizeSection(1, 70)
@@ -115,9 +116,7 @@ class TranscriptDialog(QDialog):
         else:
             self._filtered_rows = list(self._rows)
         self._render_rows(self._filtered_rows)
-        self._summary.setText(
-            f"显示 {len(self._filtered_rows)} 条 / 共 {len(self._rows)} 条"
-        )
+        self._summary.setText(f"显示 {len(self._filtered_rows)} 条 / 共 {len(self._rows)} 条")
 
     def _render_rows(self, rows: list[TranscriptLine]) -> None:
         self._table.setRowCount(len(rows))
@@ -158,4 +157,3 @@ class TranscriptDialog(QDialog):
             QMessageBox.warning(self, "导出失败", str(exc))
             return
         QMessageBox.information(self, "导出完成", f"已导出 {len(self._filtered_rows)} 条记录。")
-

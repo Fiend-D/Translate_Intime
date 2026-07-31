@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 from src.engines.pipeline.utterance import UtteranceBuffer
@@ -105,3 +106,39 @@ def test_soft_split_requires_quiet_window():
     buf.push(_quiet_pcm_ms(220))
     chunk = buf.poll()
     assert chunk is not None
+
+
+def test_concurrent_push_and_poll_preserve_all_pcm_bytes():
+    buf = UtteranceBuffer(
+        end_silence_ms=5000,
+        min_ms=1,
+        max_ms=2,
+        soft_split_ms=5000,
+    )
+    frame = b"\x01\x00" * 16
+    frame_count = 2000
+    producer_done = threading.Event()
+    flushed: list[bytes] = []
+
+    def producer() -> None:
+        for _ in range(frame_count):
+            buf.push(frame)
+        producer_done.set()
+
+    def consumer() -> None:
+        while not producer_done.is_set():
+            chunk = buf.poll()
+            if chunk:
+                flushed.append(chunk)
+
+    producer_thread = threading.Thread(target=producer)
+    consumer_thread = threading.Thread(target=consumer)
+    producer_thread.start()
+    consumer_thread.start()
+    producer_thread.join()
+    consumer_thread.join()
+    tail = buf.flush()
+    if tail:
+        flushed.append(tail)
+
+    assert sum(len(chunk) for chunk in flushed) == len(frame) * frame_count

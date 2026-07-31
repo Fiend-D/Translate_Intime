@@ -1,7 +1,8 @@
-"""WASAPI process-exclude loopback capture for Windows.
+"""Legacy soundcard-based WASAPI loopback compatibility capture.
 
-Captures system audio via soundcard's WASAPI loopback.
-Falls back gracefully when pycaw/comtypes are unavailable.
+``soundcard`` captures the complete endpoint mix and cannot exclude one process.
+The old process-exclude identifier remains for configuration migration only and
+is no longer advertised as an available backend.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import platform
 import threading
 import time
 from collections import deque
+from typing import Any
 
 import numpy as np
 
@@ -23,20 +25,15 @@ PROC_EXCLUDE_DEVICE_ID = WASAPI_PROC_EXCLUDE_PREFIX
 
 
 def is_process_exclude_available() -> bool:
-    """检查当前平台是否支持 process-exclude 捕获。"""
-    if not IS_WINDOWS:
-        return False
-    try:
-        import soundcard  # noqa: F401
-        return True
-    except Exception:
-        return False
+    """Return False until a real per-process WASAPI backend is implemented."""
+    return False
 
 
 class ProcessExcludeLoopback:
-    """基于 soundcard WASAPI loopback 的系统音频捕获。
+    """Legacy class that captures the full default endpoint mix.
 
-    捕获默认输出设备（扬声器）的回环音频，用于游戏/视频声音识别。
+    It does not exclude this process. New selection paths use the explicitly
+    named classic loopback backend instead.
     """
 
     def __init__(
@@ -62,7 +59,7 @@ class ProcessExcludeLoopback:
         self._thread.start()
         logger.info("ProcessExcludeLoopback 已启动")
 
-    def _find_loopback_mic(self):
+    def _find_loopback_mic(self) -> Any | None:
         """查找默认扬声器的 loopback 捕获设备。"""
         import soundcard as sc
 
@@ -90,7 +87,6 @@ class ProcessExcludeLoopback:
         """捕获循环：使用 soundcard 捕获 loopback 音频。"""
         try:
             import warnings
-            import soundcard as sc
 
             loopback_mic = self._find_loopback_mic()
             if loopback_mic is None:
@@ -117,10 +113,7 @@ class ProcessExcludeLoopback:
                             continue
 
                         # 多声道转单声道
-                        if data.ndim > 1:
-                            mono = data.mean(axis=1)
-                        else:
-                            mono = data
+                        mono = data.mean(axis=1) if data.ndim > 1 else data
 
                         # 重采样到目标采样率
                         if source_rate != self._sample_rate:
@@ -137,21 +130,18 @@ class ProcessExcludeLoopback:
 
                     except Exception as exc:
                         if self._running:
-                            logger.warning(f"process-exclude 捕获异常: {exc}")
+                            logger.warning(f"WASAPI loopback 捕获异常: {exc}")
                         time.sleep(0.02)
 
         except Exception as exc:
-            logger.error(f"process-exclude 捕获循环失败: {exc}")
+            logger.error(f"WASAPI loopback 捕获循环失败: {exc}")
             self._running = False
 
     def _resample(self, data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-        """简单线性重采样。"""
-        if src_rate == dst_rate:
-            return data
-        ratio = dst_rate / src_rate
-        n_out = int(len(data) * ratio)
-        indices = np.linspace(0, len(data) - 1, n_out)
-        return np.interp(indices, np.arange(len(data)), data)
+        """Resample with anti-alias filtering."""
+        from src.utils.audio_utils import resample
+
+        return resample(data.astype(np.float32), src_rate, dst_rate)
 
     def read_float32(self, chunk_size: int) -> np.ndarray | None:
         """读取一个音频块。缓冲区为空时返回 None（不返回零数组）。"""
@@ -159,7 +149,13 @@ class ProcessExcludeLoopback:
             return None
 
         with self._buffer_lock:
-            collected = []
+            # Do not consume a partial block and pad it with silence. The capture
+            # thread produces 20 ms chunks while the pipeline normally requests
+            # 40 ms; waiting for both preserves continuous audio and real timing.
+            if sum(len(chunk) for chunk in self._buffer) < chunk_size:
+                return None
+
+            collected: list[np.ndarray] = []
             remaining = chunk_size
             while remaining > 0 and self._buffer:
                 chunk = self._buffer.popleft()
@@ -171,12 +167,7 @@ class ProcessExcludeLoopback:
                     self._buffer.appendleft(chunk[remaining:])
                     remaining = 0
 
-        if not collected:
-            return None
-
         result = np.concatenate(collected)
-        if len(result) < chunk_size:
-            result = np.pad(result, (0, chunk_size - len(result)))
         return result[:chunk_size]
 
     def stop(self) -> None:

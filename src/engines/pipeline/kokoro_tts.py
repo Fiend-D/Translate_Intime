@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -17,6 +17,7 @@ from src.engines.pipeline.sentence_split import (
     split_sentences,
 )
 from src.utils.audio_utils import float32_to_pcm16, resample
+from src.utils.file_integrity import matches_sha256
 from src.utils.logger import logger
 
 _TARGET_SR = 16000
@@ -25,6 +26,12 @@ _LOG_INTERVAL_SEC = 30.0
 _INTER_SENTENCE_SILENCE_MS = 120
 _DOWNLOAD_CHUNK_BYTES = 1024 * 256
 _DOWNLOAD_TIMEOUT_SECONDS = 120
+_FILE_SHA256 = {
+    "kokoro-v1.0.onnx": "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5",
+    "kokoro-v1.1-zh.onnx": "eefec708cbc7aba8e8129b5c2f7cb92e1fe7d281af1e1dd451592d9ff0714a0d",
+    "voices-v1.0.bin": "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d",
+    "voices-v1.1-zh.bin": "14cb6186c99e4f6016871405f62046c5df863ae27465cbdc4ee08be7dd703acd",
+}
 
 _GH_MIRRORS = (
     "https://ghfast.top/https://github.com",
@@ -51,8 +58,7 @@ _EN_MODEL_URLS = _mirror(
     "model-files-v1.0/kokoro-v1.0.onnx"
 )
 _EN_VOICES_URLS = _mirror(
-    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
-    "model-files-v1.0/voices-v1.0.bin"
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 )
 # Chinese v1.1-zh
 _ZH_MODEL_URLS = _mirror(
@@ -163,9 +169,7 @@ class KokoroOnnxTts:
         if lang == "zh" and not self._zh_ready:
             if not self._zh_missing_logged:
                 self._zh_missing_logged = True
-                logger.warning(
-                    "Kokoro 中文模型不可用，跳过 EN 音色朗读中文（将回退 edge-tts）"
-                )
+                logger.warning("Kokoro 中文模型不可用，跳过 EN 音色朗读中文（将回退 edge-tts）")
             return None
         try:
             sentences = split_sentences(text, min_chars=1)
@@ -200,9 +204,7 @@ class KokoroOnnxTts:
                 return None
             elif self._kokoro_en is not None:
                 voice = self._pick_voice(lang)
-                samples, sr = self._kokoro_en.create(
-                    text, voice=voice, speed=self._speed
-                )
+                samples, sr = self._kokoro_en.create(text, voice=voice, speed=self._speed)
             else:
                 return None
         return self._to_pcm16(samples, int(sr))
@@ -213,15 +215,20 @@ class KokoroOnnxTts:
         # Prefer misaki G2P when available (recommended for v1.1-zh).
         if self._zh_g2p is not None:
             phonemes, _ = self._zh_g2p(text)
-            return self._kokoro_zh.create(
-                phonemes, voice=voice, speed=self._speed, is_phonemes=True
+            return cast(
+                tuple[Any, int],
+                self._kokoro_zh.create(phonemes, voice=voice, speed=self._speed, is_phonemes=True),
             )
         try:
-            return self._kokoro_zh.create(
-                text, voice=voice, speed=self._speed, lang="cmn"
+            return cast(
+                tuple[Any, int],
+                self._kokoro_zh.create(text, voice=voice, speed=self._speed, lang="cmn"),
             )
         except TypeError:
-            return self._kokoro_zh.create(text, voice=voice, speed=self._speed)
+            return cast(
+                tuple[Any, int],
+                self._kokoro_zh.create(text, voice=voice, speed=self._speed),
+            )
 
     def _pick_voice(self, lang: str) -> str:
         if lang == "zh":
@@ -269,9 +276,7 @@ class KokoroOnnxTts:
             self._loading = False
         if ok:
             zh = "含中文" if self._zh_ready else "仅英文（中文将回退 edge-tts）"
-            logger.info(
-                f"Kokoro TTS 已就绪（{zh}）speed={self._speed:.2f}: {self._cache_dir}"
-            )
+            logger.info(f"Kokoro TTS 已就绪（{zh}）speed={self._speed:.2f}: {self._cache_dir}")
         else:
             logger.warning("Kokoro 不可用，将尝试 edge-tts 回退（若已安装）")
 
@@ -279,9 +284,7 @@ class KokoroOnnxTts:
         try:
             from kokoro_onnx import Kokoro
         except ImportError:
-            logger.warning(
-                "未安装 kokoro-onnx，请执行: pip install kokoro-onnx"
-            )
+            logger.warning("未安装 kokoro-onnx，请执行: pip install kokoro-onnx")
             return False
 
         # kokoro-onnx 内部用 onnxruntime.InferenceSession 但不暴露 provider 参数,
@@ -293,9 +296,9 @@ class KokoroOnnxTts:
 
             _orig_init = ort.InferenceSession.__init__
 
-            def _patched_init(self_s, *args, **kwargs):
+            def _patched_init(self_s: Any, *args: Any, **kwargs: Any) -> None:
                 kwargs.setdefault("providers", providers)
-                return _orig_init(self_s, *args, **kwargs)
+                _orig_init(self_s, *args, **kwargs)
 
             ort.InferenceSession.__init__ = _patched_init
             ort_patched = True
@@ -337,8 +340,7 @@ class KokoroOnnxTts:
                     except Exception:
                         zh_g2p = None
                         logger.warning(
-                            "未安装 misaki[zh]，中文韵律可能偏硬；"
-                            "建议: pip install 'misaki[zh]'"
+                            "未安装 misaki[zh]，中文韵律可能偏硬；建议: pip install 'misaki[zh]'"
                         )
                 except Exception as exc:
                     logger.warning(f"Kokoro 中文模型加载失败，中文将回退 edge-tts: {exc}")
@@ -389,11 +391,11 @@ class KokoroOnnxTts:
             pass
         return set()
 
-    def _ensure_file(
-        self, path: Path, urls: str | list[str], *, required: bool = True
-    ) -> bool:
-        if path.exists() and path.stat().st_size > 0:
+    def _ensure_file(self, path: Path, urls: str | list[str], *, required: bool = True) -> bool:
+        expected_sha256 = _FILE_SHA256.get(path.name)
+        if expected_sha256 and matches_sha256(path, expected_sha256):
             return True
+        path.unlink(missing_ok=True)
         if not self._auto_download:
             if required:
                 logger.warning(f"Kokoro 文件缺失且禁用下载: {path}")
@@ -409,7 +411,7 @@ class KokoroOnnxTts:
                 try:
                     logger.info(f"正在下载 Kokoro: {url}")
                     tmp = path.with_suffix(path.suffix + ".part")
-                    self._download_url(url, tmp)
+                    self._download_url(url, tmp, expected_sha256=expected_sha256)
                     tmp.replace(path)
                     logger.info(f"Kokoro 已保存: {path}")
                     return True
@@ -430,7 +432,7 @@ class KokoroOnnxTts:
         return False
 
     @staticmethod
-    def _download_url(url: str, target: Path) -> None:
+    def _download_url(url: str, target: Path, *, expected_sha256: str | None = None) -> None:
         """Download atomically with a timeout and Content-Length validation."""
         target.unlink(missing_ok=True)
         request = Request(url, headers={"User-Agent": "translator-intime/1.0"})
@@ -445,6 +447,9 @@ class KokoroOnnxTts:
         if expected is not None and written != expected:
             target.unlink(missing_ok=True)
             raise URLError(f"下载长度不匹配: got={written} expected={expected}")
+        if expected_sha256 and not matches_sha256(target, expected_sha256):
+            target.unlink(missing_ok=True)
+            raise URLError(f"SHA-256 mismatch for {target.name}")
         if written <= 0:
             target.unlink(missing_ok=True)
             raise URLError("下载文件为空")

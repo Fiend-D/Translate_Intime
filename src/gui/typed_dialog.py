@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import threading
-from pathlib import Path
+from typing import override
 
-from PyQt6.QtCore import QObject, QUrl, pyqtSignal
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QUrl, pyqtSignal
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -31,7 +31,7 @@ _LANGS = [
 
 
 class _WorkerBridge(QObject):
-    succeeded = pyqtSignal(str, object)  # translated, Path|None
+    succeeded = pyqtSignal(str, object)  # translated, bytes|None
     failed = pyqtSignal(str)
 
 
@@ -48,13 +48,15 @@ class TypedTranslateDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("打字翻译")
         self.setMinimumSize(480, 360)
-        self._mp3_path: Path | None = None
+        self._audio_bytes: QByteArray | None = None
+        self._audio_buffer: QBuffer | None = None
         self._bridge = _WorkerBridge(self)
         self._bridge.succeeded.connect(self._on_ok)
         self._bridge.failed.connect(self._on_fail)
         self._player = QMediaPlayer(self)
         self._audio = QAudioOutput(self)
         self._player.setAudioOutput(self._audio)
+        self._player.mediaStatusChanged.connect(self._on_media_status)
 
         root = QVBoxLayout(self)
         tip = QLabel(
@@ -126,26 +128,51 @@ class TypedTranslateDialog(QDialog):
 
         def worker() -> None:
             try:
-                translated, path = run_async(
+                translated, audio = run_async(
                     translate_and_synthesize(text, source=src, target=tgt)
                 )
-                bridge.succeeded.emit(translated, path)
+                bridge.succeeded.emit(translated, audio)
             except Exception as exc:
                 bridge.failed.emit(str(exc))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_ok(self, translated: str, path: object) -> None:
-        self._mp3_path = path if isinstance(path, Path) else None
+    def _on_ok(self, translated: str, audio: object) -> None:
+        self._release_audio()
         self._output.setPlainText(translated)
         self._status.setText("完成")
         self._btn_run.setEnabled(True)
         original = self._input.toPlainText().strip()
         self.translated.emit(original, translated or "")
-        if self._mp3_path is not None:
-            self._player.setSource(QUrl.fromLocalFile(str(self._mp3_path)))
+        if isinstance(audio, bytes) and audio:
+            self._audio_bytes = QByteArray(audio)
+            self._audio_buffer = QBuffer(self)
+            self._audio_buffer.setData(self._audio_bytes)
+            self._audio_buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+            self._player.setSourceDevice(self._audio_buffer, QUrl("memory://typed-tts.mp3"))
             self._audio.setVolume(1.0)
             self._player.play()
+
+    def _on_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
+        if status in {
+            QMediaPlayer.MediaStatus.EndOfMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+        }:
+            self._release_audio()
+
+    def _release_audio(self) -> None:
+        self._player.stop()
+        self._player.setSource(QUrl())
+        if self._audio_buffer is not None:
+            self._audio_buffer.close()
+            self._audio_buffer.deleteLater()
+        self._audio_buffer = None
+        self._audio_bytes = None
+
+    @override
+    def done(self, result: int) -> None:
+        self._release_audio()
+        super().done(result)
 
     def _on_fail(self, message: str) -> None:
         self._status.setText("失败")

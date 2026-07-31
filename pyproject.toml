@@ -6,7 +6,57 @@ build-backend = "setuptools.build_meta"
 name = "translator-intime"
 version = "0.1.0"
 description = "Realtime simultaneous translation desktop app"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "PyQt6>=6.6,<7.0",
+    "PyAudio>=0.2.14",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12.1",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "onnxruntime>=1.17",
+    "pydantic>=2.5",
+    "loguru>=0.7",
+    "httpx>=0.26",
+    "aiohttp>=3.9",
+    "protobuf>=5.0,<7",
+    "keyring>=24.3",
+    "pynput>=1.7",
+    "PyYAML>=6.0",
+    "soundcard>=0.4.3",
+    "python-dotenv>=1.0",
+    "websockets>=12.0",
+    "edge-tts>=6.1",
+    "comtypes>=1.4.0; platform_system == 'Windows'",
+    "pycaw>=20240210; platform_system == 'Windows'",
+    "dashscope>=1.20",
+    "sherpa-onnx>=1.10",
+    "faster-whisper>=1.0",
+    "uiautomation>=2.0; platform_system == 'Windows'",
+    "ctranslate2>=4.0",
+    "transformers>=4.40",
+    "huggingface_hub>=0.23",
+    "sentencepiece>=0.2",
+    "PySocks>=1.7",
+    "socksio>=1.0",
+    "kokoro-onnx>=0.4",
+    "psutil>=5.9",
+    "pynvml>=11.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4",
+    "pytest-qt>=4.2",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.3",
+    "mypy>=1.8",
+    "pre-commit>=3.6",
+    "pyinstaller>=6.0,<7.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*", "python_protogen*"]
 
 [tool.pytest.ini_options]
 minversion = "7.4"

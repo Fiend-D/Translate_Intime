@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +14,20 @@ from pydantic import ValidationError
 
 from src.core.exceptions import ConfigValidationError
 from src.models.config import AppConfigModel
+from src.utils.resource_paths import bundled_path
 
 _SERVICE_NAME = "translator_intime"
+_SECRET_FIELDS = {
+    "volc_api_key": "volc_api_key",
+    "volc_access_token": "volc_access_token",
+    "volc_iam_ak": "volc_iam_ak",
+    "volc_iam_sk": "volc_iam_sk",
+    "economy_dashscope_api_key": "economy_dashscope_api_key",
+}
+_LEGACY_DOTA_COACH_HOTKEY = "<ctrl>+<alt>+c"
+_DOTA_COACH_HOTKEY = "<ctrl>+<alt>+k"
 
+_keyring: Any
 try:
     import keyring as _keyring
 except ImportError:  # pragma: no cover - optional dependency
@@ -27,7 +41,7 @@ class _NullKeyring:
 
     @staticmethod
     def set_password(service: str, username: str, password: str) -> None:
-        return None
+        raise RuntimeError("No system keyring backend is available")
 
     @staticmethod
     def delete_password(service: str, username: str) -> None:
@@ -45,11 +59,43 @@ if _keyring is None:
 
 
 def _get_keyring_password(username: str) -> str | None:
-    """Read a legacy secret without making configuration loading depend on keyring."""
+    """Read a secret without making configuration loading depend on keyring."""
     try:
-        return keyring.get_password(_SERVICE_NAME, username)
+        value = keyring.get_password(_SERVICE_NAME, username)
+        return str(value) if value is not None else None
     except Exception:
         return None
+
+
+def _set_keyring_password(username: str, password: str) -> bool:
+    try:
+        keyring.set_password(_SERVICE_NAME, username, password)
+        return bool(keyring.get_password(_SERVICE_NAME, username) == password)
+    except Exception:
+        return False
+
+
+def _delete_keyring_password(username: str) -> None:
+    with contextlib.suppress(Exception):
+        keyring.delete_password(_SERVICE_NAME, username)
+
+
+def _without_secrets(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in data.items() if key not in _SECRET_FIELDS}
+
+
+def _write_config_data(config_file: Path, data: dict[str, Any]) -> None:
+    """Atomically replace the public JSON settings file."""
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = config_file.with_suffix(config_file.suffix + ".tmp")
+    try:
+        with temp_file.open("w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp_file.replace(config_file)
+    finally:
+        temp_file.unlink(missing_ok=True)
 
 
 def _config_path() -> Path:
@@ -74,6 +120,7 @@ def load_config() -> AppConfigModel:
     # Drop legacy local-engine block if present
     data.pop("engine", None)
     data.pop("model_cache_dir", None)
+    _migrate_hotkey_defaults(data)
 
     # Migrate missing ASR backend → platform default.
     # Windows: live_captions; Linux/macOS: local (Live Captions is Win-only).
@@ -106,17 +153,44 @@ def load_config() -> AppConfigModel:
     if not data.get("economy_kokoro_voice_en"):
         data["economy_kokoro_voice_en"] = "af_bella"
 
-    # Best-effort: migrate old keyring volcengine secret into volc_api_key once
-    if not data.get("volc_api_key"):
-        legacy = _get_keyring_password("volcengine")
-        if legacy:
-            data["volc_api_key"] = legacy
+    plaintext_secrets = {field: str(data.pop(field, "") or "").strip() for field in _SECRET_FIELDS}
+    migration_succeeded = True
+    found_plaintext = False
+    for field, username in _SECRET_FIELDS.items():
+        secret = _get_keyring_password(username)
+        if not secret and field == "volc_api_key":
+            secret = _get_keyring_password("volcengine")
+        plaintext = plaintext_secrets[field]
+        if not secret and plaintext:
+            found_plaintext = True
+            if _set_keyring_password(username, plaintext):
+                secret = plaintext
+            else:
+                migration_succeeded = False
+                secret = plaintext
+        if secret:
+            data[field] = secret
+
+    # Remove legacy plaintext only after every discovered secret reached the
+    # system credential store. A backend outage must not destroy credentials.
+    if found_plaintext and migration_succeeded:
+        _write_config_data(config_file, _without_secrets(data))
 
     try:
         config = AppConfigModel(**data)
     except ValidationError as exc:
         raise ConfigValidationError(f"Config validation failed: {exc}") from exc
     return _fill_volc_from_yaml(config)
+
+
+def _migrate_hotkey_defaults(data: dict[str, Any]) -> None:
+    """Replace the old console-interrupt shortcut without touching custom bindings."""
+    hotkeys = data.get("hotkeys")
+    if not isinstance(hotkeys, dict):
+        return
+    current = str(hotkeys.get("dota_coach_ask", "")).strip().lower().replace(" ", "")
+    if current == _LEGACY_DOTA_COACH_HOTKEY:
+        hotkeys["dota_coach_ask"] = _DOTA_COACH_HOTKEY
 
 
 def _fill_volc_from_yaml(config: AppConfigModel) -> AppConfigModel:
@@ -135,6 +209,8 @@ def _fill_volc_from_yaml(config: AppConfigModel) -> AppConfigModel:
 def _seed_from_yaml_defaults() -> AppConfigModel | None:
     """Best-effort import from legacy config/default_config.yaml on first run."""
     yaml_path = Path("config/default_config.yaml")
+    if not yaml_path.is_file():
+        yaml_path = bundled_path("config", "default_config.yaml")
     if not yaml_path.exists():
         return None
     try:
@@ -177,17 +253,27 @@ def _seed_from_yaml_defaults() -> AppConfigModel | None:
         return None
 
 
-def save_config(config: AppConfigModel) -> None:
-    """Persist configuration to disk."""
+def save_config(
+    config: AppConfigModel,
+    *,
+    clear_secret_fields: Collection[str] = (),
+) -> None:
+    """Persist settings, preserving unavailable secrets unless explicitly cleared."""
     data = config.model_dump(mode="json")
     config_file = _config_path()
-    try:
-        config_file.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        if not config_file.parent.exists():
-            raise
-    with config_file.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    invalid_clear_fields = set(clear_secret_fields) - set(_SECRET_FIELDS)
+    if invalid_clear_fields:
+        raise ConfigValidationError(
+            f"Unknown secret fields: {', '.join(sorted(invalid_clear_fields))}"
+        )
+    for field, username in _SECRET_FIELDS.items():
+        secret = str(data.get(field, "") or "").strip()
+        if secret:
+            if not _set_keyring_password(username, secret):
+                raise ConfigValidationError(f"无法将 {field} 保存到系统凭据管理器；配置未写入。")
+        elif field in clear_secret_fields:
+            _delete_keyring_password(username)
+    _write_config_data(config_file, _without_secrets(data))
 
 
 def merge_config_updates(config: AppConfigModel, **updates: Any) -> AppConfigModel:

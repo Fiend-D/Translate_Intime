@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class Direction(str, Enum):
+class Direction(StrEnum):
     OUTBOUND = "outbound"
     INBOUND = "inbound"
 
 
-class LanguageCode(str, Enum):
+class LanguageCode(StrEnum):
     ZH = "zh"
     EN = "en"
     JA = "ja"
@@ -21,10 +21,9 @@ class LanguageCode(str, Enum):
     RU = "ru"
 
 
-class SessionStatus(str, Enum):
+class SessionStatus(StrEnum):
     IDLE = "idle"
     STARTING = "starting"
     RUNNING = "running"
     STOPPED = "stopped"
     ERROR = "error"
-

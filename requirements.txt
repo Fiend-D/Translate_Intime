@@ -28,7 +28,7 @@ sherpa-onnx>=1.10
 # Economy local ASR (faster-whisper, CTranslate2 加速 Whisper)
 faster-whisper>=1.0
 # Economy ASR: Windows Live Captions (UI Automation, 仅 Win11 22H2+)
-uiautomation>=2.0
+uiautomation>=2.0; platform_system=="Windows"
 # Economy local MT (NLLB via CTranslate2)
 ctranslate2>=4.0
 transformers>=4.40

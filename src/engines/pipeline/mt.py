@@ -11,22 +11,19 @@ from src.engines.pipeline.nllb_mt import NllbCt2Mt
 from src.utils.logger import logger
 
 _STUB_MSG = "经济模式尚未配置 MT"
-_ARGOS_HINT = (
-    "可选安装 argostranslate 做本地翻译回退（体积较大）: pip install argostranslate"
-)
+_ARGOS_HINT = "可选安装 argostranslate 做本地翻译回退（体积较大）: pip install argostranslate"
 _LOG_INTERVAL_SEC = 30.0
 
 
 class MtBackend(Protocol):
-    configured: bool
+    @property
+    def configured(self) -> bool: ...
 
     def start(self) -> None: ...
 
     def stop(self) -> None: ...
 
-    def translate(
-        self, text: str, *, source_lang: str, target_lang: str
-    ) -> str | None: ...
+    def translate(self, text: str, *, source_lang: str, target_lang: str) -> str | None: ...
 
 
 class UnconfiguredMt:
@@ -50,9 +47,7 @@ class UnconfiguredMt:
     def stop(self) -> None:
         self._started = False
 
-    def translate(
-        self, text: str, *, source_lang: str, target_lang: str
-    ) -> str | None:
+    def translate(self, text: str, *, source_lang: str, target_lang: str) -> str | None:
         del source_lang, target_lang
         if not text or not self._started:
             return None
@@ -99,9 +94,7 @@ class ArgosMt:
     def stop(self) -> None:
         self._started = False
 
-    def translate(
-        self, text: str, *, source_lang: str, target_lang: str
-    ) -> str | None:
+    def translate(self, text: str, *, source_lang: str, target_lang: str) -> str | None:
         if not text or not self._started or self._argos is None:
             return None
         src = (source_lang or "")[:2].lower()
@@ -138,9 +131,7 @@ class MyMemoryMt:
     def stop(self) -> None:
         self._started = False
 
-    def translate(
-        self, text: str, *, source_lang: str, target_lang: str
-    ) -> str | None:
+    def translate(self, text: str, *, source_lang: str, target_lang: str) -> str | None:
         text = (text or "").strip()
         if not text or not self._started:
             return None
@@ -155,9 +146,7 @@ class MyMemoryMt:
                 resp = client.get(url, params=params)
                 resp.raise_for_status()
                 data = resp.json()
-            translated = (
-                (data.get("responseData") or {}).get("translatedText") or ""
-            ).strip()
+            translated = ((data.get("responseData") or {}).get("translatedText") or "").strip()
             return translated or None
         except Exception as exc:
             now = time.time()
@@ -197,11 +186,7 @@ class AutoMt:
             return self._argos.configured
         if self._prefer == "mymemory":
             return self._mymemory.configured
-        return (
-            self._nllb.configured
-            or self._argos.configured
-            or self._mymemory.configured
-        )
+        return self._nllb.configured or self._argos.configured or self._mymemory.configured
 
     @property
     def warming_up(self) -> bool:
@@ -228,24 +213,16 @@ class AutoMt:
         self._argos.stop()
         self._mymemory.stop()
 
-    def translate(
-        self, text: str, *, source_lang: str, target_lang: str
-    ) -> str | None:
+    def translate(self, text: str, *, source_lang: str, target_lang: str) -> str | None:
         if not text or not self._started:
             return None
         if self._prefer == "argos":
-            return self._argos.translate(
-                text, source_lang=source_lang, target_lang=target_lang
-            )
+            return self._argos.translate(text, source_lang=source_lang, target_lang=target_lang)
         if self._prefer == "mymemory":
-            return self._mymemory.translate(
-                text, source_lang=source_lang, target_lang=target_lang
-            )
+            return self._mymemory.translate(text, source_lang=source_lang, target_lang=target_lang)
 
         # auto / nllb: NLLB first
-        out = self._nllb.translate(
-            text, source_lang=source_lang, target_lang=target_lang
-        )
+        out = self._nllb.translate(text, source_lang=source_lang, target_lang=target_lang)
         if out:
             return out
         # While NLLB is still downloading/loading, do not silently fall back.
@@ -256,9 +233,7 @@ class AutoMt:
             (self._argos, "Argos"),
             (self._mymemory, "MyMemory"),
         ):
-            out = backend.translate(
-                text, source_lang=source_lang, target_lang=target_lang
-            )
+            out = backend.translate(text, source_lang=source_lang, target_lang=target_lang)
             if out:
                 if not self._fallback_logged:
                     self._fallback_logged = True

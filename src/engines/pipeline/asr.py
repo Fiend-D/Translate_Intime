@@ -8,7 +8,7 @@ import time
 import wave
 from contextlib import suppress
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from src.engines.pipeline.sentence_split import is_cjk_majority
 from src.utils.logger import logger
@@ -26,7 +26,8 @@ _LANGUAGE_HINTS = {
 
 
 class AsrBackend(Protocol):
-    configured: bool
+    @property
+    def configured(self) -> bool: ...
 
     def start(self) -> None: ...
 
@@ -134,9 +135,7 @@ class DashScopeAsr:
                 return text
             # Soft fallback to paraformer if fun-asr was selected and returned empty.
             if self._model.startswith("fun-asr"):
-                text = self._call_recognition(
-                    path, hints, model_override="paraformer-realtime-v2"
-                )
+                text = self._call_recognition(path, hints, model_override="paraformer-realtime-v2")
             return text
         except Exception as exc:
             now = time.time()
@@ -146,10 +145,8 @@ class DashScopeAsr:
             return None
         finally:
             if path is not None:
-                try:
+                with suppress(Exception):
                     path.unlink(missing_ok=True)
-                except Exception:
-                    pass
 
     def _write_temp_wav(self, pcm: bytes) -> Path:
         fd, name = tempfile.mkstemp(suffix=".wav")
@@ -168,9 +165,9 @@ class DashScopeAsr:
         model: str,
         fmt: str,
         language_hints: list[str],
-        callback=None,  # noqa: ANN001
-    ) -> dict:
-        kwargs: dict = {
+        callback: Any | None = None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
             "model": model,
             "format": fmt,
             "sample_rate": 16000,
@@ -178,11 +175,8 @@ class DashScopeAsr:
             "language_hints": language_hints,
         }
         # Semantic punctuation improves sentence boundaries for Fun-ASR / Paraformer.
-        for key, value in (
-            ("semantic_punctuation_enabled", True),
-            ("semantic_punctuation", True),
-        ):
-            kwargs[key] = value
+        kwargs["semantic_punctuation_enabled"] = True
+        kwargs["semantic_punctuation"] = True
 
         if self._hotwords:
             # Try common DashScope vocabulary / phrase kwargs; drop unsupported later.
@@ -197,7 +191,7 @@ class DashScopeAsr:
                     kwargs[key] = value
         return kwargs
 
-    def _build_recognition(self, kwargs: dict):
+    def _build_recognition(self, kwargs: dict[str, Any]) -> Any:
         assert self._Recognition is not None
         # Drop unknown kwargs one-by-one if the SDK rejects them.
         attempt = dict(kwargs)
@@ -219,12 +213,13 @@ class DashScopeAsr:
                 dropped = False
                 for key in optional_keys:
                     if key in attempt and (key in msg or "unexpected" in msg.lower()):
-                        if key in ("phrase_list", "hotwords", "hotword", "vocabulary_id"):
-                            if self._hotwords and not self._hotword_warned:
-                                self._hotword_warned = True
-                                logger.info(
-                                    "DashScope Recognition 不支持热词参数，已忽略 hotwords"
-                                )
+                        if (
+                            key in ("phrase_list", "hotwords", "hotword", "vocabulary_id")
+                            and self._hotwords
+                            and not self._hotword_warned
+                        ):
+                            self._hotword_warned = True
+                            logger.info("DashScope Recognition 不支持热词参数，已忽略 hotwords")
                         attempt.pop(key, None)
                         dropped = True
                         break
@@ -265,10 +260,10 @@ class DashScopeAsr:
             def on_close(self) -> None:
                 return None
 
-            def on_error(self, result) -> None:  # noqa: ANN001
+            def on_error(self, result: Any) -> None:
                 logger.warning(f"DashScope ASR stream error: {result}")
 
-            def on_event(self, result) -> None:  # noqa: ANN001
+            def on_event(self, result: Any) -> None:
                 text = DashScopeAsr._extract_sentence_text(result)
                 if text:
                     sentences.append(text)
@@ -305,14 +300,11 @@ class DashScopeAsr:
         if not cleaned:
             return None
         blob = "".join(cleaned)
-        if is_cjk_majority(blob):
-            joined = "".join(cleaned).strip()
-        else:
-            joined = " ".join(cleaned).strip()
+        joined = "".join(cleaned).strip() if is_cjk_majority(blob) else " ".join(cleaned).strip()
         return joined or None
 
     @staticmethod
-    def _parse_result(result) -> str | None:  # noqa: ANN001
+    def _parse_result(result: Any) -> str | None:
         if result is None:
             return None
         status = getattr(result, "status_code", None)
@@ -330,7 +322,7 @@ class DashScopeAsr:
         return text.strip() if text else None
 
     @staticmethod
-    def _extract_sentence_text(result) -> str | None:  # noqa: ANN001
+    def _extract_sentence_text(result: Any) -> str | None:
         # RecognitionResult.get_sentence() may return list[dict] or dict.
         get_sentence = getattr(result, "get_sentence", None)
         if callable(get_sentence):

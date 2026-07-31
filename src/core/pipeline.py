@@ -10,6 +10,8 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from src.audio.session_ducker import Mode as DuckerMode
+from src.audio.session_ducker import SessionDucker
 from src.core.audio_capture import AudioCapture
 from src.core.audio_player import AudioPlayer
 from src.core.exceptions import EngineLoadError
@@ -58,7 +60,11 @@ class TranslationPipeline(QObject):
         self._capture_inbound: AudioCapture | None = None
         self._player: AudioPlayer | None = None
         self._directions: dict[Direction, DirectionState] = {}
-        self._subtitle_logger = SubtitleLogger(Path(config.log_dir))
+        self._subtitle_logger = SubtitleLogger(
+            Path(config.log_dir),
+            enabled=config.transcript_logging_enabled,
+            retention_days=config.transcript_retention_days,
+        )
         self._running = False
         self._outbound_active = False
         self._inbound_active = False
@@ -74,7 +80,7 @@ class TranslationPipeline(QObject):
         self._vad_diag_at = 0.0
         self._vad_pass_chunks = 0
         self._vad_drop_chunks = 0
-        self._ducker = None
+        self._ducker: SessionDucker | None = None
 
         # --- 回灌抑制（feedback suppression） ---
         # TTS 播放期间，输入音频**不丢弃**，而是缓存到 buffer。
@@ -189,11 +195,7 @@ class TranslationPipeline(QObject):
     def set_translation_mode(self, mode: EngineMode) -> None:
         """Switch engine mode; stops active channels and closes the old engine."""
         current = getattr(self._config, "translation_mode", "volc") or "volc"
-        if (
-            mode == current
-            and self._engine is not None
-            and self._engine.engine_id == mode
-        ):
+        if mode == current and self._engine is not None and self._engine.engine_id == mode:
             return
 
         if self._outbound_active or self._inbound_active:
@@ -218,18 +220,12 @@ class TranslationPipeline(QObject):
             on_error=self._on_engine_error,
             on_status=lambda msg: self.log_message.emit(msg),
             on_usage=lambda src, payload: self.usage_reported.emit(src, payload),
-            on_engine_status=lambda d, eng, st: self.engine_status_changed.emit(
-                d.value, eng, st
-            ),
+            on_engine_status=lambda d, eng, st: self.engine_status_changed.emit(d.value, eng, st),
             should_defer_rotate=self._should_defer_rotate,
         )
 
     def _should_defer_rotate(self, direction: Direction) -> bool:
-        gate = (
-            self._vad_outbound
-            if direction == Direction.OUTBOUND
-            else self._vad_inbound
-        )
+        gate = self._vad_outbound if direction == Direction.OUTBOUND else self._vad_inbound
         return bool(gate is not None and gate.is_open)
 
     def _ensure_engine(self) -> TranslationEngine:
@@ -318,89 +314,115 @@ class TranslationPipeline(QObject):
             if direction == Direction.OUTBOUND
             else self._play_inbound_voice
         )
-        if not engine.start_direction(direction, play_voice=voice):
-            if mode == "volc":
-                hint = "请检查 API Key / 网络。"
-            else:
-                from src.engines.pipeline.engine import economy_asr_requires_dashscope
-
-                if economy_asr_requires_dashscope(self._config):
-                    hint = "请检查 DashScope Key / 是否已安装 dashscope。"
+        capture: AudioCapture | None = None
+        player_created = False
+        ducker_created = False
+        previous_loopback = self._loopback_device
+        try:
+            if not engine.start_direction(direction, play_voice=voice):
+                if mode == "volc":
+                    hint = "请检查 API Key / 网络。"
                 else:
-                    hint = "请检查本地 ASR / Live Captions 是否可用（见日志）。"
-            raise EngineLoadError(f"{engine_label}连接失败（{label}）。{hint}")
+                    from src.engines.pipeline.engine import economy_asr_requires_dashscope
 
-        if opening_session:
-            path = self._subtitle_logger.begin_session()
-            self.log_message.emit(f"翻译留档：{path}")
+                    if economy_asr_requires_dashscope(self._config):
+                        hint = "请检查 DashScope Key / 是否已安装 dashscope。"
+                    else:
+                        hint = "请检查本地 ASR / Live Captions 是否可用（见日志）。"
+                raise EngineLoadError(f"{engine_label}连接失败（{label}）。{hint}")
+
+            if direction == Direction.OUTBOUND:
+                self._validate_feedback_routes(Direction.OUTBOUND)
+                self._vad_outbound_filters = bool(getattr(self._config, "vad_enabled", True))
+                self._vad_outbound = self._make_vad(
+                    "mic",
+                    force=bool(self._play_outbound_voice),
+                )
+                capture = AudioCapture(
+                    Direction.OUTBOUND,
+                    self._input_device,
+                    sample_rate=16000,
+                    channels=1,
+                )
+                self._capture_outbound = capture
+                capture.on_pcm = lambda pcm: self._engine_direct_pcm(Direction.OUTBOUND, pcm)
+                capture.on_error = lambda exc: self._on_capture_error(Direction.OUTBOUND, exc)
+            else:
+                loopback = self._resolve_loopback_device()
+                self._loopback_device = loopback
+                self._validate_feedback_routes(Direction.INBOUND)
+                self._vad_inbound = self._make_vad("game")
+                capture = AudioCapture(
+                    Direction.INBOUND,
+                    loopback,
+                    sample_rate=16000,
+                    channels=1,
+                )
+                self._capture_inbound = capture
+                capture.on_pcm = lambda pcm: self._engine_direct_pcm(Direction.INBOUND, pcm)
+                capture.on_error = lambda exc: self._on_capture_error(Direction.INBOUND, exc)
+
+            capture.start()
+            active_capture = (
+                self._capture_outbound if direction == Direction.OUTBOUND else self._capture_inbound
+            )
+            if active_capture is not capture or not capture.is_running():
+                raise EngineLoadError(f"{label}音频采集在启动期间意外停止。")
+
+            want_player = self._play_outbound_voice or self._play_inbound_voice
+            if want_player and self._player is None:
+                self._player = AudioPlayer(self._output_device)
+                player_created = True
+                # 真实播放时长反馈：用每段"wall clock"延长麦克风静音窗口
+                # 解决 TTS 多段累积下静音窗口不足的问题
+                self._player.on_segment_finished = self._on_tts_segment_finished
+                self._player.start()
+
+            if voice:
+                ducker_created = self._ducker is None
+                self._ensure_ducker()
+                self._refresh_ducker_config()
+
+            next_session: TranslationSession | None = None
+            if opening_session:
+                next_session = TranslationSession(
+                    outbound_enabled=direction == Direction.OUTBOUND,
+                    inbound_enabled=direction == Direction.INBOUND,
+                    source_language=LanguageCode(self._config.source_language),
+                    target_language=LanguageCode(self._config.target_language),
+                )
+                with contextlib.suppress(ValueError):
+                    next_session.transition(SessionStatus.STARTING)
+                with contextlib.suppress(ValueError):
+                    next_session.transition(SessionStatus.RUNNING)
+                path = self._subtitle_logger.begin_session()
+                self.log_message.emit(f"翻译留档：{path}")
+        except Exception:
+            self._rollback_channel_start(
+                direction,
+                engine,
+                capture=capture,
+                player_created=player_created,
+                ducker_created=ducker_created,
+                previous_loopback=previous_loopback,
+            )
+            raise
+
+        if direction == Direction.OUTBOUND:
+            self._outbound_active = True
+        else:
+            self._inbound_active = True
+            self.log_message.emit(f"游戏声音捕获设备：{self._loopback_device!r}")
 
         self.log_message.emit(f"{engine_label}已就绪（{label}）")
         if mode == "economy" and reason:
             self.log_message.emit(reason)
 
-        if direction == Direction.OUTBOUND:
-            self._validate_feedback_routes(Direction.OUTBOUND)
-            self._vad_outbound_filters = bool(getattr(self._config, "vad_enabled", True))
-            self._vad_outbound = self._make_vad(
-                "mic",
-                force=bool(self._play_outbound_voice),
-            )
-            self._capture_outbound = AudioCapture(
-                Direction.OUTBOUND,
-                self._input_device,
-                sample_rate=16000,
-                channels=1,
-            )
-            self._capture_outbound.on_pcm = lambda pcm: self._engine_direct_pcm(
-                Direction.OUTBOUND, pcm
-            )
-            self._capture_outbound.on_error = lambda exc: self._on_capture_error(
-                Direction.OUTBOUND, exc
-            )
-            self._capture_outbound.start()
-            self._outbound_active = True
-        else:
-            loopback = self._resolve_loopback_device()
-            self._loopback_device = loopback
-            self._validate_feedback_routes(Direction.INBOUND)
-            self._vad_inbound = self._make_vad("game")
-            self._capture_inbound = AudioCapture(
-                Direction.INBOUND,
-                loopback,
-                sample_rate=16000,
-                channels=1,
-            )
-            self._capture_inbound.on_pcm = lambda pcm: self._engine_direct_pcm(
-                Direction.INBOUND, pcm
-            )
-            self._capture_inbound.on_error = lambda exc: self._on_capture_error(
-                Direction.INBOUND, exc
-            )
-            self._capture_inbound.start()
-            self._inbound_active = True
-            self.log_message.emit(f"游戏声音捕获设备：{loopback!r}")
-
-        want_player = self._play_outbound_voice or self._play_inbound_voice
-        if want_player and self._player is None:
-            self._player = AudioPlayer(self._output_device)
-            # 真实播放时长反馈：用每段"wall clock"延长麦克风静音窗口
-            # 解决 TTS 多段累积下静音窗口不足的问题
-            self._player.on_segment_finished = self._on_tts_segment_finished
-            self._player.start()
-
         was_running = self._running
         self._running = True
         if not was_running:
-            self._session = TranslationSession(
-                outbound_enabled=self._outbound_active,
-                inbound_enabled=self._inbound_active,
-                source_language=LanguageCode(self._config.source_language),
-                target_language=LanguageCode(self._config.target_language),
-            )
-            with contextlib.suppress(ValueError):
-                self._session.transition(SessionStatus.STARTING)
-            with contextlib.suppress(ValueError):
-                self._session.transition(SessionStatus.RUNNING)
+            assert next_session is not None
+            self._session = next_session
             self.status_changed.emit("running")
 
         logger.info(f"Channel started: {direction.value} mode={mode}")
@@ -421,15 +443,51 @@ class TranslationPipeline(QObject):
         elif direction == Direction.INBOUND:
             self.log_message.emit("游戏字幕 VAD 已关闭（视频/游戏人声更完整）")
 
-        if (
-            (direction == Direction.OUTBOUND and self._play_outbound_voice)
-            or (direction == Direction.INBOUND and self._play_inbound_voice)
-        ):
-            self._ensure_ducker()
-            self._refresh_ducker_config()
+    def _rollback_channel_start(
+        self,
+        direction: Direction,
+        engine: TranslationEngine,
+        *,
+        capture: AudioCapture | None,
+        player_created: bool,
+        ducker_created: bool,
+        previous_loopback: int | str | None,
+    ) -> None:
+        """Release only resources allocated by a failed channel start."""
+        if capture is not None:
+            with contextlib.suppress(Exception):
+                capture.stop()
+
+        if direction == Direction.OUTBOUND:
+            if self._capture_outbound is capture:
+                self._capture_outbound = None
+            self._vad_outbound = None
+            self._vad_outbound_filters = False
+            self._outbound_active = False
+            self._play_outbound_voice = False
+        else:
+            if self._capture_inbound is capture:
+                self._capture_inbound = None
+            self._vad_inbound = None
+            self._inbound_active = False
+            self._play_inbound_voice = False
+            self._loopback_device = previous_loopback
+
+        if player_created and self._player is not None:
+            with contextlib.suppress(Exception):
+                self._player.stop()
+            self._player = None
+
+        if ducker_created and self._ducker is not None:
+            with contextlib.suppress(Exception):
+                self._ducker.close()
+            self._ducker = None
+
+        with contextlib.suppress(Exception):
+            engine.stop_direction(direction)
 
     @property
-    def subtitle_log_path(self):
+    def subtitle_log_path(self) -> Path:
         return self._subtitle_logger.get_recent_path()
 
     def log_typed_translation(self, original: str, translated: str) -> None:
@@ -443,8 +501,7 @@ class TranslationPipeline(QObject):
 
             devices = list_audio_devices()
             inputs = [
-                {"name": d.get("name", ""), "index": d.get("id")}
-                for d in devices.get("input", [])
+                {"name": d.get("name", ""), "index": d.get("id")} for d in devices.get("input", [])
             ]
             backend = getattr(self._config, "capture_backend", "auto") or "auto"
             picked = resolve_capture_backend(
@@ -454,11 +511,9 @@ class TranslationPipeline(QObject):
             )
             if picked is not None:
                 if self._loopback_device in (None, ""):
-                    self.log_message.emit(
-                        "未指定游戏声音来源，已自动选择系统捕获"
-                        + ("（免驱动）" if str(picked).startswith("wasapi_proc_exclude:") else "")
-                    )
-                return picked
+                    self.log_message.emit("未指定游戏声音来源，已自动选择系统 Loopback")
+                if isinstance(picked, (int, str)):
+                    return picked
         except Exception as exc:
             logger.warning(f"Auto-select loopback failed: {exc}")
         raise EngineLoadError(
@@ -514,8 +569,7 @@ class TranslationPipeline(QObject):
             ):
                 raise EngineLoadError(
                     "语音输出与游戏字幕捕获共用同一虚拟线或扬声器 Loopback，"
-                    "会造成回灌。请改用「免驱动（排除本应用）」捕获，"
-                    "或把译文输出到 CABLE Input / 另一只设备。"
+                    "会造成回灌。请把译文输出到 CABLE Input / 另一只设备。"
                 )
             if (
                 self._output_device is None
@@ -524,8 +578,7 @@ class TranslationPipeline(QObject):
             ):
                 raise EngineLoadError(
                     "语音输出为默认设备，游戏字幕使用经典 Loopback，"
-                    "无法保证不会捕获本应用声音。请改用「免驱动（排除本应用）」"
-                    "或明确选择 CABLE Input / 另一只输出设备。"
+                    "会捕获本应用声音。请明确选择 CABLE Input / 另一只输出设备。"
                 )
         except EngineLoadError:
             raise
@@ -560,16 +613,14 @@ class TranslationPipeline(QObject):
     def _ensure_ducker(self) -> None:
         if self._ducker is not None:
             return
-        from src.audio.session_ducker import SessionDucker
-
-        mode = getattr(self._config, "original_audio", "mix") or "mix"
+        mode: DuckerMode = self._config.original_audio
         gain = float(getattr(self._config, "duck_gain", 0.2) or 0.2)
         self._ducker = SessionDucker(mode=mode, duck_gain=gain)
 
     def _refresh_ducker_config(self) -> None:
         if self._ducker is None:
             return
-        mode = getattr(self._config, "original_audio", "mix") or "mix"
+        mode: DuckerMode = self._config.original_audio
         gain = float(getattr(self._config, "duck_gain", 0.2) or 0.2)
         self._ducker.configure(mode=mode, duck_gain=gain)
 
@@ -608,9 +659,8 @@ class TranslationPipeline(QObject):
             dp.last_source = ""
             dp.last_translated = ""
 
-        other_wants = (
-            (self._outbound_active and self._play_outbound_voice)
-            or (self._inbound_active and self._play_inbound_voice)
+        other_wants = (self._outbound_active and self._play_outbound_voice) or (
+            self._inbound_active and self._play_inbound_voice
         )
         if self._player is not None and not other_wants:
             with contextlib.suppress(Exception):
@@ -662,9 +712,7 @@ class TranslationPipeline(QObject):
     def _on_capture_error(self, direction: Direction, exc: Exception) -> None:
         """Mark a direction unavailable when its device read loop exits."""
         capture = (
-            self._capture_outbound
-            if direction == Direction.OUTBOUND
-            else self._capture_inbound
+            self._capture_outbound if direction == Direction.OUTBOUND else self._capture_inbound
         )
         if capture is not None:
             with contextlib.suppress(Exception):
@@ -759,8 +807,7 @@ class TranslationPipeline(QObject):
                 direction=direction,
                 original_text=original or "…",
                 translated_text=(
-                    translated
-                    or ("正在翻译…" if self.mode == "economy" and original else "…")
+                    translated or ("正在翻译…" if self.mode == "economy" and original else "…")
                 ),
                 is_final=is_final,
             )
@@ -817,9 +864,14 @@ class TranslationPipeline(QObject):
             return
         # 段播完时, 若队列仍有待播段, 继续保持静音窗口
         queue_remaining = self._player_queue_remaining()
-        candidate = time.time() + played_sec + queue_remaining + self._tts_silence_margin_sec
+        # ``played_sec`` has already elapsed when this callback runs. Adding it
+        # again would mute capture for another full segment duration.
+        candidate = time.time() + queue_remaining + self._tts_silence_margin_sec
         if candidate > self._tts_playing_until:
             self._tts_playing_until = candidate
+        if queue_remaining <= 0 and self._ducker is not None:
+            with contextlib.suppress(Exception):
+                self._ducker.release()
 
     def _player_queue_remaining(self) -> float:
         """估算 AudioPlayer 队列中剩余音频时长 (秒)."""
@@ -955,6 +1007,9 @@ class TranslationPipeline(QObject):
         if self._player is not None:
             with contextlib.suppress(Exception):
                 self._player.clear_queue()
+        if self._ducker is not None:
+            with contextlib.suppress(Exception):
+                self._ducker.release()
         self.log_message.emit("输入语音持续，已停止译文播放以保证字幕完整")
         logger.info(f"Feedback buffer limit reached ({direction.value}); preserving input")
         self._flush_feedback_buffer(direction)
@@ -965,6 +1020,9 @@ class TranslationPipeline(QObject):
         if self._player is not None:
             with contextlib.suppress(Exception):
                 self._player.clear_queue()
+        if self._ducker is not None:
+            with contextlib.suppress(Exception):
+                self._ducker.release()
         label = "麦克风" if direction == Direction.OUTBOUND else "游戏字幕"
         self.log_message.emit(f"检测到{label}抢话，提前结束 TTS 静音")
         logger.info(f"Barge-in detected ({direction.value}); ending TTS mute early")
@@ -998,10 +1056,13 @@ class TranslationPipeline(QObject):
             direction == Direction.INBOUND or self._vad_outbound_filters
         )
         if apply_vad:
+            assert gate is not None
             result = gate_result if gate_result is not None else gate.process(pcm)
             if not getattr(result, "passed", False):
                 return
-            preroll = getattr(result, "preroll", b"") if getattr(result, "opened_now", False) else b""
+            preroll = (
+                getattr(result, "preroll", b"") if getattr(result, "opened_now", False) else b""
+            )
             if preroll:
                 pcm = preroll + pcm
         with contextlib.suppress(Exception):

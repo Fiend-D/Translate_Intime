@@ -20,9 +20,9 @@ from typing import Any
 import numpy as np
 
 from src.utils.logger import logger
+from src.utils.resource_paths import model_resource_root
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-_CACHE_ROOT = _PROJECT_ROOT / "resource" / "asr" / "whisper"
+_CACHE_ROOT = model_resource_root() / "asr" / "whisper"
 _LOG_INTERVAL_SEC = 30.0
 
 # HuggingFace 镜像 (优先 hf-mirror.com)
@@ -79,6 +79,7 @@ def _resolve_device(device_preference: str) -> str:
     # auto: 检测 CUDA
     try:
         import torch  # noqa: F401
+
         if torch.cuda.is_available():
             return "cuda"
     except ImportError:
@@ -86,6 +87,7 @@ def _resolve_device(device_preference: str) -> str:
     # ctranslate2 也能检测
     try:
         import ctranslate2
+
         if "cuda" in ctranslate2.get_supported_compute_types("cuda"):
             return "cuda"
     except Exception:
@@ -208,17 +210,17 @@ class FasterWhisperAsr:
             words = self._hotwords[:50]
             initial_prompt = "、".join(words) + "。"
 
-        transcribe_kwargs: dict = dict(
-            language=lang_param,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(
-                min_silence_duration_ms=300,
-                speech_pad_ms=200,
-            ),
+        transcribe_kwargs: dict[str, Any] = {
+            "language": lang_param,
+            "beam_size": 5,
+            "vad_filter": True,
+            "vad_parameters": {
+                "min_silence_duration_ms": 300,
+                "speech_pad_ms": 200,
+            },
             # 无语音段返回空, 避免噪点
-            condition_on_previous_text=False,
-        )
+            "condition_on_previous_text": False,
+        }
         if initial_prompt:
             transcribe_kwargs["initial_prompt"] = initial_prompt
 
@@ -255,9 +257,7 @@ class FasterWhisperAsr:
         try:
             from faster_whisper import WhisperModel
         except ImportError:
-            logger.warning(
-                "faster-whisper 未安装，请执行: pip install faster-whisper"
-            )
+            logger.warning("faster-whisper 未安装，请执行: pip install faster-whisper")
             return False
 
         device = _resolve_device(self._device_preference)

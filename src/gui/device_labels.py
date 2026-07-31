@@ -77,7 +77,10 @@ def format_device_label(role: Role, name: str, device_id: Any = None) -> str:
     if kind == "system_loopback":
         return f"系统正在播放的声音 · {short}"
     if kind == "system_monitor":
-        if "translator_virtual" in str(name).lower() or "translator_virtual" in str(device_id).lower():
+        if (
+            "translator_virtual" in str(name).lower()
+            or "translator_virtual" in str(device_id).lower()
+        ):
             return f"本应用虚拟声卡回采 · {short}"
         return f"系统声音回采 · {short}"
     if kind == "app_virtual":

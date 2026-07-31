@@ -43,9 +43,9 @@ class AudioCapture:
         self._running = False
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
-        self._pyaudio = None
-        self._stream = None
-        self._audio_stream = None
+        self._pyaudio: Any | None = None
+        self._stream: Any | None = None
+        self._audio_stream: Any | None = None
         # Optional low-latency sink (e.g. Volc). When set, PCM bypasses the Qt tick queue.
         self.on_pcm: Callable[[bytes], None] | None = None
         self.on_error: Callable[[Exception], None] | None = None
@@ -79,9 +79,7 @@ class AudioCapture:
                                 "index": i,
                                 "name": info.get("name", ""),
                                 "channels": info.get("maxInputChannels", 0),
-                                "sample_rate": int(
-                                    info.get("defaultSampleRate", 16000)
-                                ),
+                                "sample_rate": int(info.get("defaultSampleRate", 16000)),
                             }
                         )
                 return devices
@@ -102,8 +100,7 @@ class AudioCapture:
                 else:
                     self._start_pyaudio_backend()
                 logger.info(
-                    f"Audio capture started for {self.direction.value} "
-                    f"(device={self.device!r})"
+                    f"Audio capture started for {self.direction.value} (device={self.device!r})"
                 )
             except Exception as exc:
                 self._running = False
@@ -159,6 +156,7 @@ class AudioCapture:
                 break
             if samples is None:
                 import time as _time
+
                 _time.sleep(0.005)
                 continue
             pcm = np.clip(samples * 32767.0, -32768, 32767).astype(np.int16).tobytes()

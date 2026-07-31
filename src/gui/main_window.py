@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, override
 
-from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
@@ -50,7 +52,12 @@ from src.audio.device_guard import (
 from src.core.audio_capture import AudioCapture
 from src.core.audio_player import AudioPlayer
 from src.core.dota_coach import DEFAULT_COACH_URL, DotaCoachBridge
-from src.core.music_share import MusicSharePlayer, list_audio_files
+from src.core.music_share import (
+    MusicSharePlayer,
+    PreparedMusicTrack,
+    list_audio_files,
+    prepare_music_track,
+)
 from src.core.pipeline import TranslationPipeline
 from src.core.usage_tracker import UsageState, UsageTracker
 from src.core.volc_engine import VOLC_VOICE_OPTIONS
@@ -63,7 +70,13 @@ from src.models.config import AppConfigModel
 from src.models.enums import Direction
 from src.models.subtitle import SubtitleEntry
 from src.utils.config_manager import load_config, merge_config_updates, save_config
-from src.utils.hotkeys import AppHotkeys, DEFAULT_HOTKEYS, GlobalHotkeys, HOTKEY_LABELS, HotkeyBridge
+from src.utils.hotkeys import (
+    DEFAULT_HOTKEYS,
+    HOTKEY_LABELS,
+    AppHotkeys,
+    GlobalHotkeys,
+    HotkeyBridge,
+)
 from src.utils.logger import logger
 
 
@@ -74,6 +87,8 @@ class _UsageBridge(QObject):
 class _MusicBridge(QObject):
     progress = pyqtSignal(float, float)
     finished = pyqtSignal()
+    loaded = pyqtSignal(int, int, bool, object)
+    load_failed = pyqtSignal(int, object, str)
 
 
 class _WheelBlockFilter(QObject):
@@ -118,7 +133,8 @@ class MainWindow(QMainWindow):
         self._registry = None
         try:
             self._config = load_config()
-        except Exception:
+        except Exception as exc:
+            logger.error(f"Configuration load failed; preserving stored credentials: {exc}")
             self._config = AppConfigModel()
 
         self._theme: ThemeMode = self._config.theme_mode  # type: ignore[assignment]
@@ -137,6 +153,8 @@ class MainWindow(QMainWindow):
         self._music_bridge = _MusicBridge(self)
         self._music_bridge.progress.connect(self._on_music_progress)
         self._music_bridge.finished.connect(self._on_music_finished)
+        self._music_bridge.loaded.connect(self._on_music_loaded)
+        self._music_bridge.load_failed.connect(self._on_music_load_failed)
         self._music = MusicSharePlayer(
             on_progress=lambda pos, dur: self._music_bridge.progress.emit(pos, dur),
             on_finished=lambda: self._music_bridge.finished.emit(),
@@ -145,6 +163,11 @@ class MainWindow(QMainWindow):
         self._music_folder: Path | None = None
         self._music_sidebar: MusicSidebarOverlay | None = None
         self._music_switching = False
+        self._music_load_generation = 0
+        self._music_pending_autoplay = False
+        self._music_loader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="music-loader")
+        self._music_load_future: Future[None] | None = None
+        self._music_load_cancel = threading.Event()
         self._hotkeys = GlobalHotkeys(HotkeyBridge(self))
         self._hotkeys.bridge.activated.connect(self._on_hotkey)
         self._app_hotkeys: AppHotkeys | None = None
@@ -188,9 +211,7 @@ class MainWindow(QMainWindow):
         self._dirty_timer.timeout.connect(self._update_save_button)
         self._dirty_timer.start()
         self._append_log("界面已就绪")
-        self._append_log(
-            "提示：语言/设备/VAD/密钥等需点「保存」后生效；字幕外观立即预览"
-        )
+        self._append_log("提示：语言/设备/VAD/密钥等需点「保存」后生效；字幕外观立即预览")
 
     # ------------------------------------------------------------------ UI
     def _setup_ui(self) -> None:
@@ -296,8 +317,7 @@ class MainWindow(QMainWindow):
         self._btn_unlock = QPushButton("解锁字幕")
         self._btn_unlock.setObjectName("ghostButton")
         self._btn_unlock.setToolTip(
-            "字幕锁定后会点击穿透，无法在浮层上操作。\n"
-            "点这里解除锁定，即可再次拖拽/右键菜单。"
+            "字幕锁定后会点击穿透，无法在浮层上操作。\n点这里解除锁定，即可再次拖拽/右键菜单。"
         )
         self._btn_unlock.clicked.connect(self._on_unlock_overlays)
         row2.addWidget(self._btn_unlock)
@@ -552,9 +572,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._lbl_music_time)
 
         self._sld_music_vol = QSlider(Qt.Orientation.Horizontal)
-        self._sld_music_vol.setRange(0, 200)
+        self._sld_music_vol.setRange(0, 100)
         self._sld_music_vol.setValue(100)
-        self._sld_music_vol.setToolTip("音量（100=原始音量，>100=增益，虚拟线缆建议 120-150）")
+        self._sld_music_vol.setToolTip(
+            "音量（100=原始音量；为避免失真，音乐通路不做超过 100% 的数字增益）"
+        )
         self._sld_music_vol.valueChanged.connect(self._on_music_volume)
         vol_row = QHBoxLayout()
         vol_row.addWidget(self._field_label("音量"))
@@ -573,8 +595,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(opts)
 
         note = QLabel(
-            "输出设备与麦克风同传共用「译文播放到」。"
-            "播音乐时建议关掉麦克风语音输出，避免抢声道。"
+            "输出设备与麦克风同传共用「译文播放到」。播音乐时建议关掉麦克风语音输出，避免抢声道。"
         )
         note.setObjectName("fieldLabel")
         note.setWordWrap(True)
@@ -643,9 +664,7 @@ class MainWindow(QMainWindow):
             "经济模式 = 阿里云 Fun-ASR + NLLB 本地翻译 + Kokoro 语音；\n"
             "首次运行会后台下载模型到 ~/.cache/translator_intime/。"
         )
-        self._cmb_translation_mode.currentIndexChanged.connect(
-            self._on_translation_mode_changed
-        )
+        self._cmb_translation_mode.currentIndexChanged.connect(self._on_translation_mode_changed)
         mode_row.addWidget(self._cmb_translation_mode, 1)
         layout.addLayout(mode_row)
 
@@ -673,9 +692,7 @@ class MainWindow(QMainWindow):
         vad_col.setSpacing(4)
         self._chk_vad = QCheckBox("麦克风 VAD（减空噪幻觉）")
         self._chk_vad.setChecked(True)
-        self._chk_vad.setToolTip(
-            "仅作用于麦克风通道。静音/空噪不送火山。\n更改后需重新开启通道。"
-        )
+        self._chk_vad.setToolTip("仅作用于麦克风通道。静音/空噪不送火山。\n更改后需重新开启通道。")
         vad_col.addWidget(self._chk_vad)
         self._chk_vad_game = QCheckBox("游戏/视频 VAD")
         self._chk_vad_game.setChecked(True)
@@ -692,9 +709,7 @@ class MainWindow(QMainWindow):
         self._cmb_vad_sens.addItem("标准", "medium")
         self._cmb_vad_sens.addItem("严格", "high")
         self._cmb_vad_sens.setToolTip(
-            "宽松：小声也送（易漏噪）\n"
-            "标准：推荐（麦克风）\n"
-            "严格：只送明显人声"
+            "宽松：小声也送（易漏噪）\n标准：推荐（麦克风）\n严格：只送明显人声"
         )
         vad_row.addWidget(self._cmb_vad_sens)
         vad_row.addWidget(self._field_label("后端"))
@@ -734,13 +749,12 @@ class MainWindow(QMainWindow):
         cap_row.addWidget(self._field_label("游戏捕获"))
         self._cmb_capture_backend = QComboBox()
         self._prep_combo(self._cmb_capture_backend)
-        self._cmb_capture_backend.addItem("自动（优先免驱动）", "auto")
-        self._cmb_capture_backend.addItem("免驱动（排除本应用）", "driverless")
-        self._cmb_capture_backend.addItem("经典 Loopback", "loopback")
+        self._cmb_capture_backend.addItem("自动（系统 Loopback）", "auto")
+        self._cmb_capture_backend.addItem("系统 Loopback", "loopback")
         self._cmb_capture_backend.setToolTip(
-            "Windows：免驱动 = process-exclude，译文不会被再识别。\n"
-            "自动：可用则免驱动，否则经典 Loopback。\n"
-            "Linux 仍使用 monitor。"
+            "Windows 使用扬声器/耳机 Loopback，会捕获该设备的全部声音。\n"
+            "为避免译文回灌，请把 TTS/音乐输出到 CABLE Input 或另一设备。\n"
+            "Linux 使用 monitor。"
         )
         cap_row.addWidget(self._cmb_capture_backend, 1)
         layout.addLayout(cap_row)
@@ -765,9 +779,7 @@ class MainWindow(QMainWindow):
         voice_row = QHBoxLayout()
         voice_row.addWidget(self._field_label("同传音色"))
         self._cmb_volc_voice = QComboBox()
-        self._cmb_volc_voice.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
+        self._cmb_volc_voice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for sid, label in VOLC_VOICE_OPTIONS:
             self._cmb_volc_voice.addItem(label, sid)
         self._cmb_volc_voice.setToolTip(
@@ -802,6 +814,22 @@ class MainWindow(QMainWindow):
         rate_row.addWidget(self._spn_history)
         rate_row.addStretch()
         layout.addLayout(rate_row)
+
+        archive_row = QHBoxLayout()
+        self._chk_transcript_logging = QCheckBox("淇濆瓨缈昏瘧璁板綍")
+        self._chk_transcript_logging.setToolTip(
+            "\u5173\u95ed\u540e\u4e0d\u518d\u5c06\u539f\u6587\u548c\u8bd1\u6587"
+            "\u5199\u5165\u672c\u5730\u6587\u4ef6"
+        )
+        archive_row.addWidget(self._chk_transcript_logging)
+        archive_row.addWidget(self._field_label("淇濈暀澶╂暟"))
+        self._spn_transcript_retention = QSpinBox()
+        self._spn_transcript_retention.setRange(1, 3650)
+        self._spn_transcript_retention.setSuffix(" \u5929")
+        self._chk_transcript_logging.toggled.connect(self._spn_transcript_retention.setEnabled)
+        archive_row.addWidget(self._spn_transcript_retention)
+        archive_row.addStretch()
+        layout.addLayout(archive_row)
 
         corpus_row = QHBoxLayout()
         self._chk_show_original = QCheckBox("浮层显示原文")
@@ -899,21 +927,18 @@ class MainWindow(QMainWindow):
             format_kokoro_info,
             format_option_label,
         )
+
         for opt in ASR_OPTIONS:
             self._cmb_local_asr_model.addItem(format_option_label(opt), opt.id)
         self._cmb_local_asr_model.setToolTip(
             "本地 sherpa-onnx 流式 ASR 模型。缓存至 项目内 resource/asr/。\n"
             "更改后立即生效（运行中会停止通道）。"
         )
-        self._cmb_local_asr_model.currentIndexChanged.connect(
-            self._on_local_asr_model_changed
-        )
+        self._cmb_local_asr_model.currentIndexChanged.connect(self._on_local_asr_model_changed)
         local_asr_row.addWidget(self._cmb_local_asr_model, 1)
         layout.addLayout(local_asr_row)
 
-        economy_tip = QLabel(
-            "经济模式 = ASR + NLLB本地翻译 + Kokoro语音（首次运行后台下载模型）"
-        )
+        economy_tip = QLabel("经济模式 = ASR + NLLB本地翻译 + Kokoro语音（首次运行后台下载模型）")
         economy_tip.setObjectName("fieldLabel")
         economy_tip.setWordWrap(True)
         layout.addWidget(economy_tip)
@@ -987,7 +1012,7 @@ class MainWindow(QMainWindow):
         self._txt_dota_url.setToolTip("Dota Tracker 的 /ai/ask 地址")
         layout.addWidget(self._txt_dota_url)
         coach_tip = QLabel(
-            "用法：先开麦克风通道 → Ctrl+Alt+C 待命 → 说话等定稿 → 自动发送；再按一次取消。"
+            "用法：先开麦克风通道 → Ctrl+Alt+K 待命 → 说话等定稿 → 自动发送；再按一次取消。"
         )
         coach_tip.setObjectName("appSubtitle")
         coach_tip.setWordWrap(True)
@@ -1124,9 +1149,7 @@ class MainWindow(QMainWindow):
         if "voicemeeter" in t and ("vaio" in t or "aux" in t) and "input" in t:
             return True
         # Voicemeeter In 1/2/3/4/5
-        if "voicemeeter in " in t:
-            return True
-        return False
+        return "voicemeeter in " in t
 
     def _populate_devices(self) -> None:
         from src.gui.device_labels import format_device_label, role_default_label, role_hint
@@ -1219,9 +1242,12 @@ class MainWindow(QMainWindow):
             if idx in seen_lb:
                 continue
             # sounddevice 查出来的数字设备重复
-            if isinstance(idx, int) and not str(idx).startswith("wasapi_"):
-                if idx in {d.get("index") for d in inputs}:
-                    continue
+            if (
+                isinstance(idx, int)
+                and not str(idx).startswith("wasapi_")
+                and idx in {d.get("index") for d in inputs}
+            ):
+                continue
             seen_lb.add(idx)
             label = format_device_label("loopback", name, idx)
             if is_vb_cable_capture(name, idx) or is_vb_cable_input(name, idx):
@@ -1334,13 +1360,11 @@ class MainWindow(QMainWindow):
         self._sync_lang_pairs_from_mic()
 
     def _on_enable_toggled(self, *_args: Any) -> None:
-        running_mic = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.OUTBOUND)
+        running_mic = self._pipeline is not None and self._pipeline.is_channel_active(
+            Direction.OUTBOUND
         )
-        running_game = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.INBOUND)
+        running_game = self._pipeline is not None and self._pipeline.is_channel_active(
+            Direction.INBOUND
         )
         mic_on = self._chk_enable_mic.isChecked()
         game_on = self._chk_enable_game.isChecked()
@@ -1402,9 +1426,7 @@ class MainWindow(QMainWindow):
         self._cmb_translation_mode.blockSignals(False)
         self._txt_volc_key.setText(cfg.volc_api_key)
         if hasattr(self, "_txt_dashscope_key"):
-            self._txt_dashscope_key.setText(
-                getattr(cfg, "economy_dashscope_api_key", "") or ""
-            )
+            self._txt_dashscope_key.setText(getattr(cfg, "economy_dashscope_api_key", "") or "")
         if hasattr(self, "_cmb_asr_backend"):
             self._cmb_asr_backend.blockSignals(True)
             asr_ui = getattr(cfg, "economy_asr_backend", "live_captions") or "live_captions"
@@ -1479,6 +1501,8 @@ class MainWindow(QMainWindow):
         self._select_combo_data(self._cmb_volc_voice, getattr(cfg, "volc_speaker_id", "") or "")
         self._spn_speech_rate.setValue(int(getattr(cfg, "volc_speech_rate", 0) or 0))
         self._spn_history.setValue(int(getattr(cfg, "subtitle_history_lines", 2) or 0))
+        self._chk_transcript_logging.setChecked(cfg.transcript_logging_enabled)
+        self._spn_transcript_retention.setValue(cfg.transcript_retention_days)
         self._chk_show_original.setChecked(bool(getattr(cfg, "show_original_in_overlay", True)))
         self._chk_advanced.blockSignals(True)
         self._chk_advanced.setChecked(bool(getattr(cfg, "show_advanced_devices", False)))
@@ -1534,19 +1558,33 @@ class MainWindow(QMainWindow):
             )
         else:
             btn.setToolTip(
-                "设置已与本地配置同步。\n"
-                "通道相关项保存后，需重新开启通道才会应用到正在运行的会话。"
+                "设置已与本地配置同步。\n通道相关项保存后，需重新开启通道才会应用到正在运行的会话。"
             )
 
     def _commit_from_ui(self, *, persist: bool = True) -> bool:
         """UI draft → self._config (+ disk)."""
+        previous = self._config
         try:
-            self._config = self._collect_config_from_ui()
+            updated = self._collect_config_from_ui()
             if persist:
-                save_config(self._config)
+                cleared = {
+                    field
+                    for field in (
+                        "volc_api_key",
+                        "volc_access_token",
+                        "volc_iam_ak",
+                        "volc_iam_sk",
+                        "economy_dashscope_api_key",
+                    )
+                    if str(getattr(previous, field, "") or "").strip()
+                    and not str(getattr(updated, field, "") or "").strip()
+                }
+                save_config(updated, clear_secret_fields=cleared)
+            self._config = updated
             self._update_save_button()
             return True
         except Exception as exc:
+            self._config = previous
             QMessageBox.critical(self, "保存失败", str(exc))
             return False
 
@@ -1651,8 +1689,7 @@ class MainWindow(QMainWindow):
             or "fun-asr-realtime",
             economy_asr_local_model=(
                 self._cmb_local_asr_model.currentData()
-                if hasattr(self, "_cmb_local_asr_model")
-                and self._cmb_local_asr_model.currentData()
+                if hasattr(self, "_cmb_local_asr_model") and self._cmb_local_asr_model.currentData()
                 else getattr(
                     self._config,
                     "economy_asr_local_model",
@@ -1661,8 +1698,7 @@ class MainWindow(QMainWindow):
                 or "faster-whisper-medium"
             ),
             economy_mt_backend=getattr(self._config, "economy_mt_backend", "nllb") or "nllb",
-            economy_tts_backend=getattr(self._config, "economy_tts_backend", "kokoro")
-            or "kokoro",
+            economy_tts_backend=getattr(self._config, "economy_tts_backend", "kokoro") or "kokoro",
             economy_nllb_model=(
                 self._cmb_nllb_model.currentData()
                 if hasattr(self, "_cmb_nllb_model") and self._cmb_nllb_model.currentData()
@@ -1676,17 +1712,11 @@ class MainWindow(QMainWindow):
             economy_offline_setup_done=bool(
                 getattr(self._config, "economy_offline_setup_done", False)
             ),
-            economy_kokoro_voice_en=getattr(
-                self._config, "economy_kokoro_voice_en", "af_bella"
-            )
+            economy_kokoro_voice_en=getattr(self._config, "economy_kokoro_voice_en", "af_bella")
             or "af_bella",
-            economy_kokoro_voice_zh=getattr(
-                self._config, "economy_kokoro_voice_zh", "zf_xiaoxiao"
-            )
+            economy_kokoro_voice_zh=getattr(self._config, "economy_kokoro_voice_zh", "zf_xiaoxiao")
             or "zf_xiaoxiao",
-            economy_kokoro_speed=float(
-                getattr(self._config, "economy_kokoro_speed", 0.92) or 0.92
-            ),
+            economy_kokoro_speed=float(getattr(self._config, "economy_kokoro_speed", 0.92) or 0.92),
             economy_sentence_min_chars=int(
                 getattr(self._config, "economy_sentence_min_chars", 4) or 4
             ),
@@ -1695,8 +1725,7 @@ class MainWindow(QMainWindow):
             ),
             device_preference=(
                 self._cmb_device_pref.currentData()
-                if hasattr(self, "_cmb_device_pref")
-                and self._cmb_device_pref.currentData()
+                if hasattr(self, "_cmb_device_pref") and self._cmb_device_pref.currentData()
                 else getattr(self._config, "device_preference", "auto") or "auto"
             ),
             economy_utterance_silence_ms=int(
@@ -1712,8 +1741,7 @@ class MainWindow(QMainWindow):
                 getattr(self._config, "economy_utterance_soft_split_ms", 6000) or 6000
             ),
             economy_utterance_soft_split_quiet_ms=int(
-                getattr(self._config, "economy_utterance_soft_split_quiet_ms", 280)
-                or 280
+                getattr(self._config, "economy_utterance_soft_split_quiet_ms", 280) or 280
             ),
             economy_utterance_tail_rms=float(
                 getattr(self._config, "economy_utterance_tail_rms", 0.003) or 0.003
@@ -1727,6 +1755,8 @@ class MainWindow(QMainWindow):
             hotwords=list(getattr(self, "_corpus_hotwords", None) or []),
             glossary=dict(getattr(self, "_corpus_glossary", None) or {}),
             subtitle_history_lines=self._spn_history.value(),
+            transcript_logging_enabled=self._chk_transcript_logging.isChecked(),
+            transcript_retention_days=self._spn_transcript_retention.value(),
             show_original_in_overlay=self._chk_show_original.isChecked(),
             overlay_locked=self._config.overlay_locked,
             theme_mode=self._theme,
@@ -1777,8 +1807,7 @@ class MainWindow(QMainWindow):
             mode = "volc"
         prev = getattr(self._config, "translation_mode", "volc") or "volc"
         if mode == prev and (
-            self._pipeline is None
-            or getattr(self._pipeline, "mode", prev) == mode
+            self._pipeline is None or getattr(self._pipeline, "mode", prev) == mode
         ):
             return
 
@@ -1838,12 +1867,8 @@ class MainWindow(QMainWindow):
 
                     raw = getattr(self._config, "economy_asr_backend", "") or ""
                     if raw == "live_captions" and not sys.platform.startswith("win"):
-                        self._append_log(
-                            "Live Captions 仅支持 Windows；已自动切换为本地 ASR"
-                        )
-                    self._append_log(
-                        "经济模式已使用本地 ASR，无需 DashScope API Key"
-                    )
+                        self._append_log("Live Captions 仅支持 Windows；已自动切换为本地 ASR")
+                    self._append_log("经济模式已使用本地 ASR，无需 DashScope API Key")
             elif not (
                 (
                     self._txt_dashscope_key.text().strip()
@@ -1897,9 +1922,7 @@ class MainWindow(QMainWindow):
         if not model_id:
             return
         current = getattr(self._config, "economy_nllb_model", "") or ""
-        if model_id == current and bool(
-            getattr(self._config, "economy_offline_setup_done", False)
-        ):
+        if model_id == current and bool(getattr(self._config, "economy_offline_setup_done", False)):
             return
 
         stopped = False
@@ -1966,9 +1989,7 @@ class MainWindow(QMainWindow):
                 update={"economy_asr_backend": backend}
             )
 
-        self._config = self._config.model_copy(
-            update={"economy_asr_backend": backend}
-        )
+        self._config = self._config.model_copy(update={"economy_asr_backend": backend})
         self._persist_config()
 
         if backend == "live_captions":
@@ -1976,9 +1997,7 @@ class MainWindow(QMainWindow):
             import sys
 
             if not sys.platform.startswith("win"):
-                warn = (
-                    "Live Captions 仅支持 Windows；Linux/macOS 将自动使用本地 ASR"
-                )
+                warn = "Live Captions 仅支持 Windows；Linux/macOS 将自动使用本地 ASR"
                 self._append_log(warn)
                 show_toast(warn)
         elif backend in ("local", "sherpa", "whisper"):
@@ -2021,9 +2040,7 @@ class MainWindow(QMainWindow):
                 update={"economy_asr_local_model": model_id}
             )
 
-        self._config = self._config.model_copy(
-            update={"economy_asr_local_model": model_id}
-        )
+        self._config = self._config.model_copy(update={"economy_asr_local_model": model_id})
         self._persist_config()
 
         msg = "已切换本地 ASR 模型，将在下次启动通道时生效"
@@ -2144,11 +2161,17 @@ class MainWindow(QMainWindow):
 
         def _persist(original: str, translated: str) -> None:
             try:
+                if not self._config.transcript_logging_enabled:
+                    return
                 if self._pipeline is not None:
                     self._pipeline.log_typed_translation(original, translated)
                 else:
                     if getattr(self, "_archive_logger", None) is None:
-                        self._archive_logger = SubtitleLogger(Path(self._config.log_dir))
+                        self._archive_logger = SubtitleLogger(
+                            Path(self._config.log_dir),
+                            enabled=self._config.transcript_logging_enabled,
+                            retention_days=self._config.transcript_retention_days,
+                        )
                     self._archive_logger.log_typed(original, translated)
                 self._append_log("打字翻译已写入留档")
             except Exception as exc:
@@ -2197,14 +2220,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_lbl_pack_remain"):
             self._lbl_pack_remain.setText(self._pack_remain_text)
 
-    def _on_pipeline_usage(self, source: str, payload: dict) -> None:
+    def _on_pipeline_usage(self, source: str, payload: dict[str, Any]) -> None:
         try:
             self._usage_tracker.feed_usage_dict(source or "mic", payload)
         except Exception as exc:
             logger.debug(f"usage feed failed: {exc}")
 
     def _on_refresh_pack_quota(self) -> None:
-        from src.core.volc_console import fetch_resource_packs, fetch_quota_monitoring, summarize_quota_payload
+        from src.core.volc_console import (
+            fetch_quota_monitoring,
+            fetch_resource_packs,
+            summarize_quota_payload,
+        )
 
         ak = self._txt_volc_iam_ak.text().strip()
         sk = self._txt_volc_iam_sk.text().strip()
@@ -2286,9 +2313,7 @@ class MainWindow(QMainWindow):
             self._select_combo_data(self._cmb_loopback, lb)
         self._config = self._config.model_copy(update={"show_advanced_devices": bool(checked)})
         self._persist_config()
-        self._append_log(
-            "已开启高级设备选项" if checked else "已隐藏高级设备选项（使用自动推荐）"
-        )
+        self._append_log("已开启高级设备选项" if checked else "已隐藏高级设备选项（使用自动推荐）")
 
     def _apply_advanced_visibility(self) -> None:
         advanced = self._chk_advanced.isChecked()
@@ -2341,20 +2366,16 @@ class MainWindow(QMainWindow):
         if str(alt) == str(lb):
             return
         self._select_combo_data(self._cmb_loopback, alt)
-        self._append_log(
-            "已自动避让：游戏声音改选系统 Loopback，避免与同传虚拟线冲突"
-        )
+        self._append_log("已自动避让：游戏声音改选系统 Loopback，避免与同传虚拟线冲突")
         show_toast("已自动避开虚拟线冲突")
 
     def _validate_devices_for_start(self, channel: Literal["mic", "game"]) -> bool:
         self._try_auto_avoid_shared_cable(channel)
-        mic_active = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.OUTBOUND)
+        mic_active = self._pipeline is not None and self._pipeline.is_channel_active(
+            Direction.OUTBOUND
         )
-        game_active = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.INBOUND)
+        game_active = self._pipeline is not None and self._pipeline.is_channel_active(
+            Direction.INBOUND
         )
         issues = validate_channel_devices(
             channel,
@@ -2523,7 +2544,7 @@ class MainWindow(QMainWindow):
         self._persist_config()
 
     def _any_overlay_locked(self) -> bool:
-        for direction, overlay in self._overlays.items():
+        for _direction, overlay in self._overlays.items():
             if overlay.is_locked():
                 return True
         # Also respect persisted state when overlay not yet created
@@ -2614,10 +2635,7 @@ class MainWindow(QMainWindow):
     def _on_channel_toggle(self, channel: Literal["mic", "game"]) -> None:
         """Toggle one independent channel without touching the other."""
         direction = Direction.OUTBOUND if channel == "mic" else Direction.INBOUND
-        active = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(direction)
-        )
+        active = self._pipeline is not None and self._pipeline.is_channel_active(direction)
         if active:
             self._stop_one_channel(channel)
         else:
@@ -2712,9 +2730,7 @@ class MainWindow(QMainWindow):
                 self._append_log(reason)
             if play_voice:
                 out_dev_name = self._resolve_output_device_name()
-                self._append_log(
-                    f"{label}已开启语音输出 → 输出设备: {out_dev_name}"
-                )
+                self._append_log(f"{label}已开启语音输出 → 输出设备: {out_dev_name}")
             self._on_enable_toggled()
         except Exception as exc:
             self._append_log(f"{label}启动失败: {exc}")
@@ -2769,25 +2785,17 @@ class MainWindow(QMainWindow):
     def _on_start(self) -> None:
         # Legacy: start whichever enable checkboxes are on
         if self._chk_enable_mic.isChecked() and (
-            self._pipeline is None
-            or not self._pipeline.is_channel_active(Direction.OUTBOUND)
+            self._pipeline is None or not self._pipeline.is_channel_active(Direction.OUTBOUND)
         ):
             self._start_one_channel("mic")
         if self._chk_enable_game.isChecked() and (
-            self._pipeline is None
-            or not self._pipeline.is_channel_active(Direction.INBOUND)
+            self._pipeline is None or not self._pipeline.is_channel_active(Direction.INBOUND)
         ):
             self._start_one_channel("game")
 
     def _refresh_channel_buttons(self) -> None:
-        mic_on = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.OUTBOUND)
-        )
-        game_on = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.INBOUND)
-        )
+        mic_on = self._pipeline is not None and self._pipeline.is_channel_active(Direction.OUTBOUND)
+        game_on = self._pipeline is not None and self._pipeline.is_channel_active(Direction.INBOUND)
 
         if mic_on:
             self._btn_mic.setText("■  关闭麦克风")
@@ -2804,8 +2812,10 @@ class MainWindow(QMainWindow):
             self._btn_game.setObjectName("primaryButton")
 
         for btn in (self._btn_game, self._btn_mic):
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+            style = btn.style()
+            if style is not None:
+                style.unpolish(btn)
+                style.polish(btn)
             btn.update()
 
         self._btn_stop.setEnabled(mic_on or game_on)
@@ -2837,13 +2847,11 @@ class MainWindow(QMainWindow):
 
     def _sync_overlays_visibility(self, *, preview: bool = False) -> None:
         wanted: list[Direction] = []
-        mic_running = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.OUTBOUND)
+        mic_running = self._pipeline is not None and self._pipeline.is_channel_active(
+            Direction.OUTBOUND
         )
-        game_running = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.INBOUND)
+        game_running = self._pipeline is not None and self._pipeline.is_channel_active(
+            Direction.INBOUND
         )
         if self._chk_show_mic.isChecked() and (preview or mic_running):
             wanted.append(Direction.OUTBOUND)
@@ -2891,7 +2899,7 @@ class MainWindow(QMainWindow):
             self._model_loading_names = names
             self._progress.setVisible(True)
             self._progress.setRange(0, 0)
-            self._status_label.setText(f"状态：正在准备 {"、".join(names)}")
+            self._status_label.setText(f"状态：正在准备 {'、'.join(names)}")
             return
 
         if self._model_loading_names:
@@ -2923,11 +2931,7 @@ class MainWindow(QMainWindow):
         if entry.direction == Direction.OUTBOUND:
             self._set_preview(self._mic_preview, entry.original_text, entry.translated_text)
             show = self._chk_show_mic.isChecked()
-            if (
-                self._dota_coach_armed
-                and entry.is_final
-                and self._chk_dota_coach.isChecked()
-            ):
+            if self._dota_coach_armed and entry.is_final and self._chk_dota_coach.isChecked():
                 text = (entry.original_text or "").strip()
                 if text and text != "…":
                     self._disarm_dota_coach(silent=True)
@@ -3005,7 +3009,6 @@ class MainWindow(QMainWindow):
             show_toast(f"教练失败：{payload[:60]}", ms=2800)
             self._append_log(f"Dota 教练失败：{payload}")
 
-
     def _on_latency_reported(self, latency_ms: int) -> None:
         self._latency_label.setText(f"延迟：{latency_ms} ms")
 
@@ -3075,7 +3078,7 @@ class MainWindow(QMainWindow):
             self._append_log(f"音乐文件夹：{folder}（{len(tracks)} 首）")
 
     def _on_music_track_combo(self, index: int) -> None:
-        if index < 0 or self._music_switching:
+        if index < 0:
             return
         was_playing = self._music.is_playing
         self._load_music_index(index, autoplay=was_playing)
@@ -3084,13 +3087,49 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self._music_tracks):
             return False
         path = self._music_tracks[index]
+        device = self._cmb_output.currentData()
+        self._music_load_cancel.set()
+        if self._music_load_future is not None:
+            self._music_load_future.cancel()
+        cancel_event = threading.Event()
+        self._music_load_cancel = cancel_event
+        self._music_load_generation += 1
+        generation = self._music_load_generation
         self._music_switching = True
-        try:
-            name, dur = self._music.load(path)
-        except Exception as exc:
-            self._music_switching = False
-            QMessageBox.warning(self, "无法打开音频", f"{path.name}\n{exc}")
-            return False
+        self._music_pending_autoplay = autoplay
+        self._btn_music_play.setEnabled(False)
+        self._append_log(f"正在加载曲目：{path.name}")
+
+        bridge = self._music_bridge
+
+        def worker() -> None:
+            try:
+                prepared = prepare_music_track(path, device, cancel_event=cancel_event)
+                if cancel_event.is_set():
+                    return
+                bridge.loaded.emit(generation, index, autoplay, prepared)
+            except Exception as exc:
+                if cancel_event.is_set():
+                    return
+                bridge.load_failed.emit(generation, path, str(exc))
+
+        self._music_load_future = self._music_loader.submit(worker)
+        return True
+
+    def _on_music_loaded(
+        self,
+        generation: int,
+        index: int,
+        autoplay: bool,
+        payload: object,
+    ) -> None:
+        if generation != self._music_load_generation:
+            return
+        if not isinstance(payload, PreparedMusicTrack):
+            self._on_music_load_failed(generation, payload, "后台返回了无效音频数据")
+            return
+        name, dur = self._music.load_prepared(payload)
+        path = payload.path
 
         self._cmb_music_track.blockSignals(True)
         self._cmb_music_track.setCurrentIndex(index)
@@ -3104,11 +3143,22 @@ class MainWindow(QMainWindow):
             self._music_sidebar.set_current_index(index, name=path.stem)
 
         self._music_switching = False
+        self._btn_music_play.setEnabled(True)
         self._append_log(f"已选曲目：{name}")
 
-        if autoplay:
-            return self._start_music_playback(show_conflict_warn=False)
-        return True
+        should_play = autoplay or self._music_pending_autoplay
+        self._music_pending_autoplay = False
+        if should_play:
+            self._start_music_playback(show_conflict_warn=False)
+
+    def _on_music_load_failed(self, generation: int, path: object, message: str) -> None:
+        if generation != self._music_load_generation:
+            return
+        self._music_switching = False
+        self._music_pending_autoplay = False
+        self._btn_music_play.setEnabled(True)
+        name = Path(path).name if isinstance(path, (str, Path)) else "音频文件"
+        QMessageBox.warning(self, "无法打开音频", f"{name}\n{message}")
 
     def _ensure_music_sidebar(self) -> MusicSidebarOverlay:
         if self._music_sidebar is None:
@@ -3142,7 +3192,9 @@ class MainWindow(QMainWindow):
         if index == self._cmb_music_track.currentIndex() and self._music.is_playing:
             return
         self._load_music_index(index, autoplay=True)
-        show_toast(self._music_tracks[index].stem if 0 <= index < len(self._music_tracks) else "切歌")
+        show_toast(
+            self._music_tracks[index].stem if 0 <= index < len(self._music_tracks) else "切歌"
+        )
 
     def _music_step(self, delta: int) -> None:
         if not self._music_tracks:
@@ -3158,22 +3210,20 @@ class MainWindow(QMainWindow):
         self._music.set_volume(value / 100.0)
 
     def _start_music_playback(self, *, show_conflict_warn: bool = True) -> bool:
+        if self._music_switching:
+            self._music_pending_autoplay = True
+            return True
         if not self._music.is_loaded:
             if self._cmb_music_track.currentData():
-                ok = self._load_music_index(
-                    self._cmb_music_track.currentIndex(), autoplay=False
-                )
-                if not ok:
-                    return False
+                return self._load_music_index(self._cmb_music_track.currentIndex(), autoplay=True)
             else:
                 QMessageBox.information(self, "音乐分享", "请先选择文件夹和曲目。")
                 return False
 
         out = self._cmb_output.currentData()
         out_name = self._cmb_output.currentText()
-        game_capture_on = (
-            self._pipeline is not None
-            and self._pipeline.is_channel_active(Direction.INBOUND)
+        game_capture_on = self._pipeline is not None and self._pipeline.is_channel_active(
+            Direction.INBOUND
         )
         if game_capture_on and shares_physical_output_path(
             output_name=out_name,
@@ -3267,14 +3317,18 @@ class MainWindow(QMainWindow):
                 if event is not None:
                     event.ignore()
                 return
-            if choice == "save":
-                if not self._commit_from_ui(persist=True):
-                    if event is not None:
-                        event.ignore()
-                    return
+            if choice == "save" and not self._commit_from_ui(persist=True):
+                if event is not None:
+                    event.ignore()
+                return
             # discard: keep self._config as last saved; positions already patched in
         with contextlib.suppress(Exception):
             self._music.stop()
+        self._music_load_cancel.set()
+        if self._music_load_future is not None:
+            self._music_load_future.cancel()
+        self._music_loader.shutdown(wait=False, cancel_futures=True)
+        self._music_load_generation += 1
         self._hide_music_sidebar()
         if self._music_sidebar is not None:
             self._music_sidebar.close()

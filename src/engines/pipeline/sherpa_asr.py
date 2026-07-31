@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -22,10 +23,11 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
+from src.utils.file_integrity import matches_sha256
 from src.utils.logger import logger
+from src.utils.resource_paths import model_resource_root
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-_CACHE_ROOT = _PROJECT_ROOT / "resource" / "asr"
+_CACHE_ROOT = model_resource_root() / "asr"
 _LOG_INTERVAL_SEC = 30.0
 _CHUNK = 1024 * 256
 
@@ -56,6 +58,25 @@ _MIN_FILE_BYTES: dict[str, dict[str, int]] = {
     },
 }
 
+_FILE_SHA256: dict[str, dict[str, str]] = {
+    "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20": {
+        "encoder-epoch-99-avg-1.int8.onnx": "8fa764187a261844f859d7143ebaa563af5d10adfece4c18a8f414c88cba2a9b",
+        "decoder-epoch-99-avg-1.int8.onnx": "1a70c593d71e53f023f5f55b0b4cfff5055abb786ee3992e5f63dc2e273cc4fa",
+        "joiner-epoch-99-avg-1.int8.onnx": "1ed689c5ed19dbaa725d9d191bb4822b5f4855a39e1ffd28cbc1f340d25b2ee0",
+        "tokens.txt": "a8e0e4ec53810e433789b54a5c0134a7eaa2ffca595a6334d54c00da858841d3",
+    },
+    "sherpa-onnx-streaming-zipformer-en-2023-06-26": {
+        "encoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx": "0d072fd4ef956294ba9db9e9a71a541ac70659095ec4934c8453d8b2fe740187",
+        "decoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx": "98da299f471e38bb4e1a8df579b8cc9122d6039576a77e357b3c60f17dd83b02",
+        "joiner-epoch-99-avg-1-chunk-16-left-64.int8.onnx": "d944208d660d67c8d72cd2acaeac971fa5ceb8c80e76c1968148846fedd6e297",
+        "tokens.txt": "49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb",
+    },
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17": {
+        "model.int8.onnx": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51",
+        "tokens.txt": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+    },
+}
+
 
 def _hf_urls(repo: str, fname: str) -> list[str]:
     """生成 HF resolve URL 列表, 镜像优先."""
@@ -75,7 +96,7 @@ def _looks_like_onnx(path: Path) -> bool:
     return b"onnx" in head
 
 
-def _file_ok(path: Path, *, min_bytes: int = 1) -> bool:
+def _file_ok(path: Path, *, min_bytes: int = 1, expected_sha256: str | None = None) -> bool:
     if not path.is_file():
         return False
     try:
@@ -84,9 +105,9 @@ def _file_ok(path: Path, *, min_bytes: int = 1) -> bool:
         return False
     if size < min_bytes:
         return False
-    if path.suffix == ".onnx" and not _looks_like_onnx(path):
+    if expected_sha256 and not matches_sha256(path, expected_sha256):
         return False
-    return True
+    return not (path.suffix == ".onnx" and not _looks_like_onnx(path))
 
 
 def _purge_model_files(info: dict[str, Any], cache_dir: Path) -> None:
@@ -289,51 +310,6 @@ def _trim_trailing_silence(samples: np.ndarray, sample_rate: int) -> np.ndarray:
     return samples[:keep_end]
 
 
-# BGM 检测: 游戏实况中持续 BGM/音效段能量持续, 无明显停顿,
-# SenseVoice 会误判为孤立标点/单字符 (如 "." "F." "The.").
-# 核心判据: 人声段有明显的"说话-停顿"交替 (相对静音窗口多),
-#           BGM 段能量持续无静音间隙 (相对静音窗口少).
-# "相对静音" = 窗口 RMS < 中位数 × 0.3 (相对于本段能量的低谷).
-_BGM_WINDOW_MS = 100
-_BGM_MIN_WINDOWS = 20  # 至少 2 秒才判断
-_BGM_MIN_RMS = 0.005  # 整体最大 RMS 低于此 → 纯静音, 不算 BGM
-_BGM_QUIET_RATIO = 0.3  # 窗口 RMS < 中位数 × 此值 → "相对静音窗口"
-_BGM_MAX_QUIET_FRAC = 0.15  # 相对静音窗口占比 < 此值 → BGM (无停顿)
-
-
-def _is_likely_bgm(samples: np.ndarray, sample_rate: int) -> bool:
-    """检测音频段是否像纯 BGM/音效 (无明显人声停顿).
-
-    返回 True 表示应跳过识别, 避免产生 "." "F." "The." 等噪点输出.
-    """
-    if samples.size == 0:
-        return False
-    win = max(160, int(_BGM_WINDOW_MS * sample_rate / 1000.0))
-    n_windows = samples.size // win
-    if n_windows < _BGM_MIN_WINDOWS:
-        return False  # 片段太短, 不做判断, 交给模型
-    rms_list: list[float] = []
-    for i in range(n_windows):
-        chunk = samples[i * win : (i + 1) * win]
-        rms = float(np.sqrt(np.mean(np.square(chunk))))
-        rms_list.append(rms)
-    rms_arr = np.array(rms_list, dtype=np.float64)
-    r_max = float(rms_arr.max())
-    # 整体能量过低 → 纯静音, 不是 BGM (交给尾部裁剪处理)
-    if r_max < _BGM_MIN_RMS:
-        return False
-    r_median = float(np.median(rms_arr))
-    if r_median < 1e-5:
-        r_median = 1e-5
-    # 统计"相对静音"窗口: RMS 低于中位数 × 0.3
-    # 人声段有明显的说话-停顿交替, 相对静音窗口多 (占比 > 15%);
-    # BGM 段能量持续, 相对静音窗口少 (占比 < 15%).
-    quiet_threshold = r_median * _BGM_QUIET_RATIO
-    quiet_count = int(np.sum(rms_arr < quiet_threshold))
-    quiet_frac = quiet_count / n_windows
-    return quiet_frac < _BGM_MAX_QUIET_FRAC
-
-
 # 无效输出过滤: SenseVoice 对纯 BGM/噪声段会输出孤立标点或单字符.
 # 这类输出无翻译价值, 且会刷屏, 予以过滤.
 # 规则:
@@ -369,9 +345,7 @@ def _is_meaningless_output(text: str) -> bool:
         return False
     # 纯英文/拉丁字符: 单个单词 (无空格) 且 ≤4 字符 → 噪点
     # 真实语音至少是短语 (含空格) 或较长单词
-    if " " not in stripped and len(letters) <= 4:
-        return True
-    return False
+    return bool(" " not in stripped and len(letters) <= 4)
 
 
 class SherpaOnnxAsr:
@@ -528,12 +502,10 @@ class SherpaOnnxAsr:
         samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         if samples.size == 0:
             return None
-        # 离线模型 (SenseVoice): 识别前裁剪尾部静音 + BGM 预判
-        # BGM 预判: 游戏实况中纯 BGM/音效段能量平稳, 识别只会产生噪点, 直接跳过
+        # Upstream VAD may already remove quiet gaps, so a steady signal can be
+        # valid speech. Decode every chunk and filter meaningless text below.
         if self._is_offline:
             samples = _trim_trailing_silence(samples, 16000)
-            if _is_likely_bgm(samples, 16000):
-                return None
         stream = recognizer.create_stream()
         stream.accept_waveform(16000, samples)
 
@@ -593,9 +565,7 @@ class SherpaOnnxAsr:
         if ok:
             logger.info(f"sherpa-onnx ASR 已就绪 ({lang_key}={model_id})")
         else:
-            logger.warning(
-                f"sherpa-onnx ASR ({lang_key}) 不可用，该语言将无法识别"
-            )
+            logger.warning(f"sherpa-onnx ASR ({lang_key}) 不可用，该语言将无法识别")
 
     def _load_lang(self, lang_key: str) -> bool:
         try:
@@ -623,16 +593,12 @@ class SherpaOnnxAsr:
                 return True
             corrupt = exc is not None and _is_corrupt_model_error(exc)
             if attempt == 0 and corrupt and self._auto_download:
-                logger.warning(
-                    f"sherpa-onnx 模型疑似损坏 ({lang_key}): {exc}；将重新下载"
-                )
+                logger.warning(f"sherpa-onnx 模型疑似损坏 ({lang_key}): {exc}；将重新下载")
                 _purge_model_files(info, cache_dir)
                 if not self._download_model(info, cache_dir):
                     return False
                 continue
-            logger.warning(
-                f"sherpa-onnx Recognizer 初始化失败 ({lang_key}): {exc}"
-            )
+            logger.warning(f"sherpa-onnx Recognizer 初始化失败 ({lang_key}): {exc}")
             return False
         return False
 
@@ -657,13 +623,12 @@ class SherpaOnnxAsr:
                     model=str(cache_dir / files["model"]),
                     tokens=str(cache_dir / files["tokens"]),
                     num_threads=1,
-                    use_itn=True,           # 逆文本正则化 (数字/日期)
-                    language="auto",         # 自动语言识别
+                    use_itn=True,  # 逆文本正则化 (数字/日期)
+                    language="auto",  # 自动语言识别
                     provider=provider,
                 )
                 logger.info(
-                    f"sherpa-onnx ASR (offline) provider={provider} "
-                    f"kind=sense_voice ({lang_key})"
+                    f"sherpa-onnx ASR (offline) provider={provider} kind=sense_voice ({lang_key})"
                 )
             except Exception as exc:
                 return False, exc
@@ -746,9 +711,7 @@ class SherpaOnnxAsr:
             logger.warning("用户选择了 CUDA 但 onnxruntime 无 CUDA provider，回退 CPU")
         return "cpu"
 
-    def _ensure_files(
-        self, info: dict[str, Any], cache_dir: Path
-    ) -> bool:
+    def _ensure_files(self, info: dict[str, Any], cache_dir: Path) -> bool:
         if self._files_ready(info, cache_dir):
             return True
         if not self._auto_download:
@@ -764,16 +727,15 @@ class SherpaOnnxAsr:
         if not cache_dir.is_dir():
             return False
         mins = _MIN_FILE_BYTES.get(cache_dir.name, {})
+        hashes = _FILE_SHA256.get(cache_dir.name, {})
         for fname in info["files"].values():
             path = cache_dir / fname
             min_bytes = mins.get(fname, 1)
-            if not _file_ok(path, min_bytes=min_bytes):
+            if not _file_ok(path, min_bytes=min_bytes, expected_sha256=hashes.get(fname)):
                 return False
         return True
 
-    def _download_model(
-        self, info: dict[str, Any], cache_dir: Path
-    ) -> bool:
+    def _download_model(self, info: dict[str, Any], cache_dir: Path) -> bool:
         from src.utils.proxy_env import prepare_model_download_env, without_proxy
 
         prepare_model_download_env()
@@ -781,23 +743,28 @@ class SherpaOnnxAsr:
         repo = info["repo"]
         files = info["files"]
         mins = _MIN_FILE_BYTES.get(cache_dir.name, {})
+        hashes = _FILE_SHA256.get(cache_dir.name, {})
 
         with without_proxy():
             for role, fname in files.items():
                 target = cache_dir / fname
                 min_bytes = mins.get(fname, 1)
-                if _file_ok(target, min_bytes=min_bytes):
+                expected_sha256 = hashes.get(fname)
+                if _file_ok(target, min_bytes=min_bytes, expected_sha256=expected_sha256):
                     continue
                 if target.exists():
-                    try:
+                    with suppress(OSError):
                         target.unlink()
-                    except OSError:
-                        pass
                 last_exc: Exception | None = None
                 for url in _hf_urls(repo, fname):
                     try:
                         logger.info(f"正在下载本地 ASR: {url}")
-                        self._download_url(url, target, min_bytes=min_bytes)
+                        self._download_url(
+                            url,
+                            target,
+                            min_bytes=min_bytes,
+                            expected_sha256=expected_sha256,
+                        )
                         last_exc = None
                         break
                     except Exception as exc:
@@ -819,14 +786,18 @@ class SherpaOnnxAsr:
         return True
 
     @staticmethod
-    def _download_url(url: str, target: Path, *, min_bytes: int = 1) -> None:
+    def _download_url(
+        url: str,
+        target: Path,
+        *,
+        min_bytes: int = 1,
+        expected_sha256: str | None = None,
+    ) -> None:
         """流式下载并校验 Content-Length / 最小体积 / ONNX 头."""
         tmp = target.with_suffix(target.suffix + ".part")
         if tmp.exists():
-            try:
+            with suppress(OSError):
                 tmp.unlink()
-            except OSError:
-                pass
         req = Request(url, headers={"User-Agent": "translator-intime/1.0"})
         with urlopen(req, timeout=120) as resp:
             expected = resp.headers.get("Content-Length")
@@ -841,15 +812,11 @@ class SherpaOnnxAsr:
                     written += len(chunk)
         if expected_n is not None and written != expected_n:
             tmp.unlink(missing_ok=True)
-            raise URLError(
-                f"下载长度不匹配: got={written} expected={expected_n}"
-            )
-        if not _file_ok(tmp, min_bytes=min_bytes):
+            raise URLError(f"下载长度不匹配: got={written} expected={expected_n}")
+        if not _file_ok(tmp, min_bytes=min_bytes, expected_sha256=expected_sha256):
             size = tmp.stat().st_size if tmp.exists() else 0
             tmp.unlink(missing_ok=True)
-            raise URLError(
-                f"下载文件校验失败: size={size} min={min_bytes} path={tmp.name}"
-            )
+            raise URLError(f"下载文件校验失败: size={size} min={min_bytes} path={tmp.name}")
         tmp.replace(target)
 
 

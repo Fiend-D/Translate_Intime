@@ -116,9 +116,7 @@ class OfflineModelDialog(QDialog):
         ram = format_ram_label(opt.ram_mb).replace("~", "")
         # quality field may be "良好，…"; show first clause for the stats line
         quality_short = opt.quality.split("，", 1)[0].strip() or opt.quality
-        stats = QLabel(
-            f"下载约 {opt.download_mb}MB · 运行约 {ram} 内存 · 质量：{quality_short}"
-        )
+        stats = QLabel(f"下载约 {opt.download_mb}MB · 运行约 {ram} 内存 · 质量：{quality_short}")
         stats.setWordWrap(True)
         stats.setObjectName("fieldLabel")
         stats.setContentsMargins(24, 0, 0, 0)

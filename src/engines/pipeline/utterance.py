@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -38,6 +39,7 @@ class UtteranceBuffer:
         self._quiet_samples = max(64, int(quiet_ms * self._sample_rate / 1000.0))
         self._tail_rms_threshold = float(tail_rms_threshold)
         self._buf = bytearray()
+        self._lock = threading.RLock()
         self.last_push_at: float = 0.0
 
     def _duration_ms(self) -> float:
@@ -58,45 +60,51 @@ class UtteranceBuffer:
     def push(self, pcm: bytes) -> None:
         if not pcm:
             return
-        self._buf.extend(pcm)
-        self.last_push_at = time.monotonic()
+        with self._lock:
+            self._buf.extend(pcm)
+            self.last_push_at = time.monotonic()
 
     def mark_capture_active(self) -> None:
         """Keep a buffered utterance alive while PCM is temporarily held upstream."""
-        if self._buf:
-            self.last_push_at = time.monotonic()
+        with self._lock:
+            if self._buf:
+                self.last_push_at = time.monotonic()
 
     def poll(self) -> bytes | None:
-        if not self._buf:
+        with self._lock:
+            if not self._buf:
+                return None
+            duration = self._duration_ms()
+            # Hard cap — always flush when we hit the absolute ceiling.
+            if duration >= self._max_ms:
+                return self.flush()
+            if self.last_push_at <= 0:
+                return None
+            gap_ms = (time.monotonic() - self.last_push_at) * 1000.0
+            # Push-gap silence (VAD has stopped delivering data).
+            if gap_ms >= self._end_silence_ms and duration >= self._min_ms:
+                return self.flush()
+            # Continuous audio path (e.g. game soundtrack with background music).
+            # Require a longer quiet window (soft_split_quiet_ms) so we do not
+            # cut mid-phrase on brief dips in game audio.
+            if (
+                duration >= self._soft_split_ms
+                and duration >= self._min_ms
+                and self._quiet_window_rms() < self._tail_rms_threshold
+            ):
+                return self.flush()
             return None
-        duration = self._duration_ms()
-        # Hard cap — always flush when we hit the absolute ceiling.
-        if duration >= self._max_ms:
-            return self.flush()
-        if self.last_push_at <= 0:
-            return None
-        gap_ms = (time.monotonic() - self.last_push_at) * 1000.0
-        # Push-gap silence (VAD has stopped delivering data).
-        if gap_ms >= self._end_silence_ms and duration >= self._min_ms:
-            return self.flush()
-        # Continuous audio path (e.g. game soundtrack with background music).
-        # Require a longer quiet window (soft_split_quiet_ms) so we do not
-        # cut mid-phrase on brief dips in game audio.
-        if (
-            duration >= self._soft_split_ms
-            and duration >= self._min_ms
-            and self._quiet_window_rms() < self._tail_rms_threshold
-        ):
-            return self.flush()
-        return None
 
     def flush(self) -> bytes | None:
-        if not self._buf:
-            return None
-        out = bytes(self._buf)
-        self._buf.clear()
-        return out
+        with self._lock:
+            if not self._buf:
+                return None
+            out = bytes(self._buf)
+            self._buf.clear()
+            self.last_push_at = 0.0
+            return out
 
     def clear(self) -> None:
-        self._buf.clear()
-        self.last_push_at = 0.0
+        with self._lock:
+            self._buf.clear()
+            self.last_push_at = 0.0

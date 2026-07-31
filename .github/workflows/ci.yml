@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    env:
+      QT_QPA_PLATFORM: offscreen
+      UV_FROZEN: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.17"
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Linux audio libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev ffmpeg
+
+      - name: Verify dependency lock
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: |
+          uv run ruff check src tests build.py
+          uv run ruff format --check src tests build.py
+
+      - name: Mypy
+        run: uv run mypy src
+
+      - name: Tests
+        run: uv run pytest -q
+
+      - name: Build Windows executable
+        if: runner.os == 'Windows'
+        run: uv run python build.py --clean
+
+      - name: Smoke test Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath .\dist\SoundFerry.exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($process.HasExited) {
+            throw "SoundFerry.exe exited during startup with code $($process.ExitCode)"
+          }
+          Stop-Process -Id $process.Id -Force
+
+      - name: Upload Windows executable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SoundFerry-windows
+          path: |
+            dist/SoundFerry.exe
+            dist/SoundFerry.exe.sha256
+          if-no-files-found: error

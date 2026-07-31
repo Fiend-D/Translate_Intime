@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
-from pathlib import Path
+from collections.abc import Coroutine
+from typing import Any
 
 import httpx
 
@@ -33,9 +33,7 @@ async def translate_text(text: str, source: str, target: str) -> str:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
-        translated = (
-            (data.get("responseData") or {}).get("translatedText") or ""
-        ).strip()
+        translated = ((data.get("responseData") or {}).get("translatedText") or "").strip()
         if not translated:
             raise RuntimeError(data.get("responseDetails") or "empty translation")
         return translated
@@ -44,20 +42,22 @@ async def translate_text(text: str, source: str, target: str) -> str:
         raise RuntimeError(f"文本翻译失败: {exc}") from exc
 
 
-async def synthesize_edge_tts(text: str, language: str) -> Path:
-    """Synthesize speech with edge-tts; returns path to a temp mp3 (caller must keep/delete)."""
+async def synthesize_edge_tts(text: str, language: str) -> bytes:
+    """Synthesize speech with edge-tts and keep the MP3 entirely in memory."""
     try:
         import edge_tts
     except ImportError as exc:
         raise RuntimeError("未安装 edge-tts，请执行: pip install edge-tts") from exc
 
     voice = _EDGE_VOICES.get(language, _EDGE_VOICES["en"])
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    tmp_path = Path(tmp.name)
-    tmp.close()
     communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(str(tmp_path))
-    return tmp_path
+    audio = bytearray()
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            audio.extend(chunk.get("data", b""))
+    if not audio:
+        raise RuntimeError("Edge TTS 未返回音频数据")
+    return bytes(audio)
 
 
 async def translate_and_synthesize(
@@ -65,16 +65,16 @@ async def translate_and_synthesize(
     *,
     source: str,
     target: str,
-) -> tuple[str, Path | None]:
-    """Translate then synthesize. Returns (translated_text, mp3_path|None)."""
+) -> tuple[str, bytes | None]:
+    """Translate then synthesize. Returns translated text and in-memory MP3 bytes."""
     translated = await translate_text(text, source, target)
     if not translated:
         return "", None
-    path = await synthesize_edge_tts(translated, target)
-    return translated, path
+    audio = await synthesize_edge_tts(translated, target)
+    return translated, audio
 
 
-def run_async(coro):
+def run_async[T](coro: Coroutine[Any, Any, T]) -> T:
     """Run coroutine from sync Qt code."""
     try:
         asyncio.get_running_loop()
@@ -82,4 +82,5 @@ def run_async(coro):
         return asyncio.run(coro)
     # Already inside a loop — run in a fresh loop via asyncio.run is unsafe;
     # callers should offload to a worker thread that calls asyncio.run.
-    return asyncio.run(coro)
+    coro.close()
+    raise RuntimeError("run_async cannot be called from a thread with a running event loop")

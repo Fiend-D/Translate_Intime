@@ -34,9 +34,7 @@ def test_nllb_lang_code_mapping() -> None:
 
 
 def test_nllb_model_slug() -> None:
-    assert model_slug("JustFrederik/nllb-200-distilled-600M-ct2-int8").startswith(
-        "nllb-200"
-    )
+    assert model_slug("JustFrederik/nllb-200-distilled-600M-ct2-int8").startswith("nllb-200")
     assert "/" not in model_slug(DEFAULT_NLLB_MODEL)
 
 

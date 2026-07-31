@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -27,7 +28,8 @@ _EDGE_VOICES = {
 
 
 class TtsBackend(Protocol):
-    configured: bool
+    @property
+    def configured(self) -> bool: ...
 
     def start(self) -> None: ...
 
@@ -73,7 +75,7 @@ class EdgePcmTts:
 
     def __init__(self) -> None:
         self._started = False
-        self._edge_tts = None
+        self._edge_tts: Any | None = None
         self._last_err_at = 0.0
         try:
             import edge_tts
@@ -102,15 +104,15 @@ class EdgePcmTts:
         text = (text or "").strip()
         if not text or not self._started or self._edge_tts is None:
             return None
+        edge_tts_module = self._edge_tts
         voice = _EDGE_VOICES.get((language or "en")[:2].lower(), _EDGE_VOICES["en"])
         tmp_path: Path | None = None
         try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-            tmp_path = Path(tmp.name)
-            tmp.close()
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
 
             async def _run() -> None:
-                communicate = self._edge_tts.Communicate(text, voice)
+                communicate = edge_tts_module.Communicate(text, voice)
                 await communicate.save(str(tmp_path))
 
             asyncio.run(_run())
@@ -123,10 +125,8 @@ class EdgePcmTts:
             return None
         finally:
             if tmp_path is not None:
-                try:
+                with suppress(Exception):
                     tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
 
     @staticmethod
     def _mp3_to_pcm16(path: Path) -> bytes | None:
@@ -182,9 +182,8 @@ class Pyttsx3Tts:
             return None
         tmp_path: Path | None = None
         try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp_path = Path(tmp.name)
-            tmp.close()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
             self._engine.save_to_file(text, str(tmp_path))
             self._engine.runAndWait()
             import soundfile as sf
@@ -202,10 +201,8 @@ class Pyttsx3Tts:
             return None
         finally:
             if tmp_path is not None:
-                try:
+                with suppress(Exception):
                     tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
 
 
 class AutoTts:
@@ -237,11 +234,7 @@ class AutoTts:
             return self._kokoro.configured
         if self._prefer == "edge":
             return self._edge.configured
-        return (
-            self._kokoro.configured
-            or self._edge.configured
-            or self._pyttsx3.configured
-        )
+        return self._kokoro.configured or self._edge.configured or self._pyttsx3.configured
 
     @property
     def warming_up(self) -> bool:

@@ -44,9 +44,7 @@ _ERR_NO_LIVECAPTIONS = (
     "Windows Live Captions 不可用：仅支持 Windows 11 22H2+，"
     "需安装 uiautomation (pip install uiautomation) 并开启系统实时字幕功能"
 )
-_WARN_LC_FALLBACK = (
-    "Live Captions 仅支持 Windows；已自动切换为本地 ASR（faster-whisper / sherpa）"
-)
+_WARN_LC_FALLBACK = "Live Captions 仅支持 Windows；已自动切换为本地 ASR（faster-whisper / sherpa）"
 _ERR_LOG_INTERVAL = 5.0
 _DIAG_LOG_INTERVAL = 5.0
 _MT_LOADING_STATUS = "本地翻译模型加载中"
@@ -91,6 +89,13 @@ class _PendingText:
     created_at: float
     pcm: bytes
     chunk_count: int
+
+
+@dataclass
+class _TtsJob:
+    direction: Direction
+    text: str
+    language: str
 
 
 def resolve_dashscope_api_key(config: AppConfigModel) -> str:
@@ -228,9 +233,7 @@ def _apply_glossary(text: str, glossary: dict[str, str]) -> str:
     return out
 
 
-def _protect_glossary(
-    text: str, glossary: dict[str, str]
-) -> tuple[str, list[tuple[str, str]]]:
+def _protect_glossary(text: str, glossary: dict[str, str]) -> tuple[str, list[tuple[str, str]]]:
     """Replace glossary keys in source with placeholders before MT.
 
     Returns ``(protected_text, [(placeholder, target_value), ...])``.
@@ -277,9 +280,7 @@ class EconomyPipelineEngine:
         self._lc_fallback = False
         if asr is None and mt is None and tts is None:
             resolved = resolve_economy_asr_backend(config)
-            self._lc_fallback = (
-                raw_pref == "live_captions" and resolved == "local"
-            )
+            self._lc_fallback = raw_pref == "live_captions" and resolved == "local"
             asr, mt, tts = build_economy_backends(config)
         self._asr: AsrBackend = asr or UnconfiguredAsr()
         self._mt: MtBackend = mt or UnconfiguredMt()
@@ -294,15 +295,9 @@ class EconomyPipelineEngine:
         soft_split_quiet_ms = int(
             getattr(config, "economy_utterance_soft_split_quiet_ms", 280) or 280
         )
-        tail_rms_threshold = float(
-            getattr(config, "economy_utterance_tail_rms", 0.003) or 0.003
-        )
-        self._sentence_min_chars = int(
-            getattr(config, "economy_sentence_min_chars", 4) or 4
-        )
-        self._sentence_pause_ms = int(
-            getattr(config, "economy_sentence_pause_ms", 900) or 900
-        )
+        tail_rms_threshold = float(getattr(config, "economy_utterance_tail_rms", 0.003) or 0.003)
+        self._sentence_min_chars = int(getattr(config, "economy_sentence_min_chars", 4) or 4)
+        self._sentence_pause_ms = int(getattr(config, "economy_sentence_pause_ms", 900) or 900)
         self._sentence_max_wait_ms = int(
             getattr(config, "economy_sentence_max_wait_ms", 2800) or 2800
         )
@@ -326,13 +321,17 @@ class EconomyPipelineEngine:
         }
         # Bound work-in-flight so slow local inference cannot grow latency/memory forever.
         self._queue: queue.Queue[_Job | None] = queue.Queue(maxsize=8)
+        self._tts_queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=8)
+        self._deferred_asr_jobs: dict[Direction, _Job] = {}
         self._pending_text: dict[Direction, _PendingText] = {}
         self._asr_audio_tail: dict[Direction, bytes] = {
             Direction.OUTBOUND: b"",
             Direction.INBOUND: b"",
         }
         self._worker: threading.Thread | None = None
+        self._tts_worker: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._tts_stop_event = threading.Event()
         self._last_err_at = 0.0
         self._last_diag_at = 0.0
         self._backends_started = False
@@ -374,6 +373,17 @@ class EconomyPipelineEngine:
             daemon=True,
         )
         self._worker.start()
+
+    def _ensure_tts_worker(self) -> None:
+        if self._tts_worker is not None and self._tts_worker.is_alive():
+            return
+        self._tts_stop_event.clear()
+        self._tts_worker = threading.Thread(
+            target=self._tts_worker_loop,
+            name="economy-tts-worker",
+            daemon=True,
+        )
+        self._tts_worker.start()
 
     def _ensure_backends(self) -> None:
         if self._backends_started:
@@ -458,12 +468,15 @@ class EconomyPipelineEngine:
         # Keep already-recognized text for the worker to translate after the
         # channel stops. Dropping it here loses the last sentence whenever the
         # user stops during the short sentence-stability window.
+        buf = self._buffers.get(direction)
+        if buf is not None:
+            chunk = buf.flush()
+            if chunk:
+                self._log_flush(direction, chunk)
+                self._enqueue(direction, chunk)
         self._asr_audio_tail[direction] = b""
         self._active.discard(direction)
         self._play_voice.pop(direction, None)
-        buf = self._buffers.get(direction)
-        if buf is not None:
-            buf.clear()
         # Keep loaded local models resident. ``close()`` still releases them on
         # app exit or an explicit model/backend change.
 
@@ -506,8 +519,7 @@ class EconomyPipelineEngine:
     def _log_flush(self, direction: Direction, pcm: bytes) -> None:
         pcm_ms = len(pcm) / 2.0 / 16000.0 * 1000.0
         self._rate_limited_diag(
-            f"经济模式 utterance 已切分 {direction.value} "
-            f"bytes={len(pcm)} ms={pcm_ms:.0f}"
+            f"经济模式 utterance 已切分 {direction.value} bytes={len(pcm)} ms={pcm_ms:.0f}"
         )
 
     def _poll_active_buffers(self) -> None:
@@ -521,8 +533,34 @@ class EconomyPipelineEngine:
                 self._log_flush(direction, chunk)
                 self._enqueue(direction, chunk)
 
+    def _defer_asr_job(self, job: _Job) -> None:
+        """Retain captured audio until a warming local ASR becomes ready."""
+        previous = self._deferred_asr_jobs.get(job.direction)
+        pcm = (previous.pcm if previous is not None else b"") + job.pcm
+        self._deferred_asr_jobs[job.direction] = _Job(
+            direction=job.direction,
+            pcm=pcm[-_FINAL_ASR_MAX_BYTES:],
+            source_lang=job.source_lang,
+            target_lang=job.target_lang,
+            play_voice=job.play_voice,
+        )
+
+    def _retry_deferred_asr_jobs(self) -> None:
+        if not self._deferred_asr_jobs or getattr(self._asr, "warming_up", False):
+            return
+        if not getattr(self._asr, "configured", False):
+            unavailable = self._asr_unavailable_message()
+            if unavailable:
+                self._rate_limited_error(unavailable)
+                self._deferred_asr_jobs.clear()
+            return
+        for direction, job in list(self._deferred_asr_jobs.items()):
+            self._deferred_asr_jobs.pop(direction, None)
+            self._process_job(job)
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
+            self._retry_deferred_asr_jobs()
             self._poll_active_buffers()
             self._flush_stable_text()
             try:
@@ -530,14 +568,61 @@ class EconomyPipelineEngine:
             except queue.Empty:
                 continue
             if job is None:
+                self._queue.task_done()
                 break
             try:
                 self._process_job(job)
             except Exception as exc:
+                if self._stop_event.is_set():
+                    continue
                 self._rate_limited_error(f"经济模式处理失败: {exc}")
                 logger.exception("Economy job failed")
             finally:
                 self._queue.task_done()
+
+    def _enqueue_tts(self, direction: Direction, text: str, language: str) -> None:
+        self._ensure_tts_worker()
+        job = _TtsJob(direction=direction, text=text, language=language)
+        try:
+            self._tts_queue.put_nowait(job)
+        except queue.Full:
+            with suppress(queue.Empty):
+                self._tts_queue.get_nowait()
+                self._tts_queue.task_done()
+            with suppress(queue.Full):
+                self._tts_queue.put_nowait(job)
+            self._rate_limited_error("经济模式语音队列已满，丢弃一条过期播报")
+
+    def _tts_worker_loop(self) -> None:
+        while not self._tts_stop_event.is_set():
+            try:
+                job = self._tts_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if job is None:
+                self._tts_queue.task_done()
+                break
+            try:
+                while getattr(self._tts, "warming_up", False) and not self._tts_stop_event.wait(
+                    0.1
+                ):
+                    pass
+                if self._tts_stop_event.is_set():
+                    continue
+                pcm = self._tts.synthesize(job.text, language=job.language)
+                if self._tts_stop_event.is_set():
+                    continue
+                if pcm:
+                    self._callbacks.on_audio(job.direction, pcm)
+                elif getattr(self._tts, "warming_up", False):
+                    self._callbacks.on_status("正在下载 Kokoro…")
+                else:
+                    self._rate_limited_error("经济模式 TTS 失败（无音频）")
+            except Exception as exc:
+                self._rate_limited_error(f"经济模式 TTS 失败: {exc}")
+                logger.exception("Economy TTS job failed")
+            finally:
+                self._tts_queue.task_done()
 
     @staticmethod
     def _join_recognized_text(previous: str, current: str) -> str:
@@ -608,9 +693,7 @@ class EconomyPipelineEngine:
             play_voice=job.play_voice,
             updated_at=time.monotonic(),
             created_at=pending.created_at if pending is not None else time.monotonic(),
-            pcm=((pending.pcm if pending is not None else b"") + job.pcm)[
-                -_FINAL_ASR_MAX_BYTES:
-            ],
+            pcm=((pending.pcm if pending is not None else b"") + job.pcm)[-_FINAL_ASR_MAX_BYTES:],
             chunk_count=(pending.chunk_count + 1 if pending is not None else 1),
         )
         # Show recognition immediately, but do not translate an unstable phrase.
@@ -620,6 +703,8 @@ class EconomyPipelineEngine:
         now = time.monotonic()
         base_pause_s = self._sentence_pause_ms / 1000.0
         for direction, pending in list(self._pending_text.items()):
+            if getattr(self._mt, "warming_up", False):
+                continue
             terminal = pending.text.rstrip().endswith(("。", "！", "？", ".", "!", "?"))
             if terminal:
                 pause_s = min(base_pause_s, 0.35)
@@ -630,9 +715,7 @@ class EconomyPipelineEngine:
                 pause_s = max(base_pause_s, 2.4)
             else:
                 pause_s = base_pause_s
-            max_wait_reached = (
-                now - pending.created_at >= self._sentence_max_wait_ms / 1000.0
-            )
+            max_wait_reached = now - pending.created_at >= self._sentence_max_wait_ms / 1000.0
             # Inbound ASR normally produces one hypothesis per ~2 s audio
             # block. Two blocks provide enough sentence context; translate at
             # once instead of spending another full pause window waiting for a
@@ -654,15 +737,18 @@ class EconomyPipelineEngine:
             ):
                 continue
             self._pending_text.pop(direction, None)
+            # The overlap tail only belongs to the pending utterance. Keeping
+            # it after commit makes the next sentence start with old speech.
+            self._asr_audio_tail[direction] = b""
             self._translate_stable_text(direction, pending)
 
-    def _translate_stable_text(
-        self, direction: Direction, pending: _PendingText
-    ) -> None:
+    def _translate_stable_text(self, direction: Direction, pending: _PendingText) -> None:
         final_text = self._asr.recognize(
             pending.pcm + _FINAL_ASR_SILENCE,
             language=pending.source_lang,
         )
+        if self._stop_event.is_set():
+            return
         if final_text:
             final_text = final_text.strip()
             provisional_len = len("".join(ch for ch in pending.text if ch.isalnum()))
@@ -675,15 +761,12 @@ class EconomyPipelineEngine:
                 if changed:
                     self._callbacks.on_source_text(direction, final_text, False)
 
-        sentences = split_sentences(
-            pending.text, min_chars=self._sentence_min_chars
-        )
+        sentences = split_sentences(pending.text, min_chars=self._sentence_min_chars)
         if not sentences:
             self._callbacks.on_source_text(direction, "", True)
             return
 
         any_ok = False
-        any_audio = False
         for sentence in sentences:
             self._callbacks.on_source_text(direction, sentence, False)
             translated = self._translate_sentence(
@@ -691,6 +774,8 @@ class EconomyPipelineEngine:
                 source_lang=pending.source_lang,
                 target_lang=pending.target_lang,
             )
+            if self._stop_event.is_set():
+                return
             if not translated:
                 if getattr(self._mt, "warming_up", False):
                     self._callbacks.on_status(_MT_LOADING_STATUS)
@@ -707,30 +792,17 @@ class EconomyPipelineEngine:
             self._callbacks.on_translated_text(direction, translated, True)
             if pending.play_voice:
                 tts_text = ensure_terminal_punct(translated)
-                pcm = self._tts.synthesize(tts_text, language=pending.target_lang)
-                if pcm:
-                    any_audio = True
-                    self._callbacks.on_audio(direction, pcm)
-                elif getattr(self._tts, "warming_up", False):
-                    self._callbacks.on_status("正在下载 Kokoro…")
+                self._enqueue_tts(direction, tts_text, pending.target_lang)
 
         if not any_ok:
             self._rate_limited_error("经济模式翻译失败（MT 无结果）")
-        elif (
-            pending.play_voice
-            and not any_audio
-            and not getattr(self._tts, "warming_up", False)
-        ):
-            self._rate_limited_error("经济模式 TTS 失败（无音频）")
 
     def _translate_sentence(
         self, sentence: str, *, source_lang: str, target_lang: str
     ) -> str | None:
         glossary = dict(getattr(self._config, "glossary", None) or {})
         protected, restores = _protect_glossary(sentence, glossary)
-        translated = self._mt.translate(
-            protected, source_lang=source_lang, target_lang=target_lang
-        )
+        translated = self._mt.translate(protected, source_lang=source_lang, target_lang=target_lang)
         if not translated:
             return None
         translated = _restore_glossary(translated.strip(), restores)
@@ -755,6 +827,10 @@ class EconomyPipelineEngine:
         return None
 
     def _process_job(self, job: _Job) -> None:
+        if not getattr(self._asr, "configured", False) and getattr(self._asr, "warming_up", False):
+            self._defer_asr_job(job)
+            self._rate_limited_diag("ASR 加载中，已保留音频等待识别")
+            return
         pcm_ms = len(job.pcm) / 2.0 / 16000.0 * 1000.0
         t0 = time.perf_counter()
         self._rate_limited_diag(
@@ -767,23 +843,23 @@ class EconomyPipelineEngine:
         asr_pcm = overlap + job.pcm
         self._asr_audio_tail[job.direction] = asr_pcm[-_ASR_OVERLAP_BYTES:]
         text = self._asr.recognize(asr_pcm, language=job.source_lang)
+        if self._stop_event.is_set():
+            return
         t_asr = (time.perf_counter() - t_asr_s) * 1000.0
         if not text:
             unavailable = self._asr_unavailable_message()
             if unavailable:
                 self._rate_limited_error(unavailable)
             elif getattr(self._asr, "warming_up", False):
-                self._rate_limited_diag("ASR 加载中，暂无识别结果")
+                self._asr_audio_tail[job.direction] = overlap
+                self._defer_asr_job(job)
+                self._rate_limited_diag("ASR 加载中，已保留音频等待识别")
             else:
-                self._rate_limited_diag(
-                    f"ASR 无结果 {job.direction.value} pcm_ms={pcm_ms:.0f}"
-                )
+                self._rate_limited_diag(f"ASR 无结果 {job.direction.value} pcm_ms={pcm_ms:.0f}")
             return
         text = text.strip()
         if not text:
-            self._rate_limited_diag(
-                f"ASR 无结果 {job.direction.value} pcm_ms={pcm_ms:.0f}"
-            )
+            self._rate_limited_diag(f"ASR 无结果 {job.direction.value} pcm_ms={pcm_ms:.0f}")
             return
 
         self._buffer_recognized_text(job, text)
@@ -825,8 +901,27 @@ class EconomyPipelineEngine:
         worker = self._worker
         if worker is not None and worker.is_alive():
             worker.join(timeout=2.0)
-        self._worker = None
+        if worker is None or not worker.is_alive():
+            self._worker = None
         self._drain_queue()
+
+    def _stop_tts_worker(self) -> None:
+        self._tts_stop_event.set()
+        with suppress(Exception):
+            self._tts_queue.put_nowait(None)
+        worker = self._tts_worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)
+        if worker is None or not worker.is_alive():
+            self._tts_worker = None
+        while True:
+            try:
+                self._tts_queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                with suppress(Exception):
+                    self._tts_queue.task_done()
 
     def _stop_backends(self) -> None:
         if not self._backends_started:
@@ -847,4 +942,7 @@ class EconomyPipelineEngine:
         for buf in self._buffers.values():
             buf.clear()
         self._stop_worker()
+        self._stop_tts_worker()
+        self._deferred_asr_jobs.clear()
+        self._pending_text.clear()
         self._stop_backends()

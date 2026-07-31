@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import override
+from typing import cast, override
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QKeyEvent, QKeySequence
-from PyQt6.QtWidgets import QLineEdit
+from PyQt6.QtGui import QFocusEvent, QKeyEvent, QKeySequence
+from PyQt6.QtWidgets import QLineEdit, QWidget
 
 from src.utils.hotkeys import combo_to_display, normalize_combo
 
@@ -35,7 +35,7 @@ for _i in range(1, 25):
 class HotkeyEdit(QLineEdit):
     """Click then press a combo; Esc clears; Backspace clears."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._combo = ""
         self.setReadOnly(True)
@@ -93,7 +93,7 @@ class HotkeyEdit(QLineEdit):
             parts.append(chr(ord("0") + (key - Qt.Key.Key_0)))
         else:
             # Fallback via QKeySequence
-            seq = QKeySequence(int(mods) | key).toString(
+            seq = QKeySequence(cast(int, mods.value) | key).toString(
                 QKeySequence.SequenceFormat.PortableText
             )
             token = seq.split("+")[-1].strip().lower() if seq else ""
@@ -112,11 +112,11 @@ class HotkeyEdit(QLineEdit):
         event.accept()
 
     @override
-    def focusInEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+    def focusInEvent(self, event: QFocusEvent | None) -> None:
         super().focusInEvent(event)
         self.setPlaceholderText("按下组合键… Esc 清空")
 
     @override
-    def focusOutEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+    def focusOutEvent(self, event: QFocusEvent | None) -> None:
         super().focusOutEvent(event)
         self.setPlaceholderText("点击后按下快捷键（Esc 清空）")

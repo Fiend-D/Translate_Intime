@@ -15,11 +15,11 @@ from src.utils.logger import logger
 # 数值越小越灵敏（更容易判定为语音）
 _SENS_THRESHOLDS = {
     "very_loose": 0.0015,  # -66 dBFS：几乎最灵敏，适用于安静环境 / 低音量麦克风
-    "loose": 0.0025,       # -60 dBFS：宽松
-    "low": 0.005,          # -56 dBFS
-    "medium": 0.008,       # -58 dBFS
-    "high": 0.014,         # -57 dBFS
-    "strict": 0.025,       # -32 dBFS
+    "loose": 0.0025,  # -60 dBFS：宽松
+    "low": 0.005,  # -56 dBFS
+    "medium": 0.008,  # -58 dBFS
+    "high": 0.014,  # -57 dBFS
+    "strict": 0.025,  # -32 dBFS
 }
 
 _SILERO_THRESHOLDS = {
@@ -79,9 +79,7 @@ class SpeechGate:
         self._open_ms = open_ms
         self._hangover_ms = hangover_ms
         self._threshold = _SENS_THRESHOLDS.get(sensitivity, _SENS_THRESHOLDS["medium"])
-        self._silero_threshold = _SILERO_THRESHOLDS.get(
-            sensitivity, _SILERO_THRESHOLDS["medium"]
-        )
+        self._silero_threshold = _SILERO_THRESHOLDS.get(sensitivity, _SILERO_THRESHOLDS["medium"])
         self._silero = silero_engine
         self._silero_warned = False
         self._silero_buffer = bytearray()
@@ -104,11 +102,7 @@ class SpeechGate:
             return GateResult(False)
         self._maybe_promote_silero()
         was_open = self._is_open
-        passed = (
-            self._process_silero(pcm)
-            if self._backend == "silero"
-            else self._process_rms(pcm)
-        )
+        passed = self._process_silero(pcm) if self._backend == "silero" else self._process_rms(pcm)
         opened_now = self._is_open and not was_open
         preroll = self._pre_roll.drain() if opened_now else b""
         self._pre_roll.push(pcm)

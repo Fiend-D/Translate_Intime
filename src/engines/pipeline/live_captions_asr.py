@@ -16,6 +16,7 @@ import queue
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from typing import Any
 
 from src.utils.logger import logger
@@ -41,11 +42,12 @@ _SW_MINIMIZE = 6
 def _is_windows_11() -> bool:
     """检测是否为 Windows 11 (22H2+)."""
     import sys
+
     if not sys.platform.startswith("win"):
         return False
     try:
         # Windows 11 build >= 22000
-        ver = sys.getwindowsversion()  # type: ignore[attr-defined]
+        ver = sys.getwindowsversion()
         return ver.build >= 22000
     except Exception:
         return False
@@ -56,7 +58,9 @@ def _is_livecaptions_running() -> bool:
     try:
         result = subprocess.run(
             ["tasklist", "/fi", "imagename eq LiveCaptions.exe", "/nh"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         return "LiveCaptions.exe" in result.stdout
     except Exception:
@@ -65,14 +69,12 @@ def _is_livecaptions_running() -> bool:
 
 def _kill_livecaptions() -> None:
     """终止已有 LiveCaptions 进程."""
-    try:
+    with suppress(Exception):
         subprocess.run(
             ["taskkill", "/f", "/im", "LiveCaptions.exe"],
             capture_output=True,
             timeout=5,
         )
-    except Exception:
-        pass
 
 
 def _hide_window(hwnd: int) -> None:
@@ -205,7 +207,7 @@ class LiveCaptionsAsr:
             # 首次读取: 将已有文本标记为已输出, 避免上一次会话的残留字幕被入队
             stale = self._read_captions()
             if stale:
-                for line in stale.split('\n'):
+                for line in stale.split("\n"):
                     t = line.strip()
                     if t:
                         self._emitted_lines.add(t)
@@ -221,6 +223,7 @@ class LiveCaptionsAsr:
                     elif text and self._pending_line:
                         # 文本未变但有 pending 行: 超时后输出一次
                         import time as _time
+
                         if _time.time() - self._pending_since > 5.0:
                             if self._pending_line not in self._emitted_lines:
                                 self._text_queue.put(self._pending_line)
@@ -251,9 +254,7 @@ class LiveCaptionsAsr:
         try:
             import uiautomation as ua
         except ImportError:
-            logger.warning(
-                "uiautomation 未安装，请执行: pip install uiautomation"
-            )
+            logger.warning("uiautomation 未安装，请执行: pip install uiautomation")
             return False
 
         # 检查 LiveCaptions 是否已在运行
@@ -375,8 +376,7 @@ class LiveCaptionsAsr:
                     if ready_ctrl.Exists(1, 0.2):
                         ready_name = ready_ctrl.Name or ""
                         logger.info(
-                            f"LiveCaptions 处于等待状态 ({ready_name}), "
-                            f"请播放音频以触发识别…"
+                            f"LiveCaptions 处于等待状态 ({ready_name}), 请播放音频以触发识别…"
                         )
                         ready_warned = True
                 except Exception:
@@ -475,7 +475,7 @@ class LiveCaptionsAsr:
 
         import time
 
-        lines = full_text.split('\n')
+        lines = full_text.split("\n")
 
         # ---- 完整行 (非最后一行): 最终版本, 逐行入队 ----
         for line in lines[:-1]:

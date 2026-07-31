@@ -12,8 +12,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-
-from src.utils.logger import logger
+from typing import Any
 
 _CACHE_TTL_SEC = 5.0
 _cuda_cache: tuple[bool, float] | None = None
@@ -145,9 +144,7 @@ class ResourceMonitor:
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(
-            target=self._loop, name="resource-monitor", daemon=True
-        )
+        self._thread = threading.Thread(target=self._loop, name="resource-monitor", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:

@@ -190,6 +190,4 @@ def format_kokoro_info(opt: OfflineModelOption | None = None) -> str:
     if item is None:
         return "语音：Kokoro（本地）"
     ram = format_ram_label(item.ram_mb)
-    return (
-        f"语音：{item.title} · 下载约 {item.download_mb}MB · 运行约 {ram.replace('~', '')} 内存"
-    )
+    return f"语音：{item.title} · 下载约 {item.download_mb}MB · 运行约 {ram.replace('~', '')} 内存"

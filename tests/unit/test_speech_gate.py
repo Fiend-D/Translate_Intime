@@ -67,4 +67,3 @@ def test_auto_backend_uses_rms_while_silero_loads() -> None:
     assert silero.started is True
     assert gate.backend == "rms"
     assert gate.accept(_pcm(3000)) is True
-

@@ -99,12 +99,13 @@ def is_vb_cable_input(name: Any, device_id: Any = None) -> bool:
     if re.search(r"cable\s*input|vb-audio.*input|translator_virtual_sink", text):
         return True
     # Voicemeeter: main VAIO Input, AUX Input, VAIO3 Input, In 1..5
-    if re.search(
-        r"voicemeeter\s+(aux\s+)?input\b|voicemeeter\s+vaio3\s+input|voicemeeter\s+in\s+\d",
-        text,
-    ):
-        return True
-    return False
+    return bool(
+        re.search(
+            r"voicemeeter\s+(aux\s+)?input\b|voicemeeter\s+vaio3\s+input|"
+            r"voicemeeter\s+in\s+\d",
+            text,
+        )
+    )
 
 
 def is_vb_cable_capture(name: Any, device_id: Any = None) -> bool:
@@ -117,9 +118,7 @@ def is_vb_cable_capture(name: Any, device_id: Any = None) -> bool:
     if re.search(r"cable\s*output|vb-audio.*output", text):
         return True
     # Voicemeeter Out A1..A5 / B1..B3 or Voicemeeter Out 1..8 (Point N)
-    if re.search(r"voicemeeter\s+out\b", text):
-        return True
-    return False
+    return bool(re.search(r"voicemeeter\s+out\b", text))
 
 
 def is_system_loopback_capture(name: Any, device_id: Any = None) -> bool:
@@ -129,9 +128,7 @@ def is_system_loopback_capture(name: Any, device_id: Any = None) -> bool:
         # exclude virtual sinks' monitors that are the cable path itself
         if is_vb_cable_input(name, device_id) or is_vb_cable_capture(name, device_id):
             return False
-        if "translator_virtual" in text and "monitor" in text:
-            return False
-        return True
+        return not ("translator_virtual" in text and "monitor" in text)
     return bool(
         re.search(r"wasapi_loopback:|wasapi_proc_exclude:|\[loopback\]|\.monitor\b", text)
         and not is_vb_cable_capture(name, device_id)
@@ -150,7 +147,9 @@ def _endpoint_key(name: Any, device_id: Any = None) -> str:
     text = re.sub(r"wasapi_loopback:", " ", text)
     text = re.sub(r"wasapi_proc_exclude:", " ", text)
     text = re.sub(r"\[(?:loopback|默认|推荐)[^\]]*\]", " ", text)
-    text = re.sub(r"\b(?:loopback|monitor|default|默认|系统声音|回采|免驱动|排除本应用)\b", " ", text)
+    text = re.sub(
+        r"\b(?:loopback|monitor|default|默认|系统声音|回采|免驱动|排除本应用)\b", " ", text
+    )
     text = re.sub(r"^(?:🔊|🎧|🔁)\s*", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -179,9 +178,12 @@ def shares_physical_output_path(
     lb_key = _endpoint_key(loopback_name, loopback_device)
     if not out_key or not lb_key:
         return False
-    if output_device is not None and loopback_device is not None:
-        if str(output_device) == str(loopback_device):
-            return True
+    if (
+        output_device is not None
+        and loopback_device is not None
+        and str(output_device) == str(loopback_device)
+    ):
+        return True
     return out_key in lb_key or lb_key in out_key
 
 
@@ -199,13 +201,11 @@ def shares_virtual_cable_path(
     )
     if out_is_vb and lb_is_vb:
         return True
-    if (
+    return bool(
         output_device is not None
         and loopback_device is not None
         and str(output_device) == str(loopback_device)
-    ):
-        return True
-    return False
+    )
 
 
 def find_preferred_vb_output(devices: list[dict[str, Any]]) -> Any | None:
@@ -239,7 +239,7 @@ def find_preferred_vb_output(devices: list[dict[str, Any]]) -> Any | None:
 
 
 def find_preferred_system_loopback(devices: list[dict[str, Any]]) -> Any | None:
-    """Prefer process-exclude, then real speaker loopback/monitor — never VB-Cable."""
+    """Prefer real speaker loopback/monitor and never VB-Cable or legacy fake IDs."""
     scored: list[tuple[int, Any]] = []
     for d in devices:
         name = str(d.get("name", ""))
@@ -248,8 +248,8 @@ def find_preferred_system_loopback(devices: list[dict[str, Any]]) -> Any | None:
             continue
         text = _blob(name, did)
         if "wasapi_proc_exclude:" in text:
-            scored.append((-1, did))
-        elif "wasapi_loopback:" in text or "[loopback]" in text:
+            continue
+        if "wasapi_loopback:" in text or "[loopback]" in text:
             scored.append((0, did))
         elif ".monitor" in text and "null" not in text:
             scored.append((1, did))
@@ -266,34 +266,14 @@ def resolve_capture_backend(
     devices: list[dict[str, Any]] | None = None,
 ) -> Any | None:
     """Pick loopback device id from capture_backend + optional configured id."""
-    from src.audio.wasapi_process_loopback import (
-        PROC_EXCLUDE_DEVICE_ID,
-        is_process_exclude_available,
-    )
-
-    if backend == "driverless" and IS_WINDOWS and is_process_exclude_available():
-        return PROC_EXCLUDE_DEVICE_ID
-
     if configured is not None and configured != "":
-        if backend == "loopback" and str(configured).startswith("wasapi_proc_exclude:"):
-            configured = None  # force classic preference below
+        if str(configured).startswith("wasapi_proc_exclude:"):
+            configured = None  # migrate the legacy fake process-exclude selection
         else:
             return configured
 
-    if backend in {"auto", "driverless"} and IS_WINDOWS and is_process_exclude_available():
-        return PROC_EXCLUDE_DEVICE_ID
-
     if devices is None:
         return None
-
-    if backend == "loopback":
-        # Skip process-exclude ids when user forced classic loopback
-        filtered = [
-            d
-            for d in devices
-            if "wasapi_proc_exclude:" not in _blob(d.get("name", ""), d.get("index", d.get("id")))
-        ]
-        return find_preferred_system_loopback(filtered)
 
     return find_preferred_system_loopback(devices)
 
@@ -364,41 +344,52 @@ def validate_channel_devices(
                     "麦克风选成了虚拟回环/系统回采，容易自反馈啸叫。请改选真实麦克风。",
                 )
             )
-        if play_mic_voice and is_vb_cable_input(output_name, output_device):
-            # Starting mic→cable while game is capturing the same virtual line
-            if game_channel_active and shares_virtual_cable_path(
+        # Starting mic→cable while game is capturing the same virtual line
+        if (
+            play_mic_voice
+            and is_vb_cable_input(output_name, output_device)
+            and game_channel_active
+            and shares_virtual_cable_path(
                 output_name=output_name,
                 output_device=output_device,
                 loopback_name=loopback_name,
                 loopback_device=loopback_device,
-            ):
-                issues.append(
-                    DeviceIssue(
-                        "error",
-                        "游戏字幕正在捕获虚拟声卡，与同传输出共用一条虚拟线，"
-                        "会把译文再识别成字幕。请把「游戏声音」改成系统扬声器 Loopback，"
-                        "或先停游戏字幕。",
-                    )
+            )
+        ):
+            issues.append(
+                DeviceIssue(
+                    "error",
+                    "游戏字幕正在捕获虚拟声卡，与同传输出共用一条虚拟线，"
+                    "会把译文再识别成字幕。请把「游戏声音」改成系统扬声器 Loopback，"
+                    "或先停游戏字幕。",
                 )
-        if output_device is not None and loopback_device is not None:
-            if str(output_device) == str(loopback_device):
-                issues.append(
-                    DeviceIssue(
-                        "error",
-                        "译文输出设备与游戏捕获源是同一设备，必现回灌。请分开选择。",
-                    )
+            )
+        if (
+            output_device is not None
+            and loopback_device is not None
+            and str(output_device) == str(loopback_device)
+        ):
+            issues.append(
+                DeviceIssue(
+                    "error",
+                    "译文输出设备与游戏捕获源是同一设备，必现回灌。请分开选择。",
                 )
-        if play_mic_voice and game_channel_active and shares_physical_output_path(
-            output_name=output_name,
-            output_device=output_device,
-            loopback_name=loopback_name,
-            loopback_device=loopback_device,
+            )
+        if (
+            play_mic_voice
+            and game_channel_active
+            and shares_physical_output_path(
+                output_name=output_name,
+                output_device=output_device,
+                loopback_name=loopback_name,
+                loopback_device=loopback_device,
+            )
         ):
             issues.append(
                 DeviceIssue(
                     "error",
                     "麦克风译文正在播到游戏字幕捕获的同一扬声器/耳机 Loopback，"
-                    "会被再次识别。请把游戏捕获改成「免驱动（排除本应用）」或分开输出设备。",
+                    "会被再次识别。请把译文输出到 CABLE Input / 另一设备。",
                 )
             )
         if (
@@ -413,7 +404,7 @@ def validate_channel_devices(
                     "error",
                     "已开启译文语音但输出设备为默认，同时游戏字幕使用经典 Loopback。"
                     "默认扬声器很可能被再次捕获。请明确选择 CABLE Input / 另一只设备，"
-                    "或把游戏捕获改为「免驱动（排除本应用）」。",
+                    "经典 Loopback 不能排除本应用。",
                 )
             )
         if IS_WINDOWS and output_device is None and play_mic_voice:
@@ -424,11 +415,7 @@ def validate_channel_devices(
                     "游戏麦克风选 CABLE Output。",
                 )
             )
-        elif (
-            play_mic_voice
-            and output_name
-            and not is_vb_cable_input(output_name, output_device)
-        ):
+        elif play_mic_voice and output_name and not is_vb_cable_input(output_name, output_device):
             issues.append(
                 DeviceIssue(
                     "info",
@@ -464,20 +451,19 @@ def validate_channel_devices(
                     )
                 )
         if (
-            (play_game_voice or (play_mic_voice and mic_channel_active))
-            and shares_physical_output_path(
-                output_name=output_name,
-                output_device=output_device,
-                loopback_name=loopback_name,
-                loopback_device=loopback_device,
-            )
+            play_game_voice or (play_mic_voice and mic_channel_active)
+        ) and shares_physical_output_path(
+            output_name=output_name,
+            output_device=output_device,
+            loopback_name=loopback_name,
+            loopback_device=loopback_device,
         ):
             issues.append(
                 DeviceIssue(
                     "error",
                     "语音/音乐输出与游戏字幕捕获共用同一扬声器/耳机 Loopback，"
-                    "会造成回灌或回声。Windows 请优先选「免驱动（排除本应用）」；"
-                    "经典 Loopback 时请把译文/音乐输出到 CABLE Input 或另一只设备。",
+                    "会造成回灌或回声。请把译文/音乐输出到 "
+                    "CABLE Input 或另一只设备。",
                 )
             )
         if (
@@ -490,7 +476,7 @@ def validate_channel_devices(
                 DeviceIssue(
                     "error",
                     "语音输出为默认设备，游戏字幕使用经典 Loopback，无法保证不会捕获本应用声音。"
-                    "请改用「免驱动（排除本应用）」或明确选择不被捕获的输出设备。",
+                    "请明确选择 CABLE Input / 另一个不被捕获的输出设备。",
                 )
             )
 

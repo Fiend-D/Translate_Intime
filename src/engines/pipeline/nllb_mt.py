@@ -9,15 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from src.utils.logger import logger
+from src.utils.resource_paths import model_resource_root
 
 DEFAULT_NLLB_MODEL = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
 TOKENIZER_ID = "facebook/nllb-200-distilled-600M"
-# 模型统一存放在项目内 resource/nllb/<model_slug>/ 下，便于随项目迁移与打包。
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-_CACHE_ROOT = _PROJECT_ROOT / "resource" / "nllb"
-_LICENSE_NOTE = (
-    "NLLB-200 许可证为 CC-BY-NC（非商业研究用途）。请仅在合规场景下使用。"
-)
+# Development uses project-local resources; packaged builds use a persistent cache.
+_CACHE_ROOT = model_resource_root() / "nllb"
+_LICENSE_NOTE = "NLLB-200 许可证为 CC-BY-NC（非商业研究用途）。请仅在合规场景下使用。"
 _LANG_MAP = {
     "zh": "zho_Hans",
     "en": "eng_Latn",
@@ -115,9 +113,7 @@ class NllbCt2Mt:
         )
         thread.start()
 
-    def translate(
-        self, text: str, *, source_lang: str, target_lang: str
-    ) -> str | None:
+    def translate(self, text: str, *, source_lang: str, target_lang: str) -> str | None:
         text = (text or "").strip()
         if not text or not self._started:
             return None
@@ -145,8 +141,7 @@ class NllbCt2Mt:
     ) -> list[str | None]:
         """Translate each sentence independently (better quality than one blob)."""
         return [
-            self.translate(s, source_lang=source_lang, target_lang=target_lang)
-            for s in sentences
+            self.translate(s, source_lang=source_lang, target_lang=target_lang) for s in sentences
         ]
 
     def _translate_locked(self, text: str, *, src_code: str, tgt_code: str) -> str | None:
@@ -215,9 +210,7 @@ class NllbCt2Mt:
         self._device = device
         self._compute_type = compute_type
         try:
-            translator, tokenizer = self._open_translator_and_tokenizer(
-                device, compute_type
-            )
+            translator, tokenizer = self._open_translator_and_tokenizer(device, compute_type)
         except Exception as exc:
             logger.warning(f"NLLB Translator/Tokenizer 初始化失败: {exc}")
             msg = str(exc).lower()
@@ -228,9 +221,7 @@ class NllbCt2Mt:
             if not self._download_model():
                 return False
             try:
-                translator, tokenizer = self._open_translator_and_tokenizer(
-                    device, compute_type
-                )
+                translator, tokenizer = self._open_translator_and_tokenizer(device, compute_type)
             except Exception as exc2:
                 logger.warning(f"NLLB Translator/Tokenizer 初始化失败: {exc2}")
                 return False
@@ -240,9 +231,7 @@ class NllbCt2Mt:
             self._tokenizer = tokenizer
         return True
 
-    def _open_translator_and_tokenizer(
-        self, device: str, compute_type: str
-    ) -> tuple[Any, Any]:
+    def _open_translator_and_tokenizer(self, device: str, compute_type: str) -> tuple[Any, Any]:
         import warnings
 
         import ctranslate2
@@ -330,9 +319,7 @@ class NllbCt2Mt:
         try:
             from huggingface_hub import snapshot_download
         except ImportError:
-            logger.warning(
-                "缺少 huggingface_hub，无法下载 NLLB；请 pip install huggingface_hub"
-            )
+            logger.warning("缺少 huggingface_hub，无法下载 NLLB；请 pip install huggingface_hub")
             return False
         import os
 
@@ -348,7 +335,7 @@ class NllbCt2Mt:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"正在下载 NLLB 模型 {self._model_id} → {self._cache_dir}")
 
-        def _try_download(repo_id: str, cache_dir) -> bool:
+        def _try_download(repo_id: str, cache_dir: Path) -> bool:
             with without_proxy():
                 snapshot_download(
                     repo_id=repo_id,

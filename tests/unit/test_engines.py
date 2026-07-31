@@ -61,7 +61,6 @@ def test_economy_start_send_stop_close(tmp_path):
     assert engine.active_directions == frozenset()
 
 
-
 def test_switch_volc_to_economy(tmp_path):
     config = AppConfigModel(
         log_dir=str(tmp_path / "logs"),
@@ -88,7 +87,6 @@ def test_switch_volc_to_economy(tmp_path):
     assert economy.engine_id == "economy"
     # DashScope SDK may be absent in CI; e2e covered in test_economy_backends.
     economy.close()
-
 
 
 def test_pipeline_mode_property(tmp_path):
@@ -185,21 +183,15 @@ def test_economy_asr_requires_dashscope_helper():
         resolve_economy_asr_backend,
     )
 
-    assert resolve_economy_asr_backend(
-        AppConfigModel(economy_asr_backend="local")
-    ) == "local"
-    assert economy_asr_requires_dashscope(
-        AppConfigModel(economy_asr_backend="local")
-    ) is False
-    assert economy_asr_requires_dashscope(
-        AppConfigModel(economy_asr_backend="live_captions")
-    ) is False
-    assert economy_asr_requires_dashscope(
-        AppConfigModel(economy_asr_backend="dashscope")
-    ) is True
-    assert resolve_economy_asr_backend(
-        AppConfigModel(economy_asr_backend="dashscope")
-    ) == "dashscope"
+    assert resolve_economy_asr_backend(AppConfigModel(economy_asr_backend="local")) == "local"
+    assert economy_asr_requires_dashscope(AppConfigModel(economy_asr_backend="local")) is False
+    assert (
+        economy_asr_requires_dashscope(AppConfigModel(economy_asr_backend="live_captions")) is False
+    )
+    assert economy_asr_requires_dashscope(AppConfigModel(economy_asr_backend="dashscope")) is True
+    assert (
+        resolve_economy_asr_backend(AppConfigModel(economy_asr_backend="dashscope")) == "dashscope"
+    )
 
 
 def test_non_windows_live_captions_resolves_to_local(monkeypatch):
@@ -241,7 +233,6 @@ def test_windows_live_captions_kept(monkeypatch):
     assert resolve_economy_asr_backend(cfg) == "live_captions"
     asr, _mt, _tts = build_economy_backends(cfg)
     assert isinstance(asr, LiveCaptionsAsr)
-
 
 
 def test_pipeline_wants_volc_false_in_economy(tmp_path):

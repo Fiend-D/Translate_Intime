@@ -27,7 +27,9 @@ DEFAULT_HOTKEYS: dict[str, str] = {
     "music_prev": "<ctrl>+<alt>+<page_up>",
     "music_next": "<ctrl>+<alt>+<page_down>",
     "music_toggle_sidebar": "<ctrl>+<alt>+b",
-    "dota_coach_ask": "<ctrl>+<alt>+c",
+    # Avoid Ctrl+Alt+C: Windows terminals may still treat it as Ctrl+C and
+    # interrupt a development launch even while the global hook receives it.
+    "dota_coach_ask": "<ctrl>+<alt>+k",
 }
 
 HOTKEY_LABELS: dict[str, str] = {
@@ -163,10 +165,7 @@ def _diagnose_pynput_error(exc: BaseException) -> str:
     if isinstance(exc, ModuleNotFoundError) or (
         isinstance(exc, ImportError) and "pynput" in lower and "no module" in lower
     ):
-        return (
-            f"当前解释器未安装 pynput（{py}）。"
-            f"请执行: {py} -m pip install pynput"
-        )
+        return f"当前解释器未安装 pynput（{py}）。请执行: {py} -m pip install pynput"
     if "display" in lower or "x connection" in lower or "not supported" in lower:
         return (
             "pynput 无法连接键盘后端（常见于 Wayland，或 DISPLAY 异常）。"

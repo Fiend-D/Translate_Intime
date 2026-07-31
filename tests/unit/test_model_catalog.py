@@ -64,9 +64,9 @@ def test_kokoro_info_line() -> None:
 
 
 def test_offline_model_dialog_default_selection() -> None:
-    from PyQt6.QtWidgets import QApplication
-
     import sys
+
+    from PyQt6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication(sys.argv)
     _ = app  # keep ref
@@ -76,9 +76,5 @@ def test_offline_model_dialog_default_selection() -> None:
     dlg = OfflineModelDialog()
     assert dlg.selected_nllb_model_id() == recommended_nllb_option().id
 
-    dlg2 = OfflineModelDialog(
-        current_model_id="mijuanlo/nllb-200-distilled-1.3B-int8-ct2"
-    )
-    assert dlg2.selected_nllb_model_id() == (
-        "mijuanlo/nllb-200-distilled-1.3B-int8-ct2"
-    )
+    dlg2 = OfflineModelDialog(current_model_id="mijuanlo/nllb-200-distilled-1.3B-int8-ct2")
+    assert dlg2.selected_nllb_model_id() == ("mijuanlo/nllb-200-distilled-1.3B-int8-ct2")

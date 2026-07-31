@@ -4,11 +4,12 @@ import contextlib
 import threading
 import time
 from collections.abc import Callable
-from queue import Queue
+from queue import Empty, Full, Queue
 from typing import Any
 
 import numpy as np
 
+from src.audio.pulse_env import temporary_pulse_sink
 from src.utils.audio_utils import (
     bytes_to_pcm16_array,
     enhance_clarity,
@@ -18,6 +19,7 @@ from src.utils.audio_utils import (
 from src.utils.logger import logger
 
 _TTS_SR = 16000
+_MAX_QUEUED_SEGMENTS = 4
 
 
 def _sounddevice() -> Any:
@@ -32,12 +34,14 @@ class AudioPlayer:
 
     def __init__(self, device_id: int | str | None = None) -> None:
         self.device_id = device_id
-        self._queue: Queue[bytes] = Queue()
+        self._queue: Queue[bytes] = Queue(maxsize=_MAX_QUEUED_SEGMENTS)
         self._running = False
         self._thread: threading.Thread | None = None
         self._stream: Any | None = None
         self._stream_key: tuple[object, int, int] | None = None
         self._stream_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._active_segment = False
         self._device_sr = _TTS_SR
         self._device_ch = 2
         self._device_name: str = ""
@@ -70,10 +74,7 @@ class AudioPlayer:
             if api_name in ("MME", "Windows DirectSound") and ch > 2:
                 wasapi_dev = self._find_wasapi_device(name)
                 if wasapi_dev is not None:
-                    logger.info(
-                        f"设备升级: [{dev}] {api_name} {ch}ch → "
-                        f"[{wasapi_dev}] WASAPI 2ch"
-                    )
+                    logger.info(f"设备升级: [{dev}] {api_name} {ch}ch → [{wasapi_dev}] WASAPI 2ch")
                     self.device_id = wasapi_dev
                     dev = wasapi_dev
                     info = sd.query_devices(dev)
@@ -156,18 +157,25 @@ class AudioPlayer:
 
     def clear_queue(self) -> None:
         """Drop pending playback and close the active stream best-effort."""
-        while not self._queue.empty():
-            data = self._queue.get()
+        while True:
+            try:
+                data = self._queue.get_nowait()
+            except Empty:
+                break
             secure_clear(bytearray(data))
         self._close_stream()
 
     @property
     def is_playing(self) -> bool:
-        """True if there's pending audio in queue or an active stream."""
+        """True while a segment is queued or being written to the device.
+
+        PortAudio streams stay active while idle so they can be reused. Stream
+        activity therefore cannot represent audible playback.
+        """
         if not self._queue.empty():
             return True
-        with self._stream_lock:
-            return self._stream is not None and self._stream.active
+        with self._state_lock:
+            return self._active_segment
 
     @property
     def queue_size(self) -> int:
@@ -176,8 +184,22 @@ class AudioPlayer:
 
     def play(self, pcm16_bytes: bytes) -> None:
         """Enqueue PCM16 mono audio for playback."""
-        if pcm16_bytes:
-            self._queue.put(pcm16_bytes)
+        if not pcm16_bytes:
+            return
+        try:
+            self._queue.put_nowait(pcm16_bytes)
+            return
+        except Full:
+            pass
+        try:
+            stale = self._queue.get_nowait()
+            secure_clear(bytearray(stale))
+        except Empty:
+            pass
+        try:
+            self._queue.put_nowait(pcm16_bytes)
+        except Full:
+            logger.warning("TTS playback queue remained full; dropping newest segment")
 
     def _playback_loop(self) -> None:
         while self._running or not self._queue.empty():
@@ -186,11 +208,15 @@ class AudioPlayer:
             except Exception:
                 continue
             t0 = time.time()
+            with self._state_lock:
+                self._active_segment = True
             try:
                 self._play_immediate(data)
             except Exception as exc:
                 logger.error(f"Audio playback error: {exc}")
             finally:
+                with self._state_lock:
+                    self._active_segment = False
                 # 通知外部该段真实播放耗时（覆盖段间开销/重采样延迟）
                 if self.on_segment_finished is not None:
                     with contextlib.suppress(Exception):
@@ -242,12 +268,7 @@ class AudioPlayer:
 
     def _resolve_device(self) -> int | None:
         device = self.device_id
-        if isinstance(device, str):
-            import os
-
-            os.environ["PULSE_SINK"] = device
-            return None
-        return device
+        return None if isinstance(device, str) else device
 
     def _ensure_stream_locked(self) -> Any:
         sd = _sounddevice()
@@ -256,12 +277,14 @@ class AudioPlayer:
         if self._stream is not None and self._stream_key == key and self._stream.active:
             return self._stream
         self._close_stream_locked()
-        self._stream = sd.OutputStream(
-            samplerate=self._device_sr,
-            channels=self._device_ch,
-            dtype="float32",
-            device=device,
-        )
+        pulse_sink = self.device_id if isinstance(self.device_id, str) else None
+        with temporary_pulse_sink(pulse_sink):
+            self._stream = sd.OutputStream(
+                samplerate=self._device_sr,
+                channels=self._device_ch,
+                dtype="float32",
+                device=device,
+            )
         self._stream.start()
         self._stream_key = key
         logger.info(

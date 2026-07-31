@@ -52,4 +52,3 @@ _PRESETS: dict[str, QualityPresetParams] = {
 def apply_quality_preset(name: str) -> QualityPresetParams:
     """Return preset parameters; unknown names fall back to balanced."""
     return _PRESETS.get((name or "balanced").strip().lower(), _PRESETS["balanced"])
-

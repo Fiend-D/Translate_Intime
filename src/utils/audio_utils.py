@@ -16,7 +16,7 @@ def float32_to_pcm16(audio: np.ndarray) -> bytes:
     """Convert normalized float32 array to 16-bit signed PCM bytes."""
     clipped = np.clip(audio, -1.0, 1.0)
     pcm = (clipped * 32767.0).astype(np.int16)
-    return pcm.tobytes()
+    return bytes(pcm.tobytes())
 
 
 def resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -30,7 +30,7 @@ def resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     down = orig_sr // g
     from scipy.signal import resample_poly
 
-    return resample_poly(audio, up, down).astype(np.float32)
+    return np.asarray(resample_poly(audio, up, down), dtype=np.float32)
 
 
 def enhance_clarity(
@@ -90,9 +90,7 @@ def enhance_clarity(
             from scipy.signal import butter, sosfiltfilt
 
             # 使用零相位滤波 (filtfilt)：前向+后向各一次，无相位偏移，无振铃
-            sos = butter(
-                2, cutoff / nyq, btype="high", output="sos"
-            )
+            sos = butter(2, cutoff / nyq, btype="high", output="sos")
             high = sosfiltfilt(sos, out.astype(np.float64)).astype(np.float32)
             additive_gain = 10.0 ** (presence_db / 20.0) - 1.0
             out = out + high * additive_gain
@@ -100,7 +98,7 @@ def enhance_clarity(
             pass
 
     # --- Step 4: Soft limit ---
-    out = np.tanh(out * 1.05) / 1.05
+    out = np.asarray(np.tanh(out * 1.05) / 1.05, dtype=np.float32)
 
     return out.astype(np.float32)
 

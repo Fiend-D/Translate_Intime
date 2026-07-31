@@ -85,9 +85,7 @@ class CorpusDialog(QDialog):
             return
 
         existing_hw = {
-            line.strip()
-            for line in self._txt_hot.toPlainText().splitlines()
-            if line.strip()
+            line.strip() for line in self._txt_hot.toPlainText().splitlines() if line.strip()
         }
         for w in hw:
             if w not in existing_hw:
@@ -97,9 +95,7 @@ class CorpusDialog(QDialog):
         existing_gl = self._parse_glossary_text(self._txt_gloss.toPlainText())
         existing_gl.update(gl)
         self._txt_gloss.setPlainText("\n".join(f"{k}={v}" for k, v in existing_gl.items()))
-        QMessageBox.information(
-            self, "导入完成", f"已追加热词 {len(hw)} / 术语 {len(gl)}"
-        )
+        QMessageBox.information(self, "导入完成", f"已追加热词 {len(hw)} / 术语 {len(gl)}")
 
     @staticmethod
     def _parse_glossary_text(text: str) -> dict[str, str]:

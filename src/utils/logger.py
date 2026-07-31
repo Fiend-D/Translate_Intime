@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,12 +51,30 @@ def _is_placeholder(text: str) -> bool:
 class SubtitleLogger:
     """Writes finalized subtitle entries to a plain-text log (session + daily archive)."""
 
-    def __init__(self, log_dir: Path) -> None:
+    def __init__(
+        self,
+        log_dir: Path,
+        *,
+        enabled: bool = True,
+        retention_days: int = 30,
+    ) -> None:
         self.log_dir = log_dir.expanduser()
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.enabled = enabled
+        self.retention_days = max(1, retention_days)
+        if self.enabled:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self._new_session_path()
         self._bytes_written = 0
         self._session_started = False
+        if self.enabled:
+            self._cleanup_expired()
+
+    def _cleanup_expired(self) -> None:
+        cutoff = time.time() - self.retention_days * 86400
+        for path in list_subtitle_logs(self.log_dir):
+            with contextlib.suppress(OSError):
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
 
     def _new_session_path(self) -> Path:
         # Local time in filename is easier to browse on disk
@@ -70,7 +90,8 @@ class SubtitleLogger:
         self.log_path = self._new_session_path()
         self._bytes_written = 0
         self._session_started = True
-        self._write_header(self.log_path)
+        if self.enabled:
+            self._write_header(self.log_path)
         return self.log_path
 
     def _ensure_session(self) -> None:
@@ -100,13 +121,12 @@ class SubtitleLogger:
         original = entry.original_text.replace("\n", " ")
         translated = entry.translated_text.replace("\n", " ")
         direction = entry.direction.value.upper()
-        return (
-            f"[{ts}] {direction} | "
-            f"ORIGINAL: {original} | TRANSLATED: {translated}\n"
-        )
+        return f"[{ts}] {direction} | ORIGINAL: {original} | TRANSLATED: {translated}\n"
 
     def log(self, entry: SubtitleEntry) -> None:
         """Append a subtitle entry to the session file and daily archive."""
+        if not self.enabled:
+            return
         if not entry.is_final:
             return
         if _is_placeholder(entry.original_text) and _is_placeholder(entry.translated_text):
@@ -125,6 +145,8 @@ class SubtitleLogger:
 
     def log_typed(self, original: str, translated: str) -> None:
         """Record a typed-translate turn into the same archives."""
+        if not self.enabled:
+            return
         orig = (original or "").strip()
         trans = (translated or "").strip()
         if not orig and not trans:

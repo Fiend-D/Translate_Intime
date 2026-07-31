@@ -20,7 +20,7 @@ class HotkeyConfig(BaseModel):
     music_prev: str = "<ctrl>+<alt>+<page_up>"
     music_next: str = "<ctrl>+<alt>+<page_down>"
     music_toggle_sidebar: str = "<ctrl>+<alt>+b"
-    dota_coach_ask: str = "<ctrl>+<alt>+c"
+    dota_coach_ask: str = "<ctrl>+<alt>+k"
 
 
 class AppConfigModel(BaseModel):
@@ -32,9 +32,9 @@ class AppConfigModel(BaseModel):
     subtitle_opacity: float = Field(default=0.88, ge=0.3, le=1.0)
     log_dir: str = "logs"
     debug_mode: bool = False
-    subtitle_window_positions: dict[str, tuple[int, int, int, int]] = Field(
-        default_factory=dict
-    )
+    transcript_logging_enabled: bool = True
+    transcript_retention_days: int = Field(default=30, ge=1, le=3650)
+    subtitle_window_positions: dict[str, tuple[int, int, int, int]] = Field(default_factory=dict)
 
     enable_mic: bool = True
     enable_game: bool = True
@@ -60,9 +60,9 @@ class AppConfigModel(BaseModel):
     # Economy mode (Fun-ASR + NLLB local MT + Kokoro TTS)
     economy_dashscope_api_key: str = ""
     # UI combo uses dashscope / local / live_captions; sherpa|whisper are aliases of local.
-    economy_asr_backend: Literal[
-        "dashscope", "local", "live_captions", "sherpa", "whisper"
-    ] = "live_captions"
+    economy_asr_backend: Literal["dashscope", "local", "live_captions", "sherpa", "whisper"] = (
+        "live_captions"
+    )
     economy_asr_model: str = "fun-asr-realtime"  # DashScope model (dashscope backend)
     economy_asr_local_model: str = "faster-whisper-medium"
     economy_mt_backend: Literal["auto", "nllb", "argos", "mymemory"] = "nllb"

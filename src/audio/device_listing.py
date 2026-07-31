@@ -14,7 +14,6 @@ from typing import Any
 
 import sounddevice as sd
 
-
 _PREFERRED_HOSTAPI_ORDER = (
     "Windows WASAPI",
     "Windows DirectSound",

@@ -41,7 +41,7 @@ class VirtualAudioDevice:
         return True  # VB-Cable 安装后自动可用
 
     @staticmethod
-    def _run(*args, check: bool = False) -> subprocess.CompletedProcess:
+    def _run(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
         """安全运行命令，pactl 不存在时不崩溃"""
         try:
             return subprocess.run(args, capture_output=True, text=True, check=check)

@@ -57,4 +57,3 @@ class AudioPreRoll:
     @property
     def size_bytes(self) -> int:
         return self._size
-

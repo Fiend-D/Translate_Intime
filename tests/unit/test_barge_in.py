@@ -96,3 +96,14 @@ def test_feedback_buffer_limit_flushes_all_audio_instead_of_dropping(tmp_path) -
     assert player.cleared is True
     assert engine.sent == [first + second]
     assert pipeline._feedback_buffer_bytes[Direction.OUTBOUND] == 0
+
+
+def test_finished_tts_segment_does_not_count_played_duration_twice(tmp_path, monkeypatch) -> None:
+    pipeline = TranslationPipeline(AppConfigModel(log_dir=str(tmp_path / "logs")))
+    pipeline._player = _FakePlayer()
+    now = 100.0
+    monkeypatch.setattr("src.core.pipeline.time.time", lambda: now)
+
+    pipeline._on_tts_segment_finished(played_sec=3.0)
+
+    assert pipeline._tts_playing_until == now + pipeline._tts_silence_margin_sec

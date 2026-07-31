@@ -1,211 +1,239 @@
 #!/usr/bin/env python3
-"""PyInstaller 打包脚本 - 将 声渡 SoundFerry 打包为单文件 EXE。
+"""Build the Windows SoundFerry executable with PyInstaller.
 
-用法:
-    python build.py            # 打包到 dist/
-    python build.py --clean    # 清理后重新打包
-    python build.py --debug    # 打包调试版（含控制台窗口）
-
-前置条件:
-    pip install pyinstaller
+Typical usage:
+    python build.py --clean
+    python build.py --clean --debug
+    python build.py --clean --install-deps
+    python build.py --dry-run
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DIST = ROOT / "dist"
-BUILD = ROOT / "build"
-SPEC = ROOT / "SoundFerry.spec"
+DIST_DIR = ROOT / "dist"
+BUILD_DIR = ROOT / "build" / "pyinstaller"
+SPEC_DIR = BUILD_DIR / "spec"
+WORK_DIR = BUILD_DIR / "work"
+ENTRYPOINT = ROOT / "run.py"
+APP_NAME = "SoundFerry"
+
+DATA_DIRS = ("assets", "config", "hotwords")
+COLLECT_ALL_PACKAGES = (
+    "espeakng_loader",
+    "faster_whisper",
+    "kokoro_onnx",
+    "sherpa_onnx",
+)
+COLLECT_BINARY_PACKAGES = ("ctranslate2",)
+COPY_METADATA_PACKAGES = ("faster-whisper", "kokoro-onnx")
+HIDDEN_IMPORTS = (
+    "audioop",
+    "dashscope.audio.asr",
+    "google.protobuf",
+    "keyring.backends.Windows",
+    "pyaudio",
+    "pycaw.pycaw",
+    "pynput.keyboard._win32",
+    "pynput.mouse._win32",
+    "scipy.signal",
+    "sentencepiece",
+    "sounddevice",
+    "soundfile",
+    "tokenizers",
+    "transformers.models.nllb.tokenization_nllb",
+    "uiautomation",
+    "yaml",
+)
+EXCLUDED_MODULES = ("jax", "matplotlib", "tensorflow", "torch")
 
 
-def run(cmd: list[str]) -> None:
-    print(f"> {' '.join(cmd)}")
-    subprocess.check_call(cmd)
+def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
+    print(">", subprocess.list2cmdline(command), flush=True)
+    subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
-def clean() -> None:
-    for d in (DIST, BUILD):
-        if d.exists():
-            print(f"清理 {d}")
-            shutil.rmtree(d)
-    if SPEC.exists():
-        SPEC.unlink()
+def _venv_python() -> Path:
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    name = "python.exe" if os.name == "nt" else "python"
+    return ROOT / ".venv" / scripts / name
 
 
-def build_exe(debug: bool = False) -> None:
-    hidden_imports = [
-        "PyQt6",
-        "PyQt6.QtCore",
-        "PyQt6.QtGui",
-        "PyQt6.QtWidgets",
-        "pyaudio",
-        "sounddevice",
-        "soundfile",
-        "numpy",
-        "scipy",
-        "scipy.signal",
-        "pydantic",
-        "loguru",
-        "httpx",
-        "aiohttp",
-        "protobuf",
-        "keyring",
-        "pynput",
-        "pynput.keyboard",
-        "pynput.keyboard._win32",
-        "pynput.mouse",
-        "pynput.mouse._win32",
-        "yaml",
-        "soundcard",
-        "dotenv",
-        "websockets",
-        "edge_tts",
-        "dashscope",
-        "dashscope.audio.asr",
-        "comtypes",
-        "pycaw",
-        "pycaw.pycaw",
-        "audioop",
-        # 项目内部模块
-        "src.core.speech_gate",
-        "src.core.usage_tracker",
-        "src.core.audio_capture",
-        "src.core.audio_player",
-        "src.core.exceptions",
-        "src.core.pipeline",
-        "src.core.volc_engine",
-        "src.core.dota_coach",
-        "src.core.music_share",
-        "src.core.typed_translate",
-        "src.engines",
-        "src.engines.base",
-        "src.engines.factory",
-        "src.engines.volc",
-        "src.engines.volc.engine",
-        "src.engines.pipeline",
-        "src.engines.pipeline.engine",
-        "src.engines.pipeline.asr",
-        "src.engines.pipeline.mt",
-        "src.engines.pipeline.tts",
-        "src.engines.pipeline.nllb_mt",
-        "src.engines.pipeline.kokoro_tts",
-        "src.engines.pipeline.sherpa_asr",
-        "src.engines.pipeline.model_catalog",
-        "src.engines.pipeline.utterance",
-        "src.core.silero_vad",
-        "src.core.quality_presets",
-        "src.utils.device_utils",
-        "src.core.audio_pre_roll",
-        "src.audio.stream",
-        "src.audio.device_guard",
-        "src.audio.session_ducker",
-        "src.audio.wasapi_process_loopback",
-        "src.audio.virtual_device",
-        "src.gui.main_window",
-        "src.gui.subtitle_overlay",
-        "src.gui.subtitle_buffer",
-        "src.gui.styles",
-        "src.gui.hotkey_dialog",
-        "src.gui.hotkey_edit",
-        "src.gui.device_labels",
-        "src.gui.corpus_dialog",
-        "src.gui.music_sidebar",
-        "src.gui.toast",
-        "src.gui.typed_dialog",
-        "src.gui.offline_model_dialog",
-        "src.models",
-        "src.models.config",
-        "src.models.enums",
-        "src.models.internal",
-        "src.models.session",
-        "src.models.subtitle",
-        "src.utils.logger",
-        "src.utils.config_manager",
-        "src.utils.hotkeys",
-        "src.utils.proxy_env",
-        "src.utils.audio_utils",
-        "src.utils.hotword_files",
-        # protobuf 生成代码
-        "python_protogen",
-        "python_protogen.common.events_pb2",
-        "python_protogen.common.events_pb2_grpc",
-        "python_protogen.common.rpcmeta_pb2",
-        "python_protogen.common.rpcmeta_pb2_grpc",
-        "python_protogen.products.understanding.ast.ast_service_pb2",
-        "python_protogen.products.understanding.ast.ast_service_pb2_grpc",
-        "python_protogen.products.understanding.base.au_base_pb2",
-        "python_protogen.products.understanding.base.au_base_pb2_grpc",
-    ]
+def reexec_with_project_venv() -> None:
+    """Always build with the project environment when it exists."""
+    target = _venv_python()
+    if not target.is_file():
+        return
+    try:
+        already_using_venv = Path(sys.executable).resolve() == target.resolve()
+    except OSError:
+        return
+    if already_using_venv or os.environ.get("SOUNDFERRY_BUILD_BOOTSTRAPPED") == "1":
+        return
+    env = os.environ.copy()
+    env["SOUNDFERRY_BUILD_BOOTSTRAPPED"] = "1"
+    os.execve(str(target), [str(target), str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
-    datas = [
-        # (源路径, 目标目录)
-        ("python_protogen", "python_protogen"),
-        ("config", "config"),
-        ("assets", "assets"),
-        ("hotwords", "hotwords"),
-    ]
 
-    # 检查 specs 目录是否存在
-    specs_dir = ROOT / "specs"
-    if specs_dir.exists():
-        datas.append(("specs", "specs"))
+def module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
 
-    # EXE 文件图标（资源管理器显示）
-    icon_path = ROOT / "assets" / "app_icon.ico"
 
-    cmd = [
-        sys.executable, "-m", "PyInstaller",
+def install_dependencies() -> None:
+    """Install the exact locked runtime and build dependencies."""
+    lockfile = ROOT / "uv.lock"
+    if not lockfile.is_file():
+        raise RuntimeError("Missing uv.lock; run `uv lock` and commit it before building")
+    uv = shutil.which("uv")
+    if not uv:
+        raise RuntimeError(
+            "uv is required for reproducible builds. Install it from https://docs.astral.sh/uv/"
+        )
+    run([uv, "sync", "--frozen", "--group", "dev", "--active"])
+
+
+def validate_environment(*, allow_missing_pyinstaller: bool = False) -> None:
+    if os.name != "nt":
+        raise RuntimeError("EXE builds must run on Windows")
+    if not ENTRYPOINT.is_file():
+        raise RuntimeError(f"Missing entry point: {ENTRYPOINT}")
+    if not allow_missing_pyinstaller and not module_available("PyInstaller"):
+        raise RuntimeError(
+            "PyInstaller is not installed. Run build_exe.bat or "
+            "python build.py --install-deps --clean"
+        )
+
+
+def clean_outputs() -> None:
+    for path in (DIST_DIR, BUILD_DIR):
+        if path.exists():
+            print(f"Removing {path}")
+            shutil.rmtree(path)
+
+
+def _add_data(command: list[str], source: Path, destination: str) -> None:
+    if source.exists():
+        command.extend(["--add-data", f"{source}{os.pathsep}{destination}"])
+
+
+def build_command(*, debug: bool, clean: bool) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "PyInstaller",
         "--noconfirm",
-        "--name", "SoundFerry",
-        # 单文件模式
+        "--name",
+        APP_NAME,
         "--onefile",
-        # 入口
-        str(ROOT / "run.py"),
+        "--console" if debug else "--windowed",
+        "--distpath",
+        str(DIST_DIR),
+        "--workpath",
+        str(WORK_DIR),
+        "--specpath",
+        str(SPEC_DIR),
+        "--paths",
+        str(ROOT),
     ]
+    if clean:
+        command.append("--clean")
 
-    if icon_path.exists():
-        cmd.extend(["--icon", str(icon_path)])
+    icon = ROOT / "assets" / "app_icon.ico"
+    if icon.is_file():
+        command.extend(["--icon", str(icon)])
 
-    if not debug:
-        cmd.append("--windowed")  # 无控制台窗口
-    else:
-        cmd.append("--console")   # 保留控制台用于调试
+    for name in DATA_DIRS:
+        _add_data(command, ROOT / name, name)
 
-    for imp in hidden_imports:
-        cmd.extend(["--hidden-import", imp])
+    # Bundle only the small VAD model. ASR/MT model caches can exceed 3 GB and
+    # remain persistent outside the one-file extraction directory at runtime.
+    vad_model = ROOT / "resource" / "vad" / "silero_vad.onnx"
+    _add_data(command, vad_model, "resource/vad")
 
-    for src, dst in datas:
-        src_path = ROOT / src
-        if src_path.exists():
-            cmd.extend(["--add-data", f"{src};{dst}"])
+    command.extend(["--collect-submodules", "src"])
+    command.extend(["--collect-submodules", "python_protogen"])
+    for package in COLLECT_ALL_PACKAGES:
+        if module_available(package):
+            command.extend(["--collect-all", package])
+    for package in COLLECT_BINARY_PACKAGES:
+        if module_available(package):
+            command.extend(["--collect-binaries", package])
+    for distribution in COPY_METADATA_PACKAGES:
+        command.extend(["--copy-metadata", distribution])
+    for module in HIDDEN_IMPORTS:
+        if module_available(module.split(".", 1)[0]):
+            command.extend(["--hidden-import", module])
+    for module in EXCLUDED_MODULES:
+        command.extend(["--exclude-module", module])
 
-    run(cmd)
-    print(f"\n打包完成: {DIST / 'SoundFerry.exe'}")
+    command.append(str(ENTRYPOINT))
+    return command
+
+
+def write_checksum(executable: Path) -> Path:
+    digest = hashlib.sha256()
+    with executable.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    checksum = executable.with_suffix(executable.suffix + ".sha256")
+    checksum.write_text(f"{digest.hexdigest()}  {executable.name}\n", encoding="ascii")
+    return checksum
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build SoundFerry.exe with PyInstaller")
+    parser.add_argument("--clean", action="store_true", help="remove old build outputs first")
+    parser.add_argument("--debug", action="store_true", help="keep a console window for logs")
+    parser.add_argument(
+        "--install-deps",
+        action="store_true",
+        help="sync the exact versions from uv.lock before building",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the PyInstaller command without changing files",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="打包 声渡 SoundFerry 为 EXE")
-    parser.add_argument("--clean", action="store_true", help="清理旧构建后重新打包")
-    parser.add_argument("--debug", action="store_true", help="打包调试版（保留控制台窗口）")
-    args = parser.parse_args()
+    reexec_with_project_venv()
+    args = parse_args()
+    if args.install_deps and not args.dry_run:
+        install_dependencies()
+    validate_environment(allow_missing_pyinstaller=args.dry_run)
+
+    command = build_command(debug=args.debug, clean=args.clean)
+    if args.dry_run:
+        print(subprocess.list2cmdline(command))
+        return 0
 
     if args.clean:
-        clean()
+        clean_outputs()
+    SPEC_DIR.mkdir(parents=True, exist_ok=True)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    run(command)
 
-    # 确保 PyInstaller 已安装
-    try:
-        import PyInstaller  # noqa: F401
-    except ImportError:
-        print("PyInstaller 未安装，正在安装...")
-        run([sys.executable, "-m", "pip", "install", "pyinstaller"])
-
-    build_exe(debug=args.debug)
+    executable = DIST_DIR / f"{APP_NAME}.exe"
+    if not executable.is_file():
+        raise RuntimeError(f"PyInstaller completed but did not create {executable}")
+    checksum = write_checksum(executable)
+    size_mb = executable.stat().st_size / (1024 * 1024)
+    print(f"\nBuild complete: {executable} ({size_mb:.1f} MB)")
+    print(f"SHA-256:       {checksum}")
     return 0
 
 

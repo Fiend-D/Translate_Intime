@@ -14,6 +14,7 @@ from urllib.request import urlretrieve
 import numpy as np
 
 from src.utils.logger import logger
+from src.utils.resource_paths import bundled_path, model_resource_root
 
 SILERO_VAD_URLS = [
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
@@ -21,8 +22,11 @@ SILERO_VAD_URLS = [
     "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
 ]
 SILERO_VAD_URL = SILERO_VAD_URLS[0]
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL_PATH = _PROJECT_ROOT / "resource" / "vad" / "silero_vad.onnx"
+_BUNDLED_MODEL_PATH = bundled_path("resource", "vad", "silero_vad.onnx")
+_PERSISTENT_MODEL_PATH = model_resource_root() / "vad" / "silero_vad.onnx"
+DEFAULT_MODEL_PATH = (
+    _BUNDLED_MODEL_PATH if _BUNDLED_MODEL_PATH.is_file() else _PERSISTENT_MODEL_PATH
+)
 
 
 class SileroVadEngine:
@@ -166,4 +170,3 @@ class SileroVadEngine:
             elif len(outputs) >= 3:
                 self._h = np.asarray(outputs[1], dtype=np.float32)
                 self._c = np.asarray(outputs[2], dtype=np.float32)
-

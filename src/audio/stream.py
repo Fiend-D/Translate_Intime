@@ -5,16 +5,20 @@
 import contextlib
 import platform
 import subprocess
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
 
+from src.audio.pulse_env import temporary_pulse_sink
 from src.utils.logger import logger
 
 IS_WINDOWS = platform.system() == "Windows"
 WASAPI_LOOPBACK_PREFIX = "wasapi_loopback:"
 WASAPI_PROC_EXCLUDE_PREFIX = "wasapi_proc_exclude:"
 PROC_EXCLUDE_DEVICE_ID = WASAPI_PROC_EXCLUDE_PREFIX
+AudioDeviceInfo = dict[str, Any]
+AudioDeviceMap = dict[str, list[AudioDeviceInfo]]
 
 
 # 过滤掉的 ALSA 虚拟/子设备名（精确匹配或包含）
@@ -54,12 +58,12 @@ def _is_junk_device(name: str) -> bool:
     return False
 
 
-def list_audio_devices() -> dict:
+def list_audio_devices() -> AudioDeviceMap:
     """列出所有可用的音频设备（过滤无用虚拟设备 + 补充 PipeWire 设备）"""
     devices = sd.query_devices()
-    result = {"input": [], "output": []}
+    result: AudioDeviceMap = {"input": [], "output": []}
 
-    seen_names = set()
+    seen_names: set[str] = set()
     for idx, dev in enumerate(devices):
         name = dev["name"]
         if _is_junk_device(name):
@@ -90,7 +94,7 @@ def list_audio_devices() -> dict:
     return result
 
 
-def _add_windows_proc_exclude_device(result: dict, seen: set) -> None:
+def _add_windows_proc_exclude_device(result: AudioDeviceMap, seen: set[str]) -> None:
     """Prefer driverless process-exclude capture when the OS supports it."""
     try:
         from src.audio.wasapi_process_loopback import (
@@ -117,7 +121,7 @@ def _add_windows_proc_exclude_device(result: dict, seen: set) -> None:
     seen.add(key)
 
 
-def _add_windows_loopback_devices(result: dict, seen: set) -> None:
+def _add_windows_loopback_devices(result: AudioDeviceMap, seen: set[str]) -> None:
     """补充 Windows WASAPI loopback 捕获源。"""
     try:
         import soundcard as sc
@@ -167,7 +171,7 @@ def _pulse_friendly_name(pulse_name: str) -> str:
     return text.split(".")[-1].replace("alsa input ", "").replace("alsa output ", "").title()
 
 
-def _add_pulse_devices(result: dict, seen: set) -> None:
+def _add_pulse_devices(result: AudioDeviceMap, seen: set[str]) -> None:
     """从 PulseAudio/PipeWire 补充 PortAudio 未枚举的设备"""
     import subprocess
 
@@ -243,21 +247,24 @@ class AudioStream:
         sample_rate: int = 16000,
         channels: int = 1,
         chunk_size: int = 1024,
-    ):
+    ) -> None:
         self.device = device
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_size = chunk_size
         self._stream: sd.InputStream | None = None
-        self._pulse_process: subprocess.Popen | None = None
-        self._loopback_recorder = None
-        self._proc_exclude = None
+        self._pulse_process: subprocess.Popen[bytes] | None = None
+        self._loopback_recorder: Any | None = None
+        self._proc_exclude: Any | None = None
         self._active = False
 
     def open_input(self) -> None:
         """打开音频输入流"""
         if isinstance(self.device, str):
-            if self.device.startswith(WASAPI_PROC_EXCLUDE_PREFIX) or self.device == PROC_EXCLUDE_DEVICE_ID:
+            if (
+                self.device.startswith(WASAPI_PROC_EXCLUDE_PREFIX)
+                or self.device == PROC_EXCLUDE_DEVICE_ID
+            ):
                 self._open_windows_proc_exclude()
                 return
             if self.device.startswith(WASAPI_LOOPBACK_PREFIX):
@@ -282,13 +289,9 @@ class AudioStream:
                     return
             except Exception:
                 pass
-        else:
-            actual_device = self.device
+        self._open_sounddevice_input(self.device)
 
-        actual_device = self.device
-        self._open_sounddevice_input(actual_device)
-
-    def _open_sounddevice_input(self, actual_device) -> None:
+    def _open_sounddevice_input(self, actual_device: int | str | None) -> None:
         """用 sounddevice 打开普通输入设备。"""
         self._stream = sd.InputStream(
             device=actual_device,
@@ -309,9 +312,7 @@ class AudioStream:
             cap = ProcessExcludeLoopback(sample_rate=self.sample_rate, channels=1)
             cap.start()
         except Exception as exc:
-            raise RuntimeError(
-                f"process-exclude 打开失败，请改用经典 Loopback: {exc}"
-            ) from exc
+            raise RuntimeError(f"process-exclude 打开失败，请改用经典 Loopback: {exc}") from exc
         self._proc_exclude = cap
         self._active = True
         logger.info("WASAPI process-exclude 已打开（排除本应用）")
@@ -368,21 +369,20 @@ class AudioStream:
     def open_output(self) -> None:
         """打开音频输出流"""
         if isinstance(self.device, str):
-            import os
-
-            os.environ["PULSE_SINK"] = self.device
             actual_device = None
             logger.info(f"音频输出: PulseAudio 设备 {self.device}")
         else:
             actual_device = self.device
 
-        self._stream = sd.OutputStream(
-            device=actual_device,
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            blocksize=self.chunk_size,
-            dtype=np.float32,
-        )
+        pulse_sink = self.device if isinstance(self.device, str) else None
+        with temporary_pulse_sink(pulse_sink):
+            self._stream = sd.OutputStream(
+                device=actual_device,
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                blocksize=self.chunk_size,
+                dtype=np.float32,
+            )
         self._stream.start()
         self._active = True
         logger.info(f"音频输出流已打开 (device={self.device}, sr={self.sample_rate})")
@@ -392,7 +392,8 @@ class AudioStream:
         if self._proc_exclude is not None:
             if not self._active:
                 return None
-            return self._proc_exclude.read_float32(self.chunk_size)
+            chunk = self._proc_exclude.read_float32(self.chunk_size)
+            return None if chunk is None else np.asarray(chunk, dtype=np.float32)
 
         if self._loopback_recorder is not None:
             if not self._active:
@@ -422,7 +423,7 @@ class AudioStream:
         if self._stream is None or not self._active:
             return None
         data, _ = self._stream.read(self.chunk_size)
-        return data.flatten()
+        return np.asarray(data, dtype=np.float32).flatten()
 
     def write_chunk(self, data: np.ndarray) -> None:
         """写入一个音频块"""
@@ -454,19 +455,15 @@ class AudioStream:
 
     @staticmethod
     def resample(data: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """音频重采样（numpy线性插值，零依赖）"""
-        ratio = target_sr / orig_sr
-        if ratio == 1.0:
-            return data
-        n_out = max(1, int(round(len(data) * ratio)))
-        x_in = np.arange(len(data), dtype=np.float32)
-        x_out = np.linspace(0, len(data) - 1, n_out, dtype=np.float32)
-        return np.interp(x_out, x_in, data.astype(np.float32)).astype(data.dtype)
+        """使用抗混叠多相滤波进行音频重采样。"""
+        from src.utils.audio_utils import resample
+
+        return resample(data.astype(np.float32), orig_sr, target_sr)
 
     @staticmethod
     def float32_to_int16(data: np.ndarray) -> np.ndarray:
         """float32 [-1,1] -> int16"""
-        return np.clip(data * 32767, -32768, 32767).astype(np.int16)
+        return np.asarray(np.clip(data * 32767, -32768, 32767), dtype=np.int16)
 
     @staticmethod
     def int16_to_float32(data: np.ndarray) -> np.ndarray:

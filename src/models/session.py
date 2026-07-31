@@ -19,4 +19,3 @@ class TranslationSession(BaseModel):
 
     def transition(self, status: SessionStatus) -> None:
         self.status = status
-

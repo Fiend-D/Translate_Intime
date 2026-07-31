@@ -13,10 +13,7 @@ from src.utils.proxy_env import (
 
 
 def test_normalize_proxy_url_socks_to_socks5() -> None:
-    assert (
-        normalize_proxy_url("socks://127.0.0.1:7890/")
-        == "socks5://127.0.0.1:7890/"
-    )
+    assert normalize_proxy_url("socks://127.0.0.1:7890/") == "socks5://127.0.0.1:7890/"
     assert normalize_proxy_url("socks://127.0.0.1:7890") == "socks5://127.0.0.1:7890"
     assert (
         normalize_proxy_url("SOCKS://user:pass@127.0.0.1:7890")
@@ -35,12 +32,14 @@ def test_normalize_proxy_url_leaves_other_schemes() -> None:
 
 def test_prepare_download_proxy_env_rewrites_all_proxy(monkeypatch) -> None:
     monkeypatch.setenv("ALL_PROXY", "socks://127.0.0.1:7890")
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
     monkeypatch.setenv("https_proxy", "socks://127.0.0.1:7890/")
     changed = prepare_download_proxy_env()
+    changed_casefold = {name.casefold(): value for name, value in changed.items()}
     assert os.environ["ALL_PROXY"] == "socks5://127.0.0.1:7890"
     assert os.environ["https_proxy"] == "socks5://127.0.0.1:7890/"
-    assert changed["ALL_PROXY"] == "socks5://127.0.0.1:7890"
-    assert changed["https_proxy"] == "socks5://127.0.0.1:7890/"
+    assert changed_casefold["all_proxy"] == "socks5://127.0.0.1:7890"
+    assert changed_casefold["https_proxy"] == "socks5://127.0.0.1:7890/"
 
 
 def test_prepare_model_download_env_preserves_proxy_by_default(monkeypatch) -> None:
