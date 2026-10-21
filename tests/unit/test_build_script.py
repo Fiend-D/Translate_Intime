@@ -10,8 +10,12 @@ import pytest
 import build
 
 
-def test_build_command_uses_isolated_paths_and_bundles_vad(monkeypatch) -> None:
+def test_build_command_uses_isolated_paths_and_bundles_vad(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(build, "module_available", lambda _name: False)
+    vad_model = tmp_path / "resource" / "vad" / "silero_vad.onnx"
+    vad_model.parent.mkdir(parents=True)
+    vad_model.write_bytes(b"onnx")
+    monkeypatch.setattr(build, "ROOT", tmp_path)
 
     command = build.build_command(debug=False, clean=True)
     rendered = " ".join(command)
@@ -19,9 +23,18 @@ def test_build_command_uses_isolated_paths_and_bundles_vad(monkeypatch) -> None:
     assert "--onefile" in command
     assert "--windowed" in command
     assert "--clean" in command
-    assert str(build.ROOT / "resource" / "vad" / "silero_vad.onnx") in rendered
+    assert str(vad_model) in rendered
     assert str(build.SPEC_DIR) in command
     assert str(build.ENTRYPOINT) == command[-1]
+
+
+def test_build_command_skips_missing_vad_model(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(build, "module_available", lambda _name: False)
+    monkeypatch.setattr(build, "ROOT", tmp_path)
+
+    command = build.build_command(debug=False, clean=False)
+
+    assert "silero_vad.onnx" not in " ".join(command)
 
 
 def test_metadata_is_copied_only_for_installed_packages(monkeypatch) -> None:

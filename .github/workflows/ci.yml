@@ -21,20 +21,28 @@ jobs:
       UV_FROZEN: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.17"
           enable-cache: true
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Install Linux audio libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev ffmpeg pulseaudio
+
+      # PortAudio's PulseAudio host API fails Pa_Initialize (and the sounddevice
+      # import) when no server is running, so give it a null sink.
+      - name: Start headless PulseAudio
+        if: runner.os == 'Linux'
+        run: |
+          pulseaudio -D --exit-idle-time=-1 --load=module-null-sink
+          pactl info
 
       - name: Verify dependency lock
         run: uv lock --check
@@ -52,6 +60,13 @@ jobs:
 
       - name: Tests
         run: uv run pytest -q
+
+      - name: Fetch bundled Silero VAD model
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx `
+            -OutFile resource/vad/silero_vad.onnx -MaximumRetryCount 3 -RetryIntervalSec 5
 
       - name: Build Windows executable
         if: runner.os == 'Windows'
