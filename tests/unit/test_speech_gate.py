@@ -4,8 +4,18 @@ from __future__ import annotations
 
 import array
 
+import pytest
+
 from src.core.audio_pre_roll import AudioPreRoll
-from src.core.speech_gate import SpeechGate
+from src.core.speech_gate import SpeechGate, _pcm16_rms
+
+
+def test_pcm16_rms_matches_known_values() -> None:
+    assert _pcm16_rms(b"") == 0.0
+    square = array.array("h", [16384, -16384] * 80).tobytes()
+    assert _pcm16_rms(square) == pytest.approx(0.5)
+    with pytest.raises(ValueError):
+        _pcm16_rms(b"\x00")
 
 
 class _PendingSilero:

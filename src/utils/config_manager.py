@@ -5,7 +5,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import sys
+import shutil
+import time
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from pydantic import ValidationError
 
 from src.core.exceptions import ConfigValidationError
 from src.models.config import AppConfigModel
-from src.utils.resource_paths import bundled_path
+from src.utils.logger import logger
 
 _SERVICE_NAME = "translator_intime"
 _SECRET_FIELDS = {
@@ -23,7 +24,10 @@ _SECRET_FIELDS = {
     "volc_iam_ak": "volc_iam_ak",
     "volc_iam_sk": "volc_iam_sk",
     "economy_dashscope_api_key": "economy_dashscope_api_key",
+    "economy_llm_api_key": "economy_llm_api_key",
+    "economy_openai_tts_api_key": "economy_openai_tts_api_key",
 }
+SECRET_FIELDS: tuple[str, ...] = tuple(_SECRET_FIELDS)
 _LEGACY_DOTA_COACH_HOTKEY = "<ctrl>+<alt>+c"
 _DOTA_COACH_HOTKEY = "<ctrl>+<alt>+k"
 
@@ -93,6 +97,8 @@ def _write_config_data(config_file: Path, data: dict[str, Any]) -> None:
             json.dump(data, stream, indent=2, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
+        with contextlib.suppress(OSError):
+            temp_file.chmod(0o600)
         temp_file.replace(config_file)
     finally:
         temp_file.unlink(missing_ok=True)
@@ -108,53 +114,35 @@ def load_config() -> AppConfigModel:
     """Load configuration from disk."""
     config_file = _config_path()
     if not config_file.exists():
-        seeded = _seed_from_yaml_defaults()
-        return seeded if seeded is not None else AppConfigModel()
+        return AppConfigModel()
 
     try:
         with config_file.open("r", encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise json.JSONDecodeError("top level is not an object", "", 0)
     except json.JSONDecodeError as exc:
-        raise ConfigValidationError(f"Config file is not valid JSON: {exc}") from exc
+        backup = _backup_bad_config(config_file)
+        raise ConfigValidationError(
+            f"Config file is not valid JSON: {exc}; original kept at {backup}"
+        ) from exc
 
-    # Drop legacy local-engine block if present
-    data.pop("engine", None)
-    data.pop("model_cache_dir", None)
+    stale_keys = set(data) - set(AppConfigModel.model_fields)
     _migrate_hotkey_defaults(data)
 
-    # Migrate missing ASR backend → platform default.
-    # Windows: live_captions; Linux/macOS: local (Live Captions is Win-only).
-    # Do NOT rewrite intentional "dashscope" — that broke cloud ASR after save/reload
-    # and made the UI look local while can_start still demanded a DashScope key
-    # when combo selection failed to match aliases.
-    legacy_backend = data.get("economy_asr_backend", None)
-    if legacy_backend in (None, ""):
-        data["economy_asr_backend"] = "live_captions" if sys.platform.startswith("win") else "local"
-    elif legacy_backend == "live_captions" and not sys.platform.startswith("win"):
-        # Persisted Win-only default is useless on Linux — fall back to local ASR.
-        data["economy_asr_backend"] = "local"
-    elif legacy_backend in ("sherpa", "whisper"):
-        # UI combo only exposes "local"; keep model choice via economy_asr_local_model.
-        data["economy_asr_backend"] = "local"
-
-    # Only fill a missing local model. ``auto`` / SenseVoice / Zipformer remain
-    # valid user-selectable options and must survive save → reload unchanged.
-    if not data.get("economy_asr_local_model"):
-        data["economy_asr_local_model"] = "faster-whisper-medium"
-
-    # New defaults apply only when a field is absent. Value-based migrations
-    # cannot distinguish an old default from a deliberate advanced setting.
-    if data.get("economy_utterance_soft_split_ms") is None:
-        data["economy_utterance_soft_split_ms"] = 6000
-    if data.get("economy_utterance_soft_split_quiet_ms") is None:
-        data["economy_utterance_soft_split_quiet_ms"] = 280
-    if data.get("economy_kokoro_speed") is None:
-        data["economy_kokoro_speed"] = 0.92
-    if not data.get("economy_kokoro_voice_en"):
-        data["economy_kokoro_voice_en"] = "af_bella"
+    # Null/empty values from old versions fall back to the model defaults.
+    for field in (
+        "economy_utterance_soft_split_ms",
+        "economy_utterance_soft_split_quiet_ms",
+        "economy_kokoro_speed",
+        "economy_kokoro_voice_en",
+    ):
+        if data.get(field) in (None, ""):
+            data.pop(field, None)
 
     plaintext_secrets = {field: str(data.pop(field, "") or "").strip() for field in _SECRET_FIELDS}
-    migration_succeeded = True
+    # Plaintext secrets the keyring could not take; they must survive any rewrite.
+    unmigrated: dict[str, str] = {}
     found_plaintext = False
     for field, username in _SECRET_FIELDS.items():
         secret = _get_keyring_password(username)
@@ -163,24 +151,77 @@ def load_config() -> AppConfigModel:
         plaintext = plaintext_secrets[field]
         if not secret and plaintext:
             found_plaintext = True
-            if _set_keyring_password(username, plaintext):
-                secret = plaintext
-            else:
-                migration_succeeded = False
-                secret = plaintext
+            if not _set_keyring_password(username, plaintext):
+                unmigrated[field] = plaintext
+            secret = plaintext
         if secret:
             data[field] = secret
 
     # Remove legacy plaintext only after every discovered secret reached the
     # system credential store. A backend outage must not destroy credentials.
-    if found_plaintext and migration_succeeded:
+    if found_plaintext and not unmigrated:
         _write_config_data(config_file, _without_secrets(data))
 
     try:
         config = AppConfigModel(**data)
     except ValidationError as exc:
-        raise ConfigValidationError(f"Config validation failed: {exc}") from exc
-    return _fill_volc_from_yaml(config)
+        config = _salvage_config(config_file, data, exc, keep_secrets=unmigrated)
+    if stale_keys:
+        # Settings removed from the model stay on disk until rewritten.
+        public = _without_secrets(config.model_dump(mode="json"))
+        public.update(unmigrated)
+        with contextlib.suppress(OSError):
+            _write_config_data(config_file, public)
+    return config
+
+
+_MAX_BAD_BACKUPS = 3
+
+
+def _backup_bad_config(
+    config_file: Path, data: dict[str, Any] | None = None, *, keep_secrets: Collection[str] = ()
+) -> Path | None:
+    """Keep a copy of a rejected config; secrets already in the keyring are left out."""
+    backup = config_file.with_name(f"{config_file.name}.bad-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        if data is None:
+            shutil.copy2(config_file, backup)
+        else:
+            redacted = {
+                key: value
+                for key, value in data.items()
+                if key not in _SECRET_FIELDS or key in keep_secrets
+            }
+            backup.write_text(json.dumps(redacted, indent=2, ensure_ascii=False), "utf-8")
+        with contextlib.suppress(OSError):
+            backup.chmod(0o600)
+    except OSError as exc:
+        logger.warning(f"无法备份损坏的配置文件: {exc}")
+        return None
+    old = sorted(config_file.parent.glob(f"{config_file.name}.bad-*"))
+    for stale in old[:-_MAX_BAD_BACKUPS]:
+        with contextlib.suppress(OSError):
+            stale.unlink()
+    return backup
+
+
+def _salvage_config(
+    config_file: Path,
+    data: dict[str, Any],
+    exc: ValidationError,
+    *,
+    keep_secrets: Collection[str] = (),
+) -> AppConfigModel:
+    """Keep every valid setting; invalid fields fall back to defaults (original backed up)."""
+    bad = {str(err["loc"][0]) for err in exc.errors() if err.get("loc")}
+    kept = {key: value for key, value in data.items() if key not in bad}
+    try:
+        config = AppConfigModel(**kept)
+    except ValidationError as again:
+        raise ConfigValidationError(f"Config validation failed: {again}") from exc
+    backup = _backup_bad_config(config_file, data, keep_secrets=keep_secrets)
+    logger.warning(f"配置项无效已恢复默认: {', '.join(sorted(bad))}；原文件备份在 {backup}")
+    return config
 
 
 def _migrate_hotkey_defaults(data: dict[str, Any]) -> None:
@@ -191,66 +232,6 @@ def _migrate_hotkey_defaults(data: dict[str, Any]) -> None:
     current = str(hotkeys.get("dota_coach_ask", "")).strip().lower().replace(" ", "")
     if current == _LEGACY_DOTA_COACH_HOTKEY:
         hotkeys["dota_coach_ask"] = _DOTA_COACH_HOTKEY
-
-
-def _fill_volc_from_yaml(config: AppConfigModel) -> AppConfigModel:
-    """If JSON config lacks Volc key, pull from legacy YAML once."""
-    if config.volc_api_key:
-        return config
-    seeded = _seed_from_yaml_defaults()
-    if seeded is None or not seeded.volc_api_key:
-        return config
-    config.volc_api_key = seeded.volc_api_key
-    if not config.volc_access_token and seeded.volc_access_token:
-        config.volc_access_token = seeded.volc_access_token
-    return config
-
-
-def _seed_from_yaml_defaults() -> AppConfigModel | None:
-    """Best-effort import from legacy config/default_config.yaml on first run."""
-    yaml_path = Path("config/default_config.yaml")
-    if not yaml_path.is_file():
-        yaml_path = bundled_path("config", "default_config.yaml")
-    if not yaml_path.exists():
-        return None
-    try:
-        import yaml
-
-        with yaml_path.open("r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-    except Exception:
-        return None
-
-    ui = raw.get("ui", {}) or {}
-    translation = raw.get("translation", {}) or {}
-    audio = raw.get("audio", {}) or {}
-    try:
-        font_size = int(ui.get("font_size", 22) or 22)
-        font_size = max(12, min(64, font_size))
-        return AppConfigModel(
-            source_language=translation.get("source_lang", "zh"),
-            target_language=translation.get("target_lang", "en"),
-            subtitle_font_size=font_size,
-            subtitle_opacity=float(ui.get("subtitle_opacity", 0.88) or 0.88),
-            enable_mic=bool(ui.get("enable_mic", True)),
-            enable_game=bool(ui.get("enable_game", True)),
-            show_mic_subtitle=bool(ui.get("show_mic_subtitle", True)),
-            show_game_subtitle=bool(ui.get("show_game_subtitle", True)),
-            play_mic_voice=bool(ui.get("play_outbound_voice", False)),
-            play_game_voice=bool(ui.get("play_inbound_voice", ui.get("play_chinese_voice", False))),
-            input_device=audio.get("input_device"),
-            output_device=audio.get("output_device"),
-            loopback_device=audio.get("game_output_device"),
-            use_volc=True,
-            # A legacy App ID is not an AST 2.0 API key. Preserve it only for
-            # display/migration instead of letting credential checks accept it.
-            volc_api_key=str(translation.get("volc_api_key", "") or ""),
-            volc_access_token=str(translation.get("volc_access_token", "") or ""),
-            volc_console_app_id=str(translation.get("volc_app_id", "") or ""),
-            theme_mode="dark",
-        )
-    except Exception:
-        return None
 
 
 def save_config(

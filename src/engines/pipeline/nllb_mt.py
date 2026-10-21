@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from src.engines.pipeline.model_catalog import nllb_option_by_id
+from src.utils import hf_download
 from src.utils.logger import logger
 from src.utils.resource_paths import model_resource_root
 
@@ -23,6 +25,16 @@ _LANG_MAP = {
     "ko": "kor_Hang",
 }
 _LOG_INTERVAL_SEC = 30.0
+
+
+_HALFWIDTH_PUNCT = {",": "，", ".": "。", "?": "？", "!": "！", ":": "：", ";": "；"}
+# Half-width mark after a CJK character, not inside numbers/abbreviations like 3.5 or U.S.
+_CJK_HALF_PUNCT = re.compile(r"(?<=[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af])\s*([,.?!:;])\s*")
+
+
+def cjk_fullwidth_punct(text: str) -> str:
+    """NLLB emits ASCII punctuation in Chinese/Japanese output; use full-width marks."""
+    return _CJK_HALF_PUNCT.sub(lambda m: _HALFWIDTH_PUNCT[m.group(1)], text)
 
 
 def nllb_lang_code(lang: str) -> str | None:
@@ -171,6 +183,8 @@ class NllbCt2Mt:
             out_ids = tokenizer.convert_tokens_to_ids(hyp)
             out = tokenizer.decode(out_ids, skip_special_tokens=True)
             out = (out or "").strip()
+            if tgt_code.startswith(("zho_", "yue_", "jpn_")):
+                out = cjk_fullwidth_punct(out)
             return out or None
 
     def _load_background(self) -> None:
@@ -253,13 +267,11 @@ class NllbCt2Mt:
                 message=r".*PyTorch was not found.*",
                 category=UserWarning,
             )
-            try:
-                # 新版 transformers 对部分 tokenizer.json 正则有误报，需显式修复。
-                tokenizer = AutoTokenizer.from_pretrained(
-                    tok_source, fix_mistral_regex=True, **kwargs
-                )
-            except TypeError:
-                tokenizer = AutoTokenizer.from_pretrained(tok_source, **kwargs)
+            # transformers flags NLLB's SentencePiece regex as the broken Mistral one; it is
+            # not. ``fix_mistral_regex=True`` swaps in byte-level splitting ("Ġ" pieces) and
+            # makes NLLB drop/repeat words, so only silence the false alarm.
+            warnings.filterwarnings("ignore", message=r".*incorrect regex pattern.*")
+            tokenizer = AutoTokenizer.from_pretrained(tok_source, **kwargs)
         return translator, tokenizer
 
     def _pick_device(self) -> tuple[str, str]:
@@ -317,50 +329,31 @@ class NllbCt2Mt:
 
     def _download_model(self) -> bool:
         try:
-            from huggingface_hub import snapshot_download
+            import huggingface_hub  # noqa: F401
         except ImportError:
             logger.warning("缺少 huggingface_hub，无法下载 NLLB；请 pip install huggingface_hub")
             return False
-        import os
-
-        from src.utils.proxy_env import prepare_model_download_env, without_proxy
-
-        # 提前设置 HF 镜像，避免先走默认源超时再重试；下载后恢复进程环境。
-        previous_endpoint = os.environ.get("HF_ENDPOINT")
-        if not previous_endpoint:
-            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-            logger.info("已预设 HF 镜像: https://hf-mirror.com")
-
-        prepare_model_download_env()
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"正在下载 NLLB 模型 {self._model_id} → {self._cache_dir}")
-
-        def _try_download(repo_id: str, cache_dir: Path) -> bool:
-            with without_proxy():
-                snapshot_download(
-                    repo_id=repo_id,
-                    local_dir=str(cache_dir),
-                )
-            return self._model_files_ready()
-
+        option = nllb_option_by_id(self._model_id)
         try:
-            try:
-                if _try_download(self._model_id, self._cache_dir):
-                    logger.info(f"NLLB 模型已保存: {self._cache_dir}")
-                    return True
-            except Exception as exc:
-                logger.warning(f"NLLB 模型下载失败: {exc}")
-                err = str(exc).lower()
-                if "socks" in err or "proxy" in err:
-                    logger.warning(
-                        "代理相关失败提示: 请改用 Clash HTTP 端口 "
-                        "(http://127.0.0.1:7890)，或 pip install PySocks"
-                        "；或取消 TRANSLATOR_INTIME_USE_PROXY 以直连下载"
-                    )
-        finally:
-            if previous_endpoint is None:
-                os.environ.pop("HF_ENDPOINT", None)
-            else:
-                os.environ["HF_ENDPOINT"] = previous_endpoint
-        # 不再强制降级到 600M；保留用户选择的模型，等下次重试或网络恢复后重新下载。
+            hf_download.snapshot(
+                self._model_id,
+                self._cache_dir,
+                label=f"NLLB 翻译 · {option.title if option else self._model_id}",
+                key=f"mt:{self._model_id}",
+                total_mb=option.download_mb if option else 0,
+            )
+        except Exception as exc:
+            err = str(exc).lower()
+            if "socks" in err or "proxy" in err:
+                logger.warning(
+                    "代理相关失败提示: 请改用 Clash HTTP 端口 "
+                    "(http://127.0.0.1:7890)，或 pip install PySocks"
+                    "；或取消 TRANSLATOR_INTIME_USE_PROXY 以直连下载"
+                )
+            # 保留用户选择的模型，等下次重试或网络恢复后重新下载。
+            return False
+        if self._model_files_ready():
+            logger.info(f"NLLB 模型已保存: {self._cache_dir}")
+            return True
+        logger.warning(f"NLLB 模型下载后不完整: {self._cache_dir}")
         return False

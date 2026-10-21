@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from collections.abc import Callable
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any
 
 import numpy as np
@@ -18,9 +19,13 @@ import numpy as np
 from src.core.exceptions import EngineRuntimeError
 from src.models.enums import Direction
 from src.models.internal import AudioChunk
+from src.utils.audio_utils import StreamResampler
 from src.utils.logger import logger
 
 CHUNK_DURATION_MS = 40  # smaller chunks → lower capture batching latency
+# PortAudio keeps calling back (silence included) while a device is alive.
+_STALL_SECONDS = 3.0
+_RAW_QUEUE_MAX = 100  # ~4 s of 40 ms blocks
 
 
 class AudioCapture:
@@ -46,6 +51,9 @@ class AudioCapture:
         self._pyaudio: Any | None = None
         self._stream: Any | None = None
         self._audio_stream: Any | None = None
+        self._raw: Queue[bytes] = Queue(maxsize=_RAW_QUEUE_MAX)
+        self._device_channels = channels
+        self._resampler: StreamResampler | None = None
         # Optional low-latency sink (e.g. Volc). When set, PCM bypasses the Qt tick queue.
         self.on_pcm: Callable[[bytes], None] | None = None
         self.on_error: Callable[[Exception], None] | None = None
@@ -113,16 +121,80 @@ class AudioCapture:
         import pyaudio
 
         self._pyaudio = pyaudio.PyAudio()
-        self._stream = self._pyaudio.open(
-            format=pyaudio.paInt16,
-            channels=self.channels,
-            rate=self.sample_rate,
-            input=True,
-            input_device_index=self.device if isinstance(self.device, int) else None,
-            frames_per_buffer=int(self.sample_rate * CHUNK_DURATION_MS / 1000),
-            stream_callback=self._callback,
+        index = self.device if isinstance(self.device, int) else None
+        rate, channels = self.sample_rate, self.channels
+        try:
+            self._stream = self._open_pyaudio(rate, channels, index)
+        except OSError as exc:
+            # WASAPI shared mode only accepts the device mix format (often 48 kHz stereo).
+            info = (
+                self._pyaudio.get_device_info_by_index(index)
+                if index is not None
+                else self._pyaudio.get_default_input_device_info()
+            )
+            rate = int(info.get("defaultSampleRate") or 48000)
+            channels = max(1, min(2, int(info.get("maxInputChannels") or 1)))
+            if (rate, channels) == (self.sample_rate, self.channels):
+                raise
+            logger.info(
+                f"设备不支持 {self.sample_rate} Hz（{exc}），改用 {rate} Hz/{channels} 声道并重采样"
+            )
+            self._stream = self._open_pyaudio(rate, channels, index)
+        self._device_channels = channels
+        self._resampler = (
+            StreamResampler(rate, self.sample_rate) if rate != self.sample_rate else None
         )
+        self._thread = threading.Thread(
+            target=self._pyaudio_pump, name=f"capture-{self.direction.value}", daemon=True
+        )
+        self._thread.start()
         self._stream.start_stream()
+
+    def _open_pyaudio(self, rate: int, channels: int, index: int | None) -> Any:
+        import pyaudio
+
+        assert self._pyaudio is not None
+        return self._pyaudio.open(
+            format=pyaudio.paInt16,
+            channels=channels,
+            rate=rate,
+            input=True,
+            input_device_index=index,
+            frames_per_buffer=int(rate * CHUNK_DURATION_MS / 1000),
+            stream_callback=self._callback,
+            start=False,
+        )
+
+    def _pyaudio_pump(self) -> None:
+        """Convert and deliver PyAudio blocks off the real-time callback thread."""
+        last_data = time.monotonic()
+        while self._running:
+            try:
+                raw = self._raw.get(timeout=0.5)
+            except Empty:
+                if self._running and time.monotonic() - last_data > _STALL_SECONDS:
+                    self._fail(OSError("音频设备无数据（可能已拔出或被系统禁用）"))
+                    return
+                continue
+            last_data = time.monotonic()
+            self._emit_pcm(self._to_target_format(raw))
+
+    def _to_target_format(self, raw: bytes) -> bytes:
+        if self._device_channels == self.channels and self._resampler is None:
+            return raw
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if self._device_channels > 1:
+            samples = samples.reshape(-1, self._device_channels).mean(axis=1)
+        if self._resampler is not None:
+            samples = self._resampler.process(samples)
+        return bytes(np.clip(samples * 32767.0, -32768, 32767).astype(np.int16).tobytes())
+
+    def _fail(self, exc: Exception) -> None:
+        logger.warning(f"Audio capture failed ({self.direction.value}): {exc}")
+        self._running = False
+        if self.on_error is not None:
+            with contextlib.suppress(Exception):
+                self.on_error(exc)
 
     def _start_stream_backend(self) -> None:
         from src.audio.stream import AudioStream
@@ -148,11 +220,7 @@ class AudioCapture:
             try:
                 samples = self._audio_stream.read_chunk()
             except Exception as exc:
-                logger.warning(f"AudioStream read failed ({self.direction.value}): {exc}")
-                self._running = False
-                if self.on_error is not None:
-                    with contextlib.suppress(Exception):
-                        self.on_error(exc)
+                self._fail(exc)
                 break
             if samples is None:
                 import time as _time
@@ -215,7 +283,14 @@ class AudioCapture:
         import pyaudio
 
         del frame_count, time_info, status_flags
-        self._emit_pcm(in_data)
+        # Real-time thread: VAD/AEC/engine work here would cause input overflows.
+        try:
+            self._raw.put_nowait(in_data)
+        except Full:
+            with contextlib.suppress(Empty):
+                self._raw.get_nowait()
+            with contextlib.suppress(Full):
+                self._raw.put_nowait(in_data)
         return (None, pyaudio.paContinue)
 
     def get_chunks(self) -> list[AudioChunk]:

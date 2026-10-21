@@ -4,7 +4,7 @@ import contextlib
 import threading
 import time
 from collections.abc import Callable
-from queue import Empty, Full, Queue
+from queue import Empty, Queue
 from typing import Any
 
 import numpy as np
@@ -19,7 +19,12 @@ from src.utils.audio_utils import (
 from src.utils.logger import logger
 
 _TTS_SR = 16000
-_MAX_QUEUED_SEGMENTS = 4
+_TTS_BYTES_PER_SEC = _TTS_SR * 2
+# Interrupt granularity: clear_queue() takes effect between two writes.
+_WRITE_CHUNK_MS = 60
+# Backlog cap by audio duration; dropping finished translations is a last resort.
+_MAX_QUEUED_SECONDS = 30.0
+_VIRTUAL_DEVICE_MARKERS = ("cable", "voicemeeter", "vb-audio", "virtual")
 
 
 def _sounddevice() -> Any:
@@ -29,12 +34,31 @@ def _sounddevice() -> Any:
     return sounddevice
 
 
+def _stream_latency(stream: Any) -> float:
+    """Output latency in seconds as reported by PortAudio (0 when unknown)."""
+    latency = getattr(stream, "latency", 0.0)
+    if isinstance(latency, tuple | list):
+        latency = latency[-1] if latency else 0.0
+    try:
+        return max(0.0, float(latency))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def is_virtual_device_name(name: str) -> bool:
+    """True for virtual cables (VB-Cable / Voicemeeter) that have no acoustic path."""
+    lowered = (name or "").lower()
+    return bool(lowered) and any(m in lowered for m in _VIRTUAL_DEVICE_MARKERS)
+
+
 class AudioPlayer:
     """Plays PCM16 audio bytes to a selected output device."""
 
     def __init__(self, device_id: int | str | None = None) -> None:
         self.device_id = device_id
-        self._queue: Queue[bytes] = Queue(maxsize=_MAX_QUEUED_SEGMENTS)
+        self._queue: Queue[tuple[int, bytes]] = Queue()
+        self._queued_bytes = 0
+        self._generation = 0
         self._running = False
         self._thread: threading.Thread | None = None
         self._stream: Any | None = None
@@ -49,6 +73,8 @@ class AudioPlayer:
         # 回调：每次一段播放结束后调用，传入该段真实播放时长（秒）
         # 用途：外部可以据此延长麦克风回灌静音窗口
         self.on_segment_finished: Callable[[float], None] | None = None
+        # 回声消除参考：(16 kHz 单声道样本, 该块播完的 monotonic 时间)
+        self.on_reference: Callable[[np.ndarray, float, bool], None] | None = None
 
     def _query_device(self) -> None:
         """查询目标设备的实际采样率和声道数，优先升级到 WASAPI 2ch 版本。"""
@@ -152,17 +178,23 @@ class AudioPlayer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        # A play() that raced with stop() must not linger: is_playing would stay
+        # True (keeping the mic muted) and the stale speech would play on restart.
+        self.clear_queue()
         self._close_stream()
         logger.info("Audio player stopped")
 
     def clear_queue(self) -> None:
-        """Drop pending playback and close the active stream best-effort."""
-        while True:
-            try:
-                data = self._queue.get_nowait()
-            except Empty:
-                break
-            secure_clear(bytearray(data))
+        """Drop pending playback and stop the current segment within one write chunk."""
+        with self._state_lock:
+            self._generation += 1
+            while True:
+                try:
+                    _, data = self._queue.get_nowait()
+                except Empty:
+                    break
+                secure_clear(bytearray(data))
+            self._queued_bytes = 0
         self._close_stream()
 
     @property
@@ -179,49 +211,73 @@ class AudioPlayer:
 
     @property
     def queue_size(self) -> int:
-        """Number of pending PCM chunks in the queue."""
+        """Number of pending PCM segments in the queue."""
         return self._queue.qsize()
 
+    @property
+    def queued_seconds(self) -> float:
+        """Duration of audio waiting in the queue (excludes the segment being played)."""
+        with self._state_lock:
+            return self._queued_bytes / _TTS_BYTES_PER_SEC
+
+    @property
+    def is_virtual_output(self) -> bool:
+        return is_virtual_device_name(self._device_name)
+
     def play(self, pcm16_bytes: bytes) -> None:
-        """Enqueue PCM16 mono audio for playback."""
-        if not pcm16_bytes:
+        """Enqueue PCM16 mono audio; only drops the oldest audio past the duration cap."""
+        if not pcm16_bytes or not self._running:
             return
-        try:
-            self._queue.put_nowait(pcm16_bytes)
-            return
-        except Full:
-            pass
-        try:
-            stale = self._queue.get_nowait()
-            secure_clear(bytearray(stale))
-        except Empty:
-            pass
-        try:
-            self._queue.put_nowait(pcm16_bytes)
-        except Full:
-            logger.warning("TTS playback queue remained full; dropping newest segment")
+        cap_bytes = int(_MAX_QUEUED_SECONDS * _TTS_BYTES_PER_SEC)
+        dropped = 0
+        with self._state_lock:
+            generation = self._generation
+            while self._queued_bytes + len(pcm16_bytes) > cap_bytes:
+                try:
+                    _, stale = self._queue.get_nowait()
+                except Empty:
+                    break
+                self._queued_bytes -= len(stale)
+                dropped += 1
+                secure_clear(bytearray(stale))
+            self._queued_bytes += len(pcm16_bytes)
+            self._queue.put_nowait((generation, pcm16_bytes))
+        if dropped:
+            logger.warning(
+                f"TTS playback backlog over {_MAX_QUEUED_SECONDS:.0f}s; dropped {dropped} segment(s)"
+            )
 
     def _playback_loop(self) -> None:
-        while self._running or not self._queue.empty():
+        while self._running:
             try:
-                data = self._queue.get(timeout=0.1)
-            except Exception:
+                generation, data = self._queue.get(timeout=0.1)
+            except Empty:
                 continue
-            t0 = time.time()
             with self._state_lock:
+                self._queued_bytes = max(0, self._queued_bytes - len(data))
+                if generation != self._generation:
+                    secure_clear(bytearray(data))
+                    continue
                 self._active_segment = True
+            t0 = time.time()
+            completed = False
             try:
-                self._play_immediate(data)
+                completed = self._play_immediate(data, generation)
             except Exception as exc:
                 logger.error(f"Audio playback error: {exc}")
             finally:
                 with self._state_lock:
                     self._active_segment = False
-                # 通知外部该段真实播放耗时（覆盖段间开销/重采样延迟）
-                if self.on_segment_finished is not None:
+                # 通知外部该段真实播放耗时（覆盖段间开销/重采样延迟）。
+                # 被 clear_queue 打断的段不回调，否则会重新延长已解除的静音窗口。
+                if completed and self.on_segment_finished is not None:
                     with contextlib.suppress(Exception):
                         self.on_segment_finished(time.time() - t0)
                 secure_clear(bytearray(data))
+
+    def _is_current(self, generation: int) -> bool:
+        with self._state_lock:
+            return generation == self._generation
 
     def set_device(self, device_id: int | str | None) -> None:
         """Change the output device."""
@@ -236,13 +292,10 @@ class AudioPlayer:
         degrades low-level TTS, so enhance_clarity is needed.
         Physical speakers / headphones skip it to preserve natural TTS timbre.
         """
-        name = (self._device_name or "").lower()
-        if not name:
-            return False
-        markers = ("cable", "voicemeeter", "vb-audio", "virtual")
-        return any(m in name for m in markers)
+        return is_virtual_device_name(self._device_name)
 
-    def _play_immediate(self, pcm16_bytes: bytes) -> None:
+    def _play_immediate(self, pcm16_bytes: bytes, generation: int | None = None) -> bool:
+        """Write one segment in small chunks; return False if interrupted."""
         # int16 → float32
         samples = bytes_to_pcm16_array(pcm16_bytes).astype(np.float32) / 32768.0
 
@@ -251,6 +304,7 @@ class AudioPlayer:
         # 直接输出到物理音响/耳机时跳过, 保留 Kokoro TTS 的自然音质.
         if self._is_virtual_device():
             samples = enhance_clarity(samples, _TTS_SR)
+        reference = samples
 
         # 重采样到设备实际采样率（避免 PortAudio 低质量重采样）
         if self._device_sr != _TTS_SR:
@@ -262,9 +316,25 @@ class AudioPlayer:
         elif self._device_ch == 1 and samples.ndim == 1:
             samples = samples.reshape(-1, 1)
 
-        with self._stream_lock:
-            stream = self._ensure_stream_locked()
-            stream.write(np.ascontiguousarray(samples, dtype=np.float32))
+        frames = np.ascontiguousarray(samples, dtype=np.float32)
+        chunk = max(1, int(self._device_sr * _WRITE_CHUNK_MS / 1000))
+        for start in range(0, len(frames), chunk):
+            if not self._running or (generation is not None and not self._is_current(generation)):
+                return False
+            end = min(start + chunk, len(frames))
+            with self._stream_lock:
+                stream = self._ensure_stream_locked()
+                underflowed = bool(stream.write(frames[start:end]))
+                latency = _stream_latency(stream)
+            on_reference = self.on_reference
+            if on_reference is not None:
+                r0 = start * _TTS_SR // self._device_sr
+                r1 = end * _TTS_SR // self._device_sr
+                with contextlib.suppress(Exception):
+                    # An underflow inserted device silence: the chunk no longer follows
+                    # the previous one, so the reference must re-anchor on its timestamp.
+                    on_reference(reference[r0:r1], time.monotonic() + latency, underflowed)
+        return True
 
     def _resolve_device(self) -> int | None:
         device = self.device_id

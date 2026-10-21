@@ -9,12 +9,16 @@ checkpoints/
 *.onnx
 *.safetensors
 *.part
+*.incomplete
+*.sha256
+.locks/
 # Local downloaded assets under resource/ (keep placeholder .gitkeep)
 resource/mt/
 resource/nllb/*
 !resource/nllb/.gitkeep
 resource/asr/*
 !resource/asr/.gitkeep
+resource/tts/
 resource/vad/*.onnx
 !resource/vad/.gitkeep
 torch_cache/
@@ -88,6 +92,12 @@ usage_data.json
 # Local subtitle / transcript archives if written under the repo
 subtitles_*.txt
 archive_*.txt
+transcript_*.txt
+*.srt
+*.vtt
+# Device-specific user config copied into the repo
+/config.json
+/config/*.json
 
 # ---- Media / scratch audio (tests & captures) ----
 *.webm
@@ -99,6 +109,12 @@ archive_*.txt
 *.aac
 test*.wav
 microphone-test-*
+*.pcm
+*.raw
+# Debug dumps / screenshots written by local scripts
+/*.png
+/*.npy
+/*.npz
 
 # ---- Packaging / Nuitka / pyinstaller ----
 *.dist/

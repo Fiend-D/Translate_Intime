@@ -33,6 +33,57 @@ def resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     return np.asarray(resample_poly(audio, up, down), dtype=np.float32)
 
 
+class StreamResampler:
+    """Polyphase resampler that carries filter history across chunks.
+
+    Resampling each capture chunk on its own restarts the anti-alias filter at
+    every boundary (a click every ~100 ms). Feeding chunks here yields exactly
+    the samples a single pass over the whole stream would, at the cost of a
+    causal delay of about half the filter length (well under 1 ms).
+    """
+
+    def __init__(self, orig_sr: int, target_sr: int) -> None:
+        from math import gcd
+
+        from scipy.signal import firwin
+
+        g = gcd(orig_sr, target_sr)
+        self._up = target_sr // g
+        self._down = orig_sr // g
+        self.passthrough = self._up == self._down
+        max_rate = max(self._up, self._down)
+        taps = 2 * 10 * max_rate + 1
+        self._h = firwin(taps, 1.0 / max_rate, window=("kaiser", 5.0)) * self._up
+        # Input samples a full filter window spans, rounded up to the decimation grid.
+        self._keep = (taps // self._up + 2) // self._down * self._down + self._down
+        self._history = np.zeros(0, dtype=np.float32)
+        self._hist_start = 0  # global index of _history[0]; always a multiple of _down
+        self._n_in = 0
+        self._n_out = 0
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        if self.passthrough:
+            return np.asarray(chunk, dtype=np.float32)
+        from scipy.signal import upfirdn
+
+        data = np.concatenate([self._history, np.asarray(chunk, dtype=np.float32)])
+        self._n_in += len(chunk)
+        last_out = ((self._n_in - 1) * self._up) // self._down
+        first_rel = self._n_out - (self._hist_start * self._up) // self._down
+        out = np.zeros(0, dtype=np.float32)
+        if last_out >= self._n_out:
+            full = upfirdn(self._h, data, self._up, self._down)
+            out = np.asarray(full[first_rel : first_rel + last_out - self._n_out + 1], np.float32)
+            self._n_out = last_out + 1
+        cut = max(0, self._n_in - self._keep)
+        cut -= cut % self._down
+        if cut > self._hist_start:
+            data = data[cut - self._hist_start :]
+            self._hist_start = cut
+        self._history = data
+        return out
+
+
 def enhance_clarity(
     audio: np.ndarray,
     sr: int,

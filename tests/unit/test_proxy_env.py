@@ -8,6 +8,7 @@ from src.utils.proxy_env import (
     normalize_proxy_url,
     prepare_download_proxy_env,
     prepare_model_download_env,
+    redact_proxy_url,
     without_proxy,
 )
 
@@ -28,6 +29,11 @@ def test_normalize_proxy_url_leaves_other_schemes() -> None:
     assert normalize_proxy_url("socks5h://127.0.0.1:7890") == "socks5h://127.0.0.1:7890"
     assert normalize_proxy_url("") == ""
     assert normalize_proxy_url("   ") == ""
+
+
+def test_redact_proxy_url_hides_credentials() -> None:
+    assert redact_proxy_url("socks5://user:pa%40ss@10.0.0.1:7890") == "socks5://***@10.0.0.1:7890"
+    assert redact_proxy_url("http://127.0.0.1:7890") == "http://127.0.0.1:7890"
 
 
 def test_prepare_download_proxy_env_rewrites_all_proxy(monkeypatch) -> None:
@@ -69,3 +75,20 @@ def test_without_proxy_clears_and_restores(monkeypatch) -> None:
         assert "ALL_PROXY" not in os.environ
     assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:7890"
     assert os.environ["ALL_PROXY"] == "socks://127.0.0.1:7890"
+
+
+def test_overlapping_without_proxy_restores_only_after_last_exit(monkeypatch) -> None:
+    from src.utils import proxy_env
+
+    monkeypatch.delenv("TRANSLATOR_INTIME_USE_PROXY", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+
+    outer = proxy_env.without_proxy()
+    inner = proxy_env.without_proxy()
+    outer.__enter__()
+    inner.__enter__()
+    outer.__exit__(None, None, None)
+    assert "HTTPS_PROXY" not in os.environ
+    inner.__exit__(None, None, None)
+
+    assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:7890"

@@ -171,8 +171,7 @@ def test_load_config_migrates_live_captions_off_windows(tmp_path, monkeypatch) -
         encoding="utf-8",
     )
     monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
-    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
-    monkeypatch.setattr(config_manager.sys, "platform", "linux")
+    monkeypatch.setattr("sys.platform", "linux")
     loaded = config_manager.load_config()
     assert loaded.economy_asr_backend == "local"
 
@@ -215,8 +214,8 @@ def test_non_windows_live_captions_resolves_to_local(monkeypatch):
     assert resolve_economy_asr_backend(SimpleNamespace(economy_asr_backend="")) == "local"
     assert resolve_economy_asr_backend(SimpleNamespace(economy_asr_backend=None)) == "local"
 
-    asr, _mt, _tts = build_economy_backends(cfg)
-    assert not isinstance(asr, LiveCaptionsAsr)
+    asrs, _mt, _tts = build_economy_backends(cfg)
+    assert not any(isinstance(a, LiveCaptionsAsr) for a in asrs.values())
 
 
 def test_windows_live_captions_kept(monkeypatch):
@@ -231,8 +230,8 @@ def test_windows_live_captions_kept(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     cfg = AppConfigModel(economy_asr_backend="live_captions")
     assert resolve_economy_asr_backend(cfg) == "live_captions"
-    asr, _mt, _tts = build_economy_backends(cfg)
-    assert isinstance(asr, LiveCaptionsAsr)
+    asrs, _mt, _tts = build_economy_backends(cfg)
+    assert all(isinstance(a, LiveCaptionsAsr) for a in asrs.values())
 
 
 def test_pipeline_wants_volc_false_in_economy(tmp_path):

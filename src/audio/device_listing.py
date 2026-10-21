@@ -10,6 +10,10 @@ playback quality.
 
 from __future__ import annotations
 
+import os
+import re
+import subprocess
+import sys
 from typing import Any
 
 import sounddevice as sd
@@ -20,6 +24,20 @@ _PREFERRED_HOSTAPI_ORDER = (
     "MME",
     "Windows WDM-KS",
 )
+
+
+def rescan_portaudio() -> bool:
+    """Re-initialise PortAudio so hot-plugged devices appear.
+
+    PortAudio snapshots devices at init, and re-initialising invalidates every
+    open stream, so callers must only do this while nothing is capturing/playing.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception:
+        return False
+    return True
 
 
 def _hostapi_rank(name: str) -> int:
@@ -37,6 +55,60 @@ def _hostapi_name(api_idx: int) -> str:
         return sd.query_hostapis(api_idx).get("name", "") or ""
     except Exception:
         return ""
+
+
+# ALSA plugin PCMs that PortAudio lists on Linux but are not playback targets.
+_ALSA_PSEUDO_OUTPUT = re.compile(
+    r"^(lavrate|samplerate|speexrate|upmix|vdownmix|surround\d+|iec958|spdif|hdmi|dmix|a52|"
+    r"dsnoop|front|rear|center_lfe|side|null|jack|oss|sysdefault|default|pulse|pipewire|"
+    r"default sink)$",
+    re.IGNORECASE,
+)
+
+
+def list_pulse_sinks() -> list[dict[str, str]]:
+    """PulseAudio / PipeWire sinks as ``{"name", "description"}`` (empty without pactl)."""
+    try:
+        out = subprocess.run(
+            ["pactl", "list", "sinks"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    sinks: list[dict[str, str]] = []
+    for line in out.splitlines():
+        key, _, value = line.strip().partition(":")
+        if key == "Name":
+            sinks.append({"name": value.strip(), "description": value.strip()})
+        elif key == "Description" and sinks:
+            sinks[-1]["description"] = value.strip() or sinks[-1]["name"]
+    return sinks
+
+
+def _linux_output_devices(alsa: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace ALSA pseudo devices with named sinks; sink names route via pulse_env."""
+    sinks = list_pulse_sinks()
+    kept = [d for d in alsa if not _ALSA_PSEUDO_OUTPUT.match(str(d["name"]).strip())]
+    if not sinks:
+        return kept
+    # Raw hw: devices bypass the sound server and fail while it holds the card;
+    # PortAudio's own PulseAudio entries duplicate the sinks with unstable indices.
+    sink_names = {sink["name"] for sink in sinks}
+    kept = [d for d in kept if "(hw:" not in str(d["name"]) and str(d["name"]) not in sink_names]
+    kept.extend(
+        {
+            "index": sink["name"],
+            "name": sink["description"],
+            "channels": 2,
+            "sample_rate": 48000,
+            "hostapi": "PipeWire/PulseAudio",
+        }
+        for sink in sinks
+    )
+    return kept
 
 
 def list_output_devices() -> list[dict[str, Any]]:
@@ -124,6 +196,8 @@ def list_output_devices() -> list[dict[str, Any]]:
             }
         )
     result.sort(key=lambda d: d["name"].lower())
+    if sys.platform.startswith("linux"):
+        return _linux_output_devices(result)
     return result
 
 

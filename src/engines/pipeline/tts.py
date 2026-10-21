@@ -73,10 +73,17 @@ class UnconfiguredTts:
 class EdgePcmTts:
     """edge-tts → mp3 → decode/resample to PCM16 mono 16 kHz."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, voice_zh: str = "", voice_en: str = "", speed: float = 1.0) -> None:
         self._started = False
         self._edge_tts: Any | None = None
         self._last_err_at = 0.0
+        self._voices = dict(_EDGE_VOICES)
+        if voice_zh.strip():
+            self._voices["zh"] = voice_zh.strip()
+        if voice_en.strip():
+            self._voices["en"] = voice_en.strip()
+        rate = max(-50, min(100, round((float(speed or 1.0) - 1.0) * 100)))
+        self._rate = f"{rate:+d}%"
         try:
             import edge_tts
 
@@ -105,14 +112,14 @@ class EdgePcmTts:
         if not text or not self._started or self._edge_tts is None:
             return None
         edge_tts_module = self._edge_tts
-        voice = _EDGE_VOICES.get((language or "en")[:2].lower(), _EDGE_VOICES["en"])
+        voice = self._voices.get((language or "en")[:2].lower(), self._voices["en"])
         tmp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
                 tmp_path = Path(tmp.name)
 
             async def _run() -> None:
-                communicate = edge_tts_module.Communicate(text, voice)
+                communicate = edge_tts_module.Communicate(text, voice, rate=self._rate)
                 await communicate.save(str(tmp_path))
 
             asyncio.run(_run())
@@ -217,11 +224,16 @@ class AutoTts:
         pyttsx3: Pyttsx3Tts | None = None,
         voice_en: str | None = None,
         voice_zh: str | None = None,
+        local_zh: TtsBackend | None = None,
     ) -> None:
         self._prefer = (prefer or "auto").lower()
+        # Offline Chinese voice used when Kokoro has no Chinese model; loaded on first need.
+        self._local_zh = local_zh
+        self._local_zh_started = False
+        self.last_failure = ""
         self._kokoro = kokoro or KokoroOnnxTts(
             voice_en=voice_en or "af_bella",
-            voice_zh=voice_zh or "zf_xiaoxiao",
+            voice_zh=voice_zh or "zf_001",
         )
         self._edge = edge or EdgePcmTts()
         self._pyttsx3 = pyttsx3 or Pyttsx3Tts()
@@ -256,6 +268,18 @@ class AutoTts:
         self._kokoro.stop()
         self._edge.stop()
         self._pyttsx3.stop()
+        if self._local_zh is not None and self._local_zh_started:
+            self._local_zh.stop()
+            self._local_zh_started = False
+
+    def _synthesize_local_zh(self, text: str) -> bytes | None:
+        if self._local_zh is None:
+            return None
+        if not self._local_zh_started:
+            self._local_zh_started = True
+            logger.warning("Kokoro 中文模型不可用，改用本地 MeloTTS 朗读中文（首次需下载）")
+            self._local_zh.start()
+        return self._local_zh.synthesize(text, language="zh")
 
     def synthesize(self, text: str, *, language: str) -> bytes | None:
         if not text or not self._started:
@@ -269,6 +293,12 @@ class AutoTts:
         if getattr(self._kokoro, "warming_up", False):
             return None
 
+        chinese = (language or "")[:2].lower() == "zh"
+        if chinese:
+            pcm = self._synthesize_local_zh(text)
+            if pcm:
+                return pcm
+
         pcm = self._edge.synthesize(text, language=language)
         if pcm:
             if not self._fallback_logged:
@@ -276,5 +306,13 @@ class AutoTts:
                 logger.warning("Kokoro 不可用，已回退到 edge-tts")
             return pcm
         if self._prefer == "auto":
-            return self._pyttsx3.synthesize(text, language=language)
+            pcm = self._pyttsx3.synthesize(text, language=language)
+            if pcm:
+                return pcm
+        if chinese and getattr(self._local_zh, "warming_up", False):
+            self.last_failure = "本地中文语音 MeloTTS 下载中，在线 edge-tts 连接失败"
+        elif chinese:
+            self.last_failure = "Kokoro 中文模型不可用，在线 edge-tts 连接失败"
+        else:
+            self.last_failure = "Kokoro 未就绪，在线 edge-tts 连接失败"
         return None

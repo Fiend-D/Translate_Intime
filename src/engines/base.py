@@ -23,6 +23,8 @@ class EngineCallbacks:
     on_usage: Callable[[str, dict[str, Any]], None]
     on_engine_status: Callable[[Direction, str, str], None]
     should_defer_rotate: Callable[[Direction], bool]
+    # The engine can no longer serve this direction (e.g. reconnects exhausted).
+    on_channel_lost: Callable[[Direction, str], None] | None = None
 
 
 class TranslationEngine(Protocol):

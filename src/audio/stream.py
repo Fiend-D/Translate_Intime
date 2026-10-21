@@ -11,6 +11,7 @@ import numpy as np
 import sounddevice as sd
 
 from src.audio.pulse_env import temporary_pulse_sink
+from src.utils.audio_utils import StreamResampler
 from src.utils.logger import logger
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -178,7 +179,7 @@ def _add_pulse_devices(result: AudioDeviceMap, seen: set[str]) -> None:
     try:
         # 输入源
         sources = subprocess.run(
-            ["pactl", "list", "short", "sources"], capture_output=True, text=True
+            ["pactl", "list", "short", "sources"], capture_output=True, text=True, timeout=3
         )
         for line in sources.stdout.splitlines():
             parts = line.split()
@@ -198,7 +199,9 @@ def _add_pulse_devices(result: AudioDeviceMap, seen: set[str]) -> None:
             )
 
         # 输出
-        sinks = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True)
+        sinks = subprocess.run(
+            ["pactl", "list", "short", "sinks"], capture_output=True, text=True, timeout=3
+        )
         for line in sinks.stdout.splitlines():
             parts = line.split()
             if len(parts) < 2:
@@ -254,6 +257,7 @@ class AudioStream:
         self.chunk_size = chunk_size
         self._stream: sd.InputStream | None = None
         self._pulse_process: subprocess.Popen[bytes] | None = None
+        self._loopback_resampler: StreamResampler | None = None
         self._loopback_recorder: Any | None = None
         self._proc_exclude: Any | None = None
         self._active = False
@@ -404,7 +408,9 @@ class AudioStream:
             if data.size == 0:
                 return None
             mono = data.mean(axis=1).astype(np.float32)
-            return self.resample(mono, source_rate, self.sample_rate)
+            if self._loopback_resampler is None:
+                self._loopback_resampler = StreamResampler(source_rate, self.sample_rate)
+            return self._loopback_resampler.process(mono)
 
         if self._pulse_process is not None:
             if not self._active or self._pulse_process.stdout is None:

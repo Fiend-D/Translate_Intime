@@ -78,6 +78,12 @@ class VolcTranslationEngine:
             def _on_audio(data: bytes, d: Direction = direction) -> None:
                 cb.on_audio(d, data)
 
+            def _on_lost(message: str, d: Direction = direction) -> None:
+                if cb.on_channel_lost is not None:
+                    cb.on_channel_lost(d, message)
+                else:
+                    cb.on_error(message)
+
             client = VolcASTClient(
                 api_key=api_key,
                 access_token=access_token,
@@ -96,6 +102,7 @@ class VolcTranslationEngine:
                 on_usage=_on_usage,
                 session_rotate_minutes=rotate_m,
                 should_defer_rotate=_defer_rotate,
+                on_lost=_on_lost,
             )
 
             if hotwords or glossary:
@@ -137,6 +144,14 @@ class VolcTranslationEngine:
             return
         with contextlib.suppress(Exception):
             self._runtime.send_audio(name, pcm)
+
+    def cancel_pending_audio(self, direction: Direction) -> None:
+        """Stop playing the rest of the sentence the server is still streaming."""
+        if self._runtime is None:
+            return
+        with contextlib.suppress(Exception):
+            if self._runtime.cancel_tts(direction.value):
+                logger.info(f"抢话：丢弃火山 {direction.value} 当前句剩余语音")
 
     def close(self) -> None:
         for direction in list(self._active):

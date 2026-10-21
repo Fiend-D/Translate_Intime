@@ -138,10 +138,15 @@ class ProcessExcludeLoopback:
             self._running = False
 
     def _resample(self, data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-        """Resample with anti-alias filtering."""
-        from src.utils.audio_utils import resample
+        """Resample with anti-alias filtering, continuous across 20 ms packets."""
+        from src.utils.audio_utils import StreamResampler
 
-        return resample(data.astype(np.float32), src_rate, dst_rate)
+        resampler = getattr(self, "_resampler", None)
+        if resampler is None or getattr(self, "_resampler_rates", None) != (src_rate, dst_rate):
+            resampler = StreamResampler(src_rate, dst_rate)
+            self._resampler = resampler
+            self._resampler_rates = (src_rate, dst_rate)
+        return np.asarray(resampler.process(data.astype(np.float32)))
 
     def read_float32(self, chunk_size: int) -> np.ndarray | None:
         """读取一个音频块。缓冲区为空时返回 None（不返回零数组）。"""

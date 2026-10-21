@@ -14,6 +14,7 @@ from src.engines.pipeline.mt import AutoMt
 from src.engines.pipeline.nllb_mt import (
     DEFAULT_NLLB_MODEL,
     NllbCt2Mt,
+    cjk_fullwidth_punct,
     model_slug,
     nllb_lang_code,
 )
@@ -31,6 +32,30 @@ def test_nllb_lang_code_mapping() -> None:
     assert nllb_lang_code("EN") == "eng_Latn"
     assert nllb_lang_code("fr") is None
     assert nllb_lang_code("") is None
+
+
+def test_nllb_tokenizer_keeps_sentencepiece_pretokenizer(tmp_path, monkeypatch) -> None:
+    import ctranslate2
+    import transformers
+
+    seen: list[dict] = []
+    monkeypatch.setattr(ctranslate2, "Translator", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda _src, **kwargs: seen.append(kwargs) or object(),
+    )
+
+    NllbCt2Mt(cache_dir=tmp_path)._open_translator_and_tokenizer("cpu", "int8")
+
+    assert seen and "fix_mistral_regex" not in seen[0]
+
+
+def test_cjk_output_uses_fullwidth_punctuation() -> None:
+    assert (
+        cjk_fullwidth_punct("当我到达的时候,我应该和谁说话?") == "当我到达的时候，我应该和谁说话？"
+    )
+    assert cjk_fullwidth_punct("版本 3.5 发布.") == "版本 3.5 发布。"
 
 
 def test_nllb_model_slug() -> None:
@@ -99,11 +124,11 @@ def test_config_economy_defaults() -> None:
     assert cfg.economy_tts_backend == "kokoro"
     assert "nllb-200" in cfg.economy_nllb_model
     assert cfg.economy_kokoro_voice_en == "af_bella"
-    assert cfg.economy_kokoro_voice_zh == "zf_xiaoxiao"
+    assert cfg.economy_kokoro_voice_zh == "zf_001"
     assert cfg.economy_kokoro_speed == 0.92
     assert cfg.economy_sentence_min_chars == 4
     assert cfg.economy_sentence_pause_ms == 900
-    assert cfg.economy_sentence_max_wait_ms == 2800
+    assert cfg.economy_sentence_max_wait_ms == 7000
     assert cfg.economy_utterance_soft_split_ms == 6000
     assert cfg.economy_utterance_soft_split_quiet_ms == 280
 
@@ -123,15 +148,15 @@ def test_build_economy_backends_prefers_nllb_kokoro(tmp_path) -> None:
         mock_mt.return_value = MagicMock(configured=False, warming_up=True)
         mock_tts.return_value = MagicMock(configured=False, warming_up=True)
         mock_asr.return_value = MagicMock(configured=True)
-        asr, mt, tts = build_economy_backends(cfg)
+        asrs, mt, tts = build_economy_backends(cfg)
     mock_mt.assert_called()
     prefer = mock_mt.call_args.kwargs.get("prefer") or mock_mt.call_args[1].get("prefer")
     assert prefer == "nllb"
     mock_tts.assert_called()
     tts_prefer = mock_tts.call_args.kwargs.get("prefer")
     assert tts_prefer == "kokoro"
-    assert asr is mock_asr.return_value
-    assert mt is mock_mt.return_value
+    assert all(a is mock_asr.return_value for a in asrs.values())
+    assert getattr(mt, "inner", mt) is mock_mt.return_value
     assert tts is mock_tts.return_value
 
 

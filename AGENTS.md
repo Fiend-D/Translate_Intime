@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Application code lives in `src/`. Keep orchestration and audio lifecycle logic in `src/core/`, engine adapters in `src/engines/`, platform audio integrations in `src/audio/`, Qt widgets in `src/gui/`, configuration/data objects in `src/models/`, and shared helpers in `src/utils/`. Generated Volcengine protobuf modules are under `python_protogen/`; do not edit them manually. Tests are split into `tests/unit/` and `tests/integration/`. Runtime defaults, icons, terminology lists, and optional model placeholders live in `config/`, `assets/`, `hotwords/`, and `resource/`. Design documents and contracts are in `specs/` and `docs/`.
+Application code lives in `src/`. Keep orchestration and audio lifecycle logic in `src/core/`, engine adapters in `src/engines/`, platform audio integrations in `src/audio/`, Qt widgets in `src/gui/`, configuration/data objects in `src/models/`, and shared helpers in `src/utils/`. Generated Volcengine protobuf modules are under `python_protogen/`; do not edit them manually. Tests are split into `tests/unit/` and `tests/integration/`. Icons, terminology lists, and optional model placeholders live in `assets/`, `hotwords/`, and `resource/`; setting defaults are defined only by `AppConfigModel` in `src/models/config.py`. Design documents and contracts are in `specs/` and `docs/`.
 
 ## Build, Test, and Development Commands
 
@@ -29,4 +29,4 @@ History follows short Conventional Commit-style subjects, for example `feat(audi
 
 ## Security & Configuration Tips
 
-Never commit API keys, local transcripts, downloaded models, or device-specific configuration. Preserve `.gitignore` protections for `.env`, logs, media, caches, and model files. Treat `config/default_config.yaml` as non-secret defaults only.
+Never commit API keys, local transcripts, downloaded models, or device-specific configuration. Preserve `.gitignore` protections for `.env`, logs, media, caches, and model files. User settings live in `~/.config/translator_intime/config.json`; secrets are stored in the system keyring, never in that file.

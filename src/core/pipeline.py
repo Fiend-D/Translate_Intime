@@ -14,6 +14,12 @@ from src.audio.session_ducker import Mode as DuckerMode
 from src.audio.session_ducker import SessionDucker
 from src.core.audio_capture import AudioCapture
 from src.core.audio_player import AudioPlayer
+from src.core.echo_canceller import (
+    AecResult,
+    EchoCanceller,
+    LoopbackEchoCanceller,
+    PlaybackReference,
+)
 from src.core.exceptions import EngineLoadError
 from src.core.speech_gate import SpeechGate
 from src.core.volc_engine import resolve_volc_credentials
@@ -24,6 +30,7 @@ from src.models.enums import Direction, LanguageCode, SessionStatus
 from src.models.session import TranslationSession
 from src.models.subtitle import SubtitleEntry
 from src.utils.logger import SubtitleLogger, configure_logging, logger
+from src.utils.resource_paths import resolve_log_dir
 
 
 @dataclass
@@ -48,6 +55,7 @@ class TranslationPipeline(QObject):
     latency_reported = pyqtSignal(int)
     error_occurred = pyqtSignal(str)
     log_message = pyqtSignal(str)
+    channel_lost = pyqtSignal(str, str)  # direction value, message
     usage_reported = pyqtSignal(str, dict)  # source, usage payload
 
     def __init__(self, config: AppConfigModel, registry: object | None = None) -> None:
@@ -61,7 +69,7 @@ class TranslationPipeline(QObject):
         self._player: AudioPlayer | None = None
         self._directions: dict[Direction, DirectionState] = {}
         self._subtitle_logger = SubtitleLogger(
-            Path(config.log_dir),
+            resolve_log_dir(config.log_dir),
             enabled=config.transcript_logging_enabled,
             retention_days=config.transcript_retention_days,
         )
@@ -71,9 +79,14 @@ class TranslationPipeline(QObject):
         self._play_outbound_voice = False
         self._play_inbound_voice = False
         self._engine: TranslationEngine | None = None
+        self._engine_built_with: tuple[tuple[str, str], ...] = ()
         self._input_device: int | str | None = None
         self._output_device: int | str | None = None
         self._loopback_device: int | str | None = None
+        # Device the running game channel really captures; callers may reset _loopback_device.
+        self._inbound_loopback: int | str | None = None
+        # Game audio keeps flowing during TTS only after the feedback check fully ran.
+        self._inbound_route_checked = False
         self._vad_outbound: SpeechGate | None = None
         self._vad_inbound: SpeechGate | None = None
         self._vad_outbound_filters = False
@@ -100,6 +113,14 @@ class TranslationPipeline(QObject):
             Direction.INBOUND: 0,
         }
         self._feedback_buffer_max_bytes: int = 5 * 16000 * 2  # 每方向最多延迟 5 秒
+        # 译文只进虚拟线（会议软件），麦克风物理上听不到，无需闭麦缓存。
+        self._outbound_echo_free = False
+        self._aec: EchoCanceller | None = None
+        # Our playback reaches the game capture (same device's monitor/loopback):
+        # cancel it digitally instead of muting the game channel during TTS.
+        self._inbound_feedback_route = False
+        self._aec_inbound: LoopbackEchoCanceller | None = None
+        self._reference: PlaybackReference | None = None
         self._barge_in_started_at: dict[Direction, float] = {
             Direction.OUTBOUND: 0.0,
             Direction.INBOUND: 0.0,
@@ -118,7 +139,7 @@ class TranslationPipeline(QObject):
         # 保护 buffer 写入的锁（on_pcm 在录音线程被调用）
         self._feedback_buffer_lock = threading.Lock()
 
-        configure_logging(Path(config.log_dir), config.debug_mode)
+        configure_logging(resolve_log_dir(config.log_dir), config.debug_mode)
 
     @property
     def mode(self) -> str:
@@ -169,23 +190,20 @@ class TranslationPipeline(QObject):
         if mode == "economy":
             from src.engines.pipeline.engine import (
                 economy_asr_requires_dashscope,
+                economy_stack_label,
                 resolve_dashscope_api_key,
-                resolve_economy_asr_backend,
             )
 
-            asr_pref = resolve_economy_asr_backend(self._config)
             # Local / Live Captions / sherpa / whisper do not need DashScope.
             if not economy_asr_requires_dashscope(self._config):
-                if asr_pref == "live_captions":
-                    return True, "经济模式：Windows Live Captions + NLLB 本地翻译 + Kokoro TTS"
-                return True, "经济模式：本地 ASR + NLLB 本地翻译 + Kokoro TTS"
+                return True, economy_stack_label(self._config)
             if not resolve_dashscope_api_key(self._config):
                 return (
                     False,
                     "请先填写 DashScope API Key（经济模式）或设置环境变量 DASHSCOPE_API_KEY，"
                     "或切换为「本地 ASR / Live Captions」。",
                 )
-            return True, "经济模式：阿里云 Fun-ASR + NLLB 本地翻译 + Kokoro TTS"
+            return True, economy_stack_label(self._config)
         if mode == "volc":
             if not self.has_volc_credentials():
                 return False, "请先填写火山 API Key（当前为火山同传模式）。"
@@ -203,8 +221,6 @@ class TranslationPipeline(QObject):
 
         self.close_engine()
         self._config = self._config.model_copy(update={"translation_mode": mode})
-        # Keep use_volc in sync for backward-compatible config readers.
-        self._config = self._config.model_copy(update={"use_volc": mode == "volc"})
 
     def close_engine(self) -> None:
         if self._engine is not None:
@@ -222,18 +238,33 @@ class TranslationPipeline(QObject):
             on_usage=lambda src, payload: self.usage_reported.emit(src, payload),
             on_engine_status=lambda d, eng, st: self.engine_status_changed.emit(d.value, eng, st),
             should_defer_rotate=self._should_defer_rotate,
+            on_channel_lost=self._on_engine_channel_lost,
         )
 
     def _should_defer_rotate(self, direction: Direction) -> bool:
         gate = self._vad_outbound if direction == Direction.OUTBOUND else self._vad_inbound
         return bool(gate is not None and gate.is_open)
 
+    def _engine_signature(self) -> tuple[tuple[str, str], ...]:
+        """Settings baked into the economy engine's backends at construction."""
+        data = self._config.model_dump(mode="json")
+        keys = sorted(k for k in data if k.startswith("economy_") or k == "device_preference")
+        return tuple((k, repr(data[k])) for k in keys)
+
     def _ensure_engine(self) -> TranslationEngine:
         mode: EngineMode = getattr(self._config, "translation_mode", "volc") or "volc"
+        signature = self._engine_signature()
         if self._engine is not None and self._engine.engine_id == mode:
-            return self._engine
+            stale = (
+                mode == "economy"
+                and bool(self._engine_built_with)
+                and signature != self._engine_built_with
+            )
+            if not stale or self._engine.active_directions:
+                return self._engine
         self.close_engine()
         self._engine = create_engine(mode, self._config, self._engine_callbacks())
+        self._engine_built_with = signature
         return self._engine
 
     def start(
@@ -377,6 +408,7 @@ class TranslationPipeline(QObject):
                 # 解决 TTS 多段累积下静音窗口不足的问题
                 self._player.on_segment_finished = self._on_tts_segment_finished
                 self._player.start()
+            self._refresh_outbound_echo_route()
 
             if voice:
                 ducker_created = self._ducker is None
@@ -412,6 +444,7 @@ class TranslationPipeline(QObject):
             self._outbound_active = True
         else:
             self._inbound_active = True
+            self._inbound_loopback = self._loopback_device
             self.log_message.emit(f"游戏声音捕获设备：{self._loopback_device!r}")
 
         self.log_message.emit(f"{engine_label}已就绪（{label}）")
@@ -465,6 +498,7 @@ class TranslationPipeline(QObject):
             self._vad_outbound_filters = False
             self._outbound_active = False
             self._play_outbound_voice = False
+            self._refresh_echo_canceller()
         else:
             if self._capture_inbound is capture:
                 self._capture_inbound = None
@@ -472,11 +506,15 @@ class TranslationPipeline(QObject):
             self._inbound_active = False
             self._play_inbound_voice = False
             self._loopback_device = previous_loopback
+            self._inbound_feedback_route = False
+            self._refresh_echo_canceller()
 
         if player_created and self._player is not None:
+            self._drop_echo_canceller()
             with contextlib.suppress(Exception):
                 self._player.stop()
             self._player = None
+            self._outbound_echo_free = False
 
         if ducker_created and self._ducker is not None:
             with contextlib.suppress(Exception):
@@ -546,12 +584,24 @@ class TranslationPipeline(QObject):
         return str(device)
 
     def _validate_feedback_routes(self, direction: Direction) -> None:
-        """Block routes where app playback would be captured by the game channel."""
+        """Detect routes where app playback is captured by the game channel.
+
+        Such routes get a loopback echo canceller on the game channel (see
+        ``_refresh_echo_canceller``), so a single headset still works.
+        """
         inbound_active = self._inbound_active or direction == Direction.INBOUND
         voice_playback = self._play_outbound_voice or self._play_inbound_voice
+        self._inbound_route_checked = False
+        self._inbound_feedback_route = False
         if not inbound_active or not voice_playback:
+            self._inbound_route_checked = True
             return
 
+        loopback = (
+            self._inbound_loopback
+            if self._inbound_active and direction == Direction.OUTBOUND
+            else self._loopback_device
+        )
         try:
             from src.audio.device_guard import (
                 is_process_exclude_capture,
@@ -560,30 +610,27 @@ class TranslationPipeline(QObject):
             )
 
             output_name = self._device_name(self._output_device, kind="output")
-            loopback_name = self._device_name(self._loopback_device, kind="input")
-            if shares_physical_output_path(
+            loopback_name = self._device_name(loopback, kind="input")
+            shared = shares_physical_output_path(
                 output_name=output_name,
                 output_device=self._output_device,
                 loopback_name=loopback_name,
-                loopback_device=self._loopback_device,
-            ):
-                raise EngineLoadError(
-                    "语音输出与游戏字幕捕获共用同一虚拟线或扬声器 Loopback，"
-                    "会造成回灌。请把译文输出到 CABLE Input / 另一只设备。"
-                )
-            if (
+                loopback_device=loopback,
+            ) or (
                 self._output_device is None
-                and is_system_loopback_capture(loopback_name, self._loopback_device)
-                and not is_process_exclude_capture(loopback_name, self._loopback_device)
-            ):
-                raise EngineLoadError(
-                    "语音输出为默认设备，游戏字幕使用经典 Loopback，"
-                    "会捕获本应用声音。请明确选择 CABLE Input / 另一只输出设备。"
+                and is_system_loopback_capture(loopback_name, loopback)
+                and not is_process_exclude_capture(loopback_name, loopback)
+            )
+            if shared:
+                self._inbound_feedback_route = True
+                self.log_message.emit(
+                    "语音输出会被游戏字幕捕获（同一设备的 Loopback/监听），"
+                    "已启用回采消除：译文不会再被当成游戏声音识别。"
                 )
-        except EngineLoadError:
-            raise
         except Exception as exc:
-            logger.debug(f"feedback route validation skipped: {exc}")
+            logger.warning(f"回灌检查未能完成，播报期间将暂停游戏声道: {exc}")
+            return
+        self._inbound_route_checked = True
 
     def _make_vad(self, profile: str, *, force: bool = False) -> SpeechGate | None:
         if profile == "game":
@@ -614,14 +661,14 @@ class TranslationPipeline(QObject):
         if self._ducker is not None:
             return
         mode: DuckerMode = self._config.original_audio
-        gain = float(getattr(self._config, "duck_gain", 0.2) or 0.2)
+        gain = float(self._config.duck_gain)
         self._ducker = SessionDucker(mode=mode, duck_gain=gain)
 
     def _refresh_ducker_config(self) -> None:
         if self._ducker is None:
             return
         mode: DuckerMode = self._config.original_audio
-        gain = float(getattr(self._config, "duck_gain", 0.2) or 0.2)
+        gain = float(self._config.duck_gain)
         self._ducker.configure(mode=mode, duck_gain=gain)
 
     def stop_channel(self, direction: Direction) -> None:
@@ -639,6 +686,7 @@ class TranslationPipeline(QObject):
                 with contextlib.suppress(Exception):
                     self._capture_outbound.stop()
                 self._capture_outbound = None
+            self._refresh_echo_canceller()
             self._vad_outbound = None
             self._vad_outbound_filters = False
             self._barge_in_started_at[Direction.OUTBOUND] = 0.0
@@ -651,6 +699,10 @@ class TranslationPipeline(QObject):
                 self._capture_inbound = None
             self._vad_inbound = None
             self._inbound_active = False
+            self._inbound_loopback = None
+            self._inbound_route_checked = False
+            self._inbound_feedback_route = False
+            self._refresh_echo_canceller()
             self._play_inbound_voice = False
 
         dp = self._directions.get(direction)
@@ -663,9 +715,11 @@ class TranslationPipeline(QObject):
             self._inbound_active and self._play_inbound_voice
         )
         if self._player is not None and not other_wants:
+            self._drop_echo_canceller()
             with contextlib.suppress(Exception):
                 self._player.stop()
             self._player = None
+            self._outbound_echo_free = False
 
         label = "麦克风" if direction == Direction.OUTBOUND else "游戏字幕"
         self.log_message.emit(f"{label}通道已停止")
@@ -699,9 +753,11 @@ class TranslationPipeline(QObject):
                 self._capture_inbound.stop()
             self._capture_inbound = None
         if self._player is not None:
+            self._drop_echo_canceller()
             with contextlib.suppress(Exception):
                 self._player.stop()
             self._player = None
+            self._outbound_echo_free = False
         self._outbound_active = False
         self._inbound_active = False
         with contextlib.suppress(ValueError):
@@ -710,29 +766,22 @@ class TranslationPipeline(QObject):
         logger.info("Translation session stopped")
 
     def _on_capture_error(self, direction: Direction, exc: Exception) -> None:
-        """Mark a direction unavailable when its device read loop exits."""
-        capture = (
-            self._capture_outbound if direction == Direction.OUTBOUND else self._capture_inbound
-        )
-        if capture is not None:
-            with contextlib.suppress(Exception):
-                capture.stop()
-            if direction == Direction.OUTBOUND:
-                self._capture_outbound = None
-            else:
-                self._capture_inbound = None
-        if self._engine is not None:
-            with contextlib.suppress(Exception):
-                self._engine.stop_direction(direction)
-        if direction == Direction.OUTBOUND:
-            self._outbound_active = False
-        else:
-            self._inbound_active = False
-        message = f"{direction.value} 音频设备已断开，通道已暂停：{exc}"
+        """Device read loop died (unplugged/reset): ask the UI to stop the channel cleanly.
+
+        Runs on the capture thread, so the full teardown (engine, player, ducker,
+        session status) is left to ``stop_channel`` on the owner's side.
+        """
+        label = "麦克风" if direction == Direction.OUTBOUND else "游戏声音"
+        message = f"{label}音频设备已断开，通道已停止：{exc}"
         logger.warning(message)
         self.engine_status_changed.emit(direction.value, self.mode, "error")
-        self.error_occurred.emit(message)
-        self.status_changed.emit("running" if self.active_channels() else "paused")
+        self.channel_lost.emit(direction.value, message)
+
+    def _on_engine_channel_lost(self, direction: Direction, message: str) -> None:
+        """Engine gave up on a direction; same clean UI-side stop as a lost device."""
+        logger.warning(message)
+        self.engine_status_changed.emit(direction.value, self.mode, "error")
+        self.channel_lost.emit(direction.value, message)
 
     def _on_engine_source(self, direction: Direction, text: str, is_final: bool) -> None:
         dp = self._directions.get(direction)
@@ -877,12 +926,76 @@ class TranslationPipeline(QObject):
         """估算 AudioPlayer 队列中剩余音频时长 (秒)."""
         if self._player is None:
             return 0.0
+        queued = getattr(self._player, "queued_seconds", None)
+        if isinstance(queued, int | float):
+            return float(queued)
         try:
             qsize = self._player.queue_size
         except Exception:
             qsize = 0
-        # 队列里每段平均 ~1.5 秒 (经验值), 不精确但足以防止回灌
+        # 无时长信息时按每段 ~1.5 秒估算
         return qsize * 1.5
+
+    def _refresh_outbound_echo_route(self) -> None:
+        """Mic cannot hear playback that only goes into a virtual cable."""
+        from src.core.audio_player import is_virtual_device_name
+
+        player = self._player
+        echo_free = False
+        if player is not None and bool(getattr(player, "is_virtual_output", False)):
+            mic_name = self._device_name(self._input_device, kind="input")
+            echo_free = not is_virtual_device_name(mic_name)
+        if echo_free and not self._outbound_echo_free:
+            logger.info("译文输出为虚拟线且麦克风为物理设备：麦克风通道不闭麦")
+        self._outbound_echo_free = echo_free
+        self._refresh_echo_canceller()
+
+    def _refresh_echo_canceller(self) -> None:
+        """Cancel our TTS where it leaks back: mic (speakers) and game loopback.
+
+        Both cancellers read one ``PlaybackReference`` fed by the player.
+        """
+        player = self._player
+        mic = (
+            player is not None
+            and self._capture_outbound is not None
+            and not self._outbound_echo_free
+            and bool(getattr(self._config, "aec_enabled", True))
+        )
+        loop = player is not None and self._inbound_feedback_route
+        if not mic:
+            self._aec = None
+        if not loop:
+            self._aec_inbound = None
+        if player is None or not (mic or loop):
+            self._drop_echo_canceller()
+            return
+        if self._reference is None:
+            self._reference = PlaybackReference(origin=time.monotonic())
+            player.on_reference = self._reference.push
+        if mic and self._aec is None:
+            self._aec = EchoCanceller(self._reference)
+            logger.info("麦克风通道已启用软件回声消除")
+        if loop and self._aec_inbound is None:
+            self._aec_inbound = LoopbackEchoCanceller(self._reference)
+            logger.info("游戏字幕通道已启用回采消除（本应用语音输出）")
+
+    def _drop_echo_canceller(self) -> None:
+        player = self._player
+        if player is not None:
+            player.on_reference = None
+        self._aec = None
+        self._aec_inbound = None
+        self._reference = None
+
+    def _cancel_pending_tts(self) -> None:
+        """Drop translations queued for synthesis so they do not play after an interrupt."""
+        cancel = getattr(self._engine, "cancel_pending_audio", None)
+        if not callable(cancel):
+            return
+        for direction in (Direction.OUTBOUND, Direction.INBOUND):
+            with contextlib.suppress(Exception):
+                cancel(direction)
 
     def _on_engine_error(self, message: str) -> None:
         self.log_message.emit(message)
@@ -914,6 +1027,25 @@ class TranslationPipeline(QObject):
         任一为 True 都保持静音窗口, 避免估算不准导致回灌.
         """
         now = time.time()
+        aec_result: AecResult | None = None
+        aec: EchoCanceller | LoopbackEchoCanceller | None = (
+            self._aec if direction == Direction.OUTBOUND else self._aec_inbound
+        )
+        if aec is not None:
+            try:
+                aec_result = aec.process(pcm, time.monotonic())
+            except Exception as exc:
+                logger.warning(f"回声消除异常，已停用：{exc}")
+                if direction == Direction.OUTBOUND:
+                    self._aec = None
+                else:
+                    # Without cancellation the game channel would recapture our TTS.
+                    self._aec_inbound = None
+                    self._inbound_route_checked = False
+            else:
+                if not aec_result.pcm:
+                    return
+                pcm = aec_result.pcm
         gate = self._vad_outbound if direction == Direction.OUTBOUND else self._vad_inbound
         result = gate.process(pcm) if gate is not None else None
 
@@ -930,6 +1062,13 @@ class TranslationPipeline(QObject):
         # 双重判定: 时间窗口 OR 真实播放状态
         player_busy = self._player is not None and self._player.is_playing
         in_silence = (now < self._tts_playing_until) or player_busy
+        if direction == Direction.OUTBOUND and self._outbound_echo_free:
+            in_silence = False
+        # Routes where playback reaches the game capture are refused at start
+        # (_validate_feedback_routes), and the game/video voice does not pause for
+        # our TTS: muting or "barge-in" there would only cut every translation off.
+        if direction == Direction.INBOUND and self._inbound_route_checked:
+            in_silence = False
         if not in_silence:
             self._barge_in_started_at[direction] = 0.0
             # 窗口已解除：先把 buffer 残留（来自上次静音期）回放，再发当前帧
@@ -949,12 +1088,25 @@ class TranslationPipeline(QObject):
         overflow = False
         if result is not None and result.opened_now and result.preroll:
             overflow = self._append_feedback_buffer(direction, result.preroll)
-        overflow = self._append_feedback_buffer(direction, pcm) or overflow
+        # Same filtering as the live path: replaying VAD-rejected noise after TTS
+        # would hand the engine audio it would never have received otherwise.
+        filters = direction == Direction.INBOUND or self._vad_outbound_filters
+        if result is None or result.passed or not filters:
+            overflow = self._append_feedback_buffer(direction, pcm) or overflow
         if overflow:
             self._end_tts_mute_for_buffer_limit(direction)
             return
 
         if result is None or not result.passed:
+            self._barge_in_started_at[direction] = 0.0
+            return
+        if (
+            aec_result is not None
+            and aec_result.far_active
+            and aec_result.converged
+            and not aec_result.near_end_dominant
+        ):
+            # VAD fired on residual echo of our own TTS, not on the user.
             self._barge_in_started_at[direction] = 0.0
             return
 
@@ -1007,6 +1159,7 @@ class TranslationPipeline(QObject):
         if self._player is not None:
             with contextlib.suppress(Exception):
                 self._player.clear_queue()
+        self._cancel_pending_tts()
         if self._ducker is not None:
             with contextlib.suppress(Exception):
                 self._ducker.release()
@@ -1020,6 +1173,7 @@ class TranslationPipeline(QObject):
         if self._player is not None:
             with contextlib.suppress(Exception):
                 self._player.clear_queue()
+        self._cancel_pending_tts()
         if self._ducker is not None:
             with contextlib.suppress(Exception):
                 self._ducker.release()

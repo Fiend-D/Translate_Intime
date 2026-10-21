@@ -42,6 +42,12 @@ class UtteranceBuffer:
         self._lock = threading.RLock()
         self.last_push_at: float = 0.0
 
+    @property
+    def has_audio(self) -> bool:
+        """Captured speech is waiting to be cut into an utterance."""
+        with self._lock:
+            return bool(self._buf)
+
     def _duration_ms(self) -> float:
         samples = len(self._buf) // 2
         return (samples / self._sample_rate) * 1000.0

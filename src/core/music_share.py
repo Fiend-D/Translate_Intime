@@ -34,6 +34,8 @@ AUDIO_EXTENSIONS = {
 _SUPPORTED_NATIVE = {".wav", ".flac", ".ogg", ".aiff", ".aif", ".w64"}
 _MAX_OUTPUT_PEAK = 0.999
 _PROGRESS_INTERVAL_SEC = 0.1
+# Windowed builds would flash a console window for each decode.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _FFMPEG_TIMEOUT_SEC = 120.0
 
 
@@ -120,6 +122,7 @@ def _ffmpeg_decode(
                 text=True,
                 check=False,
                 timeout=_FFMPEG_TIMEOUT_SEC,
+                creationflags=_NO_WINDOW,
             )
             returncode = completed.returncode
             stdout = completed.stdout
@@ -130,6 +133,7 @@ def _ffmpeg_decode(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                creationflags=_NO_WINDOW,
             )
             deadline = time.monotonic() + _FFMPEG_TIMEOUT_SEC
             while True:

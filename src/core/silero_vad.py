@@ -6,27 +6,46 @@ Uses the official snakers4/silero-vad stateful ONNX model. The model consumes
 
 from __future__ import annotations
 
+import contextlib
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.request import urlretrieve
+from urllib.request import urlopen
 
 import numpy as np
 
+from src.utils import download_progress
+from src.utils.file_integrity import matches_sha256
 from src.utils.logger import logger
 from src.utils.resource_paths import bundled_path, model_resource_root
 
 SILERO_VAD_URLS = [
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
-    "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
     "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+    "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
 ]
 SILERO_VAD_URL = SILERO_VAD_URLS[0]
+SILERO_VAD_SHA256 = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
 _BUNDLED_MODEL_PATH = bundled_path("resource", "vad", "silero_vad.onnx")
 _PERSISTENT_MODEL_PATH = model_resource_root() / "vad" / "silero_vad.onnx"
 DEFAULT_MODEL_PATH = (
     _BUNDLED_MODEL_PATH if _BUNDLED_MODEL_PATH.is_file() else _PERSISTENT_MODEL_PATH
 )
+
+
+_DOWNLOAD_TIMEOUT_SECONDS = 30
+
+
+def _fetch(url: str, target: Path, *, reporthook: Callable[[int, int, int], None]) -> None:
+    """``urlretrieve`` without its unbounded socket wait on a stalled mirror."""
+    with urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response, target.open("wb") as out:
+        total = int(response.headers.get("Content-Length") or -1)
+        blocks = 0
+        while chunk := response.read(64 * 1024):
+            out.write(chunk)
+            blocks += 1
+            reporthook(blocks, 64 * 1024, total)
 
 
 class SileroVadEngine:
@@ -99,35 +118,65 @@ class SileroVadEngine:
         if self.sample_rate != 16000:
             logger.warning("Silero VAD only supports 16 kHz input in this pipeline")
             return False
-        if not self.model_path.exists() and not self._download_model():
-            return False
-        try:
-            import onnxruntime as ort
+        downloaded = False
+        if not self.model_path.exists():
+            if not self._download_model():
+                return False
+            downloaded = True
+        while True:
+            try:
+                self._open_session()
+                logger.info(f"Silero VAD 已加载: {self.model_path}")
+                return True
+            except Exception as exc:
+                self._session = None
+                if downloaded:
+                    logger.warning(f"Silero VAD 加载失败，回退 RMS VAD: {exc}")
+                    return False
+                # A truncated file from an interrupted download would otherwise stick forever.
+                logger.warning(f"Silero VAD 模型文件损坏，重新下载: {exc}")
+                with contextlib.suppress(OSError):
+                    self.model_path.unlink()
+                if not self._download_model():
+                    return False
+                downloaded = True
 
-            self._session = ort.InferenceSession(
-                str(self.model_path),
-                providers=["CPUExecutionProvider"],
-            )
-            self._input_names = {i.name for i in self._session.get_inputs()}
-            self.reset()
-            logger.info(f"Silero VAD 已加载: {self.model_path}")
-            return True
-        except Exception as exc:
-            logger.warning(f"Silero VAD 加载失败，回退 RMS VAD: {exc}")
-            self._session = None
-            return False
+    def _open_session(self) -> None:
+        import onnxruntime as ort
+
+        self._session = ort.InferenceSession(
+            str(self.model_path),
+            providers=["CPUExecutionProvider"],
+        )
+        self._input_names = {i.name for i in self._session.get_inputs()}
+        self.reset()
 
     def _download_model(self) -> bool:
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
+        partial = self.model_path.with_name(self.model_path.name + ".part")
+        key = "vad:silero"
+        download_progress.begin(key, "Silero VAD", dest=self.model_path)
+
+        def _hook(blocks: int, block_size: int, total: int) -> None:
+            download_progress.update(key, blocks * block_size, total if total > 0 else None)
+
         for url in SILERO_VAD_URLS:
             try:
                 logger.info(f"Silero VAD 模型缺失，尝试下载: {url}")
-                urlretrieve(url, self.model_path)
+                download_progress.set_source(key, url)
+                _fetch(url, partial, reporthook=_hook)
+                if not matches_sha256(partial, SILERO_VAD_SHA256, cache=False):
+                    raise ValueError("SHA-256 校验失败（镜像返回的文件不可信）")
+                partial.replace(self.model_path)
                 logger.info(f"Silero VAD 模型已保存: {self.model_path}")
+                download_progress.finish(key, ok=True)
                 return True
             except Exception as exc:
+                with contextlib.suppress(OSError):
+                    partial.unlink()
                 logger.warning(f"Silero VAD 模型下载失败（{url}）: {exc}")
         logger.warning("Silero VAD 所有镜像下载均失败，回退 RMS VAD")
+        download_progress.finish(key, ok=False, error="所有镜像均失败")
         return False
 
     def _build_inputs(self, x: np.ndarray) -> dict[str, np.ndarray]:

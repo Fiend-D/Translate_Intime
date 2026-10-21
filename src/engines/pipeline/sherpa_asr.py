@@ -19,16 +19,19 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 import numpy as np
 
+from src.utils import download_progress
 from src.utils.file_integrity import matches_sha256
+from src.utils.http_download import fetch_resumable
 from src.utils.logger import logger
 from src.utils.resource_paths import model_resource_root
 
 _CACHE_ROOT = model_resource_root() / "asr"
 _LOG_INTERVAL_SEC = 30.0
+# Silence fed after each streaming utterance (sherpa-onnx examples use 0.66 s).
+_STREAMING_TAIL_PADDING = np.zeros(int(0.66 * 16000), dtype=np.float32)
 _CHUNK = 1024 * 256
 
 # HuggingFace 镜像源, 与 nllb_mt.py 保持一致 (优先 hf-mirror.com)
@@ -528,9 +531,11 @@ class SherpaOnnxAsr:
             return text or None
 
         # 流式 (OnlineRecognizer): 增量解码
-        # Each recognize() call owns a complete temporary stream. Mark its input
-        # finished so the transducer emits the final token instead of truncating
-        # words at PCM chunk boundaries.
+        # Each recognize() call owns a complete temporary stream. The encoder only
+        # emits a frame once it has seen its right context, so the last words
+        # stay undecoded ("beautiful" → "beauti", or dropped) unless silence is
+        # fed after the speech before marking the input finished.
+        stream.accept_waveform(16000, _STREAMING_TAIL_PADDING)
         stream.input_finished()
         while recognizer.is_ready(stream):
             recognizer.decode_stream(stream)
@@ -717,10 +722,7 @@ class SherpaOnnxAsr:
         if not self._auto_download:
             logger.warning(f"本地 ASR 模型缺失且禁用下载: {cache_dir}")
             return False
-        # 存在不完整文件时先清掉再下, 避免 "size>0 就跳过" 留下坏文件
-        if cache_dir.is_dir() and any(cache_dir.iterdir()):
-            logger.info(f"本地 ASR 模型不完整，将重新下载: {cache_dir}")
-            _purge_model_files(info, cache_dir)
+        # Files that fail the size/SHA check are replaced one by one; .part files resume.
         return self._download_model(info, cache_dir)
 
     def _files_ready(self, info: dict[str, Any], cache_dir: Path) -> bool:
@@ -736,49 +738,53 @@ class SherpaOnnxAsr:
         return True
 
     def _download_model(self, info: dict[str, Any], cache_dir: Path) -> bool:
-        from src.utils.proxy_env import prepare_model_download_env, without_proxy
+        from src.utils.proxy_env import prepare_model_download_env, use_proxy_for_downloads
 
         prepare_model_download_env()
+        trust_env = use_proxy_for_downloads()
         cache_dir.mkdir(parents=True, exist_ok=True)
         repo = info["repo"]
         files = info["files"]
         mins = _MIN_FILE_BYTES.get(cache_dir.name, {})
         hashes = _FILE_SHA256.get(cache_dir.name, {})
 
-        with without_proxy():
-            for role, fname in files.items():
-                target = cache_dir / fname
-                min_bytes = mins.get(fname, 1)
-                expected_sha256 = hashes.get(fname)
-                if _file_ok(target, min_bytes=min_bytes, expected_sha256=expected_sha256):
-                    continue
-                if target.exists():
+        for role, fname in files.items():
+            target = cache_dir / fname
+            min_bytes = mins.get(fname, 1)
+            expected_sha256 = hashes.get(fname)
+            if _file_ok(target, min_bytes=min_bytes, expected_sha256=expected_sha256):
+                continue
+            key = f"asr:{cache_dir.name}:{fname}"
+            title = str(info.get("title") or cache_dir.name)
+            download_progress.begin(key, f"{title} · {fname}", dest=target)
+            if target.exists():
+                with suppress(OSError):
+                    target.unlink()
+            last_exc: Exception | None = None
+            for url in _hf_urls(repo, fname):
+                try:
+                    logger.info(f"正在下载本地 ASR: {url}")
+                    download_progress.set_source(key, url)
+                    self._download_url(
+                        url,
+                        target,
+                        min_bytes=min_bytes,
+                        expected_sha256=expected_sha256,
+                        progress_key=key,
+                        trust_env=trust_env,
+                    )
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(f"本地 ASR 镜像失败（{url}）: {exc}")
+                    # The .part file is kept: the next mirror resumes the same bytes.
                     with suppress(OSError):
-                        target.unlink()
-                last_exc: Exception | None = None
-                for url in _hf_urls(repo, fname):
-                    try:
-                        logger.info(f"正在下载本地 ASR: {url}")
-                        self._download_url(
-                            url,
-                            target,
-                            min_bytes=min_bytes,
-                            expected_sha256=expected_sha256,
-                        )
-                        last_exc = None
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                        logger.warning(f"本地 ASR 镜像失败（{url}）: {exc}")
-                        for junk in (target, target.with_suffix(target.suffix + ".part")):
-                            try:
-                                if junk.exists():
-                                    junk.unlink()
-                            except OSError:
-                                pass
-                if last_exc is not None:
-                    logger.warning(f"本地 ASR 文件下载失败: {role}={fname}: {last_exc}")
-                    return False
+                        target.unlink(missing_ok=True)
+            download_progress.finish(key, ok=last_exc is None, error=str(last_exc or ""))
+            if last_exc is not None:
+                logger.warning(f"本地 ASR 文件下载失败: {role}={fname}: {last_exc}")
+                return False
         if not self._files_ready(info, cache_dir):
             logger.warning(f"本地 ASR 下载后校验未通过: {cache_dir}")
             return False
@@ -792,27 +798,12 @@ class SherpaOnnxAsr:
         *,
         min_bytes: int = 1,
         expected_sha256: str | None = None,
+        progress_key: str | None = None,
+        trust_env: bool = True,
     ) -> None:
-        """流式下载并校验 Content-Length / 最小体积 / ONNX 头."""
+        """断点续传下载，并校验最小体积 / SHA-256 / ONNX 头."""
         tmp = target.with_suffix(target.suffix + ".part")
-        if tmp.exists():
-            with suppress(OSError):
-                tmp.unlink()
-        req = Request(url, headers={"User-Agent": "translator-intime/1.0"})
-        with urlopen(req, timeout=120) as resp:
-            expected = resp.headers.get("Content-Length")
-            expected_n = int(expected) if expected and expected.isdigit() else None
-            written = 0
-            with tmp.open("wb") as out:
-                while True:
-                    chunk = resp.read(_CHUNK)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    written += len(chunk)
-        if expected_n is not None and written != expected_n:
-            tmp.unlink(missing_ok=True)
-            raise URLError(f"下载长度不匹配: got={written} expected={expected_n}")
+        fetch_resumable(url, tmp, progress_key=progress_key, trust_env=trust_env)
         if not _file_ok(tmp, min_bytes=min_bytes, expected_sha256=expected_sha256):
             size = tmp.stat().st_size if tmp.exists() else 0
             tmp.unlink(missing_ok=True)

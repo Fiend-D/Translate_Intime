@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import audioop
 from dataclasses import dataclass
 
 import numpy as np
@@ -10,6 +9,17 @@ import numpy as np
 from src.core.audio_pre_roll import AudioPreRoll
 from src.core.silero_vad import SileroVadEngine
 from src.utils.logger import logger
+
+
+def _pcm16_rms(pcm: bytes) -> float:
+    """RMS of little-endian int16 PCM normalised to 0..1."""
+    if len(pcm) % 2:
+        raise ValueError("PCM16 buffer length must be even")
+    if not pcm:
+        return 0.0
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    return float(np.sqrt(np.mean(samples * samples))) / 32768.0
+
 
 # 灵敏度档位对应的 RMS 阈值（归一化 0..1，对应 16bit RMS / 32768）
 # 数值越小越灵敏（更容易判定为语音）
@@ -162,10 +172,9 @@ class SpeechGate:
 
     def _accept_rms_block(self, pcm: bytes) -> bool:
         try:
-            rms = audioop.rms(pcm, 2)
-        except Exception:
+            normalized = _pcm16_rms(pcm)
+        except ValueError:
             return True
-        normalized = rms / 32768.0
         self._last_rms = normalized
         self._update_gate(normalized >= self._threshold)
         return self._is_open
@@ -193,8 +202,8 @@ class SpeechGate:
 
     def _update_rms_stat(self, pcm: bytes) -> None:
         try:
-            self._last_rms = audioop.rms(pcm, 2) / 32768.0
-        except Exception:
+            self._last_rms = _pcm16_rms(pcm)
+        except ValueError:
             self._last_rms = 0.0
 
     def _update_gate(self, triggered: bool) -> None:

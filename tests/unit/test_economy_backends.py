@@ -270,6 +270,47 @@ def test_slow_tts_does_not_block_following_asr(tmp_path):
     engine.close()
 
 
+def test_sentences_are_requeued_when_mt_starts_loading_mid_batch(tmp_path):
+    from src.engines.pipeline.engine import _PendingText
+
+    class _SwitchingMt:
+        configured = True
+        warming_up = False
+
+        def start(self) -> None: ...
+
+        def stop(self) -> None: ...
+
+        def translate(self, text: str, *, source_lang: str, target_lang: str) -> str | None:
+            self.warming_up = True
+            return None
+
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=_MockAsr(""),
+        mt=_SwitchingMt(),
+        tts=_MockTts(),
+    )
+    now = time.monotonic()
+    engine._translate_stable_text(
+        Direction.OUTBOUND,
+        _PendingText(
+            text="Hello world. How are you?",
+            source_lang="en",
+            target_lang="zh",
+            play_voice=False,
+            updated_at=now,
+            created_at=now,
+            pcm=b"",
+            chunk_count=1,
+        ),
+    )
+
+    assert engine._pending_text[Direction.OUTBOUND].text == "Hello world. How are you?"
+    engine.close()
+
+
 def test_stopped_tts_worker_does_not_emit_late_audio(tmp_path):
     cb = _callbacks()
     tts = _BlockingTts()
@@ -540,7 +581,28 @@ def test_loading_models_reports_each_warming_backend(tmp_path):
         tts=tts,
     )
 
-    assert engine.loading_models == ("本地 ASR", "NLLB 翻译", "Kokoro 语音")
+    assert engine.loading_models == ("本地 ASR", "NLLB 翻译")
+
+    engine._ensure_tts_started()
+    assert engine.loading_models == ("本地 ASR", "NLLB 翻译", "Kokoro-82M")
+
+
+def test_voice_model_only_loads_for_channels_that_speak(tmp_path):
+    tts = _MockTts()
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=_MockAsr(),
+        mt=_MockMt(),
+        tts=tts,
+    )
+
+    assert engine.start_direction(Direction.INBOUND, play_voice=False) is True
+    assert tts.started is False
+
+    assert engine.start_direction(Direction.OUTBOUND, play_voice=True) is True
+    assert tts.started is True
+    engine.close()
 
 
 def test_inbound_incomplete_phrase_waits_across_audio_bursts(tmp_path, monkeypatch):
@@ -562,12 +624,20 @@ def test_inbound_incomplete_phrase_waits_across_audio_bursts(tmp_path, monkeypat
     monkeypatch.setattr("src.engines.pipeline.engine.time.monotonic", lambda: now)
     job = _Job(Direction.INBOUND, _pcm_ms(100), "en", "zh", False)
     engine._buffer_recognized_text(job, "This is an incomplete")
+    # The next phrase is still being captured: not a sentence end yet.
+    engine._buffers[Direction.INBOUND].push(_pcm_ms(500))
     now = 101.5
     engine._flush_stable_text()
     assert not engine._mt.calls
-    now = 102.5
+
+    engine._buffers[Direction.INBOUND].flush()
+    engine._buffer_recognized_text(job, "sentence that goes on")
+    now = 102.0
     engine._flush_stable_text()
-    assert engine._mt.calls == ["This is an incomplete"]
+    assert not engine._mt.calls
+    now = 103.0
+    engine._flush_stable_text()
+    assert engine._mt.calls == ["This is an incomplete sentence that goes on"]
 
 
 def test_continuous_pcm_does_not_postpone_stable_text_translation(tmp_path, monkeypatch):
@@ -626,7 +696,7 @@ def test_continuous_asr_updates_hit_short_max_wait(tmp_path, monkeypatch):
     assert engine._mt.calls == ["This sentence starts and continues with more context"]
 
 
-def test_two_inbound_asr_chunks_translate_without_waiting_for_third(tmp_path, monkeypatch):
+def test_recent_speech_pcm_postpones_unpunctuated_commit(tmp_path, monkeypatch):
     engine = EconomyPipelineEngine(
         config=AppConfigModel(
             log_dir=str(tmp_path),
@@ -646,10 +716,41 @@ def test_two_inbound_asr_chunks_translate_without_waiting_for_third(tmp_path, mo
     job = _Job(Direction.INBOUND, _pcm_ms(100), "en", "zh", False)
     engine._buffer_recognized_text(job, "This sentence starts")
     now = 102.0
-    engine._buffer_recognized_text(job, "and now has enough context")
+    engine._buffer_recognized_text(job, "and keeps going")
+    # Speech PCM arrived just now (between VAD-cut chunks): the speaker has not paused.
+    engine._last_pcm_at[Direction.INBOUND] = 102.5
+    now = 102.8
     engine._flush_stable_text()
+    assert not engine._mt.calls
 
-    assert engine._mt.calls == ["This sentence starts and now has enough context"]
+    now = 103.5
+    engine._flush_stable_text()
+    assert engine._mt.calls == ["This sentence starts and keeps going"]
+
+
+def test_punctuated_sentence_commits_without_long_pause(tmp_path, monkeypatch):
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=_MockAsr(),
+        mt=_MockMt("__echo__"),
+        tts=_MockTts(),
+    )
+    from src.engines.pipeline.engine import _Job
+
+    now = 100.0
+    monkeypatch.setattr("src.engines.pipeline.engine.time.monotonic", lambda: now)
+    engine._buffer_recognized_text(
+        _Job(Direction.INBOUND, _pcm_ms(100), "en", "zh", False), "It is done."
+    )
+    now = 100.4
+    engine._flush_stable_text()
+    assert engine._mt.calls == ["It is done."]
+
+
+def test_old_default_sentence_max_wait_is_migrated() -> None:
+    assert AppConfigModel(economy_sentence_max_wait_ms=2800).economy_sentence_max_wait_ms == 7000
+    assert AppConfigModel(economy_sentence_max_wait_ms=3600).economy_sentence_max_wait_ms == 3600
 
 
 def test_short_final_asr_pass_does_not_erase_accumulated_text(tmp_path):
@@ -774,7 +875,7 @@ def test_stopping_last_direction_keeps_models_loaded_until_close(tmp_path):
         tts=tts,
     )
 
-    assert engine.start_direction(Direction.INBOUND) is True
+    assert engine.start_direction(Direction.INBOUND, play_voice=True) is True
     engine.stop_direction(Direction.INBOUND)
     assert asr.started is True
     assert mt.started is True
@@ -784,3 +885,176 @@ def test_stopping_last_direction_keeps_models_loaded_until_close(tmp_path):
     assert asr.started is False
     assert mt.started is False
     assert tts.started is False
+
+
+def test_single_chunk_sentence_skips_second_asr_pass(tmp_path):
+    asr = _MockAsr("Hello there.")
+    mt = _MockMt("__echo__")
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=asr,
+        mt=mt,
+        tts=_MockTts(),
+    )
+    from src.engines.pipeline.engine import _Job
+
+    engine._process_job(_Job(Direction.OUTBOUND, _pcm_ms(100), "en", "zh", False))
+    engine._flush_stable_text(force=True)
+
+    assert len(asr.calls) == 1
+    assert mt.calls == ["Hello there."]
+
+
+def test_multi_chunk_sentence_runs_final_asr_pass(tmp_path):
+    asr = _MockAsr("Hello there")
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=asr,
+        mt=_MockMt("__echo__"),
+        tts=_MockTts(),
+    )
+    from src.engines.pipeline.engine import _Job
+
+    engine._process_job(_Job(Direction.OUTBOUND, _pcm_ms(100), "en", "zh", False))
+    asr._text = "my friend."
+    engine._process_job(_Job(Direction.OUTBOUND, _pcm_ms(100), "en", "zh", False))
+    asr._text = "Hello there my friend."
+    engine._flush_stable_text(force=True)
+
+    assert len(asr.calls) == 3
+    assert engine._mt.calls == ["Hello there my friend."]
+
+
+def test_cancel_pending_audio_drops_in_flight_and_queued_tts(tmp_path):
+    cb = _callbacks()
+    tts = _BlockingTts()
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=cb,
+        asr=_MockAsr(),
+        mt=_MockMt(),
+        tts=tts,
+    )
+    engine._enqueue_tts(Direction.OUTBOUND, "in flight", "en")
+    assert tts.entered.wait(timeout=1.0)
+    engine._enqueue_tts(Direction.OUTBOUND, "queued", "en")
+
+    engine.cancel_pending_audio(Direction.OUTBOUND)
+    tts.release.set()
+    _wait_until(lambda: engine._tts_queue.unfinished_tasks == 0)
+
+    cb.on_audio.assert_not_called()
+    assert tts.calls == ["in flight"]
+
+    engine._enqueue_tts(Direction.OUTBOUND, "after interrupt", "en")
+    _wait_until(lambda: cb.on_audio.called)
+    engine.close()
+
+    assert tts.calls == ["in flight", "after interrupt"]
+
+
+def test_trim_repeated_head_keeps_new_words() -> None:
+    from src.engines.pipeline.engine import _trim_repeated_head
+
+    assert _trim_repeated_head("我们先去推中路", "推中路然后打肉山") == "然后打肉山"
+    assert _trim_repeated_head("push mid now.", "Mid now, then Roshan") == "then Roshan"
+    assert _trim_repeated_head("完全不同", "另一句话") == "另一句话"
+    assert _trim_repeated_head("abcd", "abcd") == "abcd"
+
+
+def test_committed_duplicate_is_skipped_within_window(monkeypatch) -> None:
+    from src.engines.pipeline import engine as engine_mod
+
+    clock = [100.0]
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: clock[0])
+    eng = engine_mod.EconomyPipelineEngine.__new__(engine_mod.EconomyPipelineEngine)
+    eng._last_committed = {}
+    d = Direction.INBOUND
+    assert eng._dedupe_committed(d, "Enemy missing mid!") == "Enemy missing mid!"
+    assert eng._dedupe_committed(d, "enemy missing mid") is None
+    clock[0] += 10.0
+    assert eng._dedupe_committed(d, "Enemy missing mid!") == "Enemy missing mid!"
+
+
+def test_each_channel_uses_its_own_asr(tmp_path):
+    from src.engines.pipeline.engine import _Job
+
+    mic_asr = _MockAsr("我说的话")
+    game_asr = _MockAsr("game line")
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr={Direction.OUTBOUND: mic_asr, Direction.INBOUND: game_asr},
+        mt=_MockMt("__echo__"),
+        tts=_MockTts(),
+    )
+    assert engine.start_direction(Direction.INBOUND)
+    assert game_asr.started and not mic_asr.started
+
+    engine._process_job(_Job(Direction.OUTBOUND, _pcm_ms(100), "zh", "en", False))
+    engine._process_job(_Job(Direction.INBOUND, _pcm_ms(100), "en", "zh", False))
+
+    assert [lang for _pcm, lang in mic_asr.calls] == ["zh"]
+    assert [lang for _pcm, lang in game_asr.calls] == ["en"]
+    engine.close()
+    assert not game_asr.started
+
+
+def test_build_channel_asr_shares_instances_by_model(tmp_path, monkeypatch):
+    from src.engines.pipeline import engine as engine_mod
+
+    built: list[str] = []
+
+    def fake_local(_config, _device, model):
+        built.append(model)
+        return _MockAsr(model)
+
+    monkeypatch.setattr(engine_mod, "_build_local_asr", fake_local)
+    base = {"log_dir": str(tmp_path), "economy_asr_backend": "local"}
+
+    split = engine_mod.build_channel_asr(
+        AppConfigModel(**base, economy_asr_mic_model="mic-model", economy_asr_game_model="auto")
+    )
+    assert split[Direction.OUTBOUND] is not split[Direction.INBOUND]
+    assert built == ["mic-model", "auto"]
+
+    built.clear()
+    same = engine_mod.build_channel_asr(
+        AppConfigModel(**base, economy_asr_mic_model="auto", economy_asr_game_model="auto")
+    )
+    assert same[Direction.OUTBOUND] is same[Direction.INBOUND]
+    assert built == ["auto"]
+
+    cloud = engine_mod.build_channel_asr(
+        AppConfigModel(log_dir=str(tmp_path), economy_asr_backend="qwen_flash")
+    )
+    assert cloud[Direction.OUTBOUND] is cloud[Direction.INBOUND]
+
+
+def test_worker_survives_housekeeping_failure(tmp_path, monkeypatch):
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=_MockAsr(),
+        mt=_MockMt(),
+        tts=_MockTts(),
+    )
+    calls = 0
+
+    def flaky() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("transcript locked")
+
+    monkeypatch.setattr(engine, "_flush_stable_text", flaky)
+    assert engine.start_direction(Direction.INBOUND, play_voice=False) is True
+
+    deadline = time.monotonic() + 3
+    while calls < 3 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    engine.close()
+
+    assert calls >= 3

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import importlib.util
 import os
 import shutil
@@ -27,18 +28,27 @@ WORK_DIR = BUILD_DIR / "work"
 ENTRYPOINT = ROOT / "run.py"
 APP_NAME = "SoundFerry"
 
-DATA_DIRS = ("assets", "config", "hotwords")
+DATA_DIRS = ("assets", "hotwords")
 COLLECT_ALL_PACKAGES = (
     "espeakng_loader",
     "faster_whisper",
+    # Chinese G2P for Kokoro v1.1-zh; jieba/pypinyin/cn2an load dictionaries from package data.
+    "cn2an",
+    "jieba",
     "kokoro_onnx",
+    "misaki",
+    "pypinyin",
+    "pypinyin_dict",
+    # Hy-MT2 local translation; bundled only when installed in the build env.
+    "llama_cpp",
     "sherpa_onnx",
 )
 COLLECT_BINARY_PACKAGES = ("ctranslate2",)
-COPY_METADATA_PACKAGES = ("faster-whisper", "kokoro-onnx")
+COPY_METADATA_PACKAGES = ("faster-whisper", "kokoro-onnx", "llama-cpp-python")
 HIDDEN_IMPORTS = (
-    "audioop",
     "dashscope.audio.asr",
+    "dashscope.audio.tts_v2",
+    "edge_tts",
     "google.protobuf",
     "keyring.backends.Windows",
     "pyaudio",
@@ -52,7 +62,6 @@ HIDDEN_IMPORTS = (
     "tokenizers",
     "transformers.models.nllb.tokenization_nllb",
     "uiautomation",
-    "yaml",
 )
 EXCLUDED_MODULES = ("jax", "matplotlib", "tensorflow", "torch")
 
@@ -68,6 +77,10 @@ def _venv_python() -> Path:
     return ROOT / ".venv" / scripts / name
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def reexec_with_project_venv() -> None:
     """Always build with the project environment when it exists."""
     target = _venv_python()
@@ -81,7 +94,11 @@ def reexec_with_project_venv() -> None:
         return
     env = os.environ.copy()
     env["SOUNDFERRY_BUILD_BOOTSTRAPPED"] = "1"
-    os.execve(str(target), [str(target), str(Path(__file__).resolve()), *sys.argv[1:]], env)
+    argv = [str(target), str(Path(__file__).resolve()), *sys.argv[1:]]
+    if _is_windows():
+        # Windows execve spawns a new process and exits 0, hiding a failed build.
+        raise SystemExit(subprocess.run(argv, env=env, check=False).returncode)
+    os.execve(str(target), argv, env)
 
 
 def module_available(name: str) -> bool:
@@ -89,6 +106,14 @@ def module_available(name: str) -> bool:
         return importlib.util.find_spec(name) is not None
     except (ImportError, ModuleNotFoundError, ValueError):
         return False
+
+
+def distribution_available(name: str) -> bool:
+    try:
+        importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
 
 
 def install_dependencies() -> None:
@@ -101,7 +126,7 @@ def install_dependencies() -> None:
         raise RuntimeError(
             "uv is required for reproducible builds. Install it from https://docs.astral.sh/uv/"
         )
-    run([uv, "sync", "--frozen", "--group", "dev", "--active"])
+    run([uv, "sync", "--locked", "--group", "dev", "--active"])
 
 
 def validate_environment(*, allow_missing_pyinstaller: bool = False) -> None:
@@ -171,7 +196,9 @@ def build_command(*, debug: bool, clean: bool) -> list[str]:
         if module_available(package):
             command.extend(["--collect-binaries", package])
     for distribution in COPY_METADATA_PACKAGES:
-        command.extend(["--copy-metadata", distribution])
+        # PyInstaller aborts the whole build on metadata of an uninstalled package.
+        if distribution_available(distribution):
+            command.extend(["--copy-metadata", distribution])
     for module in HIDDEN_IMPORTS:
         if module_available(module.split(".", 1)[0]):
             command.extend(["--hidden-import", module])

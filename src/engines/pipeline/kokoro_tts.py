@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 from typing import Any, cast
 from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 import numpy as np
 
@@ -16,27 +15,47 @@ from src.engines.pipeline.sentence_split import (
     is_punct_only,
     split_sentences,
 )
+from src.models.config import KOKORO_LEGACY_ZH_VOICES
+from src.utils import download_progress
 from src.utils.audio_utils import float32_to_pcm16, resample
 from src.utils.file_integrity import matches_sha256
+from src.utils.http_download import fetch_resumable
 from src.utils.logger import logger
+from src.utils.resource_paths import model_resource_root
 
 _TARGET_SR = 16000
-_CACHE_ROOT = Path.home() / ".cache" / "translator_intime" / "kokoro"
+_LEGACY_CACHE_ROOT = Path.home() / ".cache" / "translator_intime" / "kokoro"
+
+
+def kokoro_cache_root() -> Path:
+    """``resource/tts/kokoro`` like other models; keep using a completed legacy cache."""
+    if (_LEGACY_CACHE_ROOT / "kokoro-v1.0.onnx").is_file():
+        return _LEGACY_CACHE_ROOT
+    return model_resource_root() / "tts" / "kokoro"
+
+
+_CACHE_ROOT = kokoro_cache_root()
 _LOG_INTERVAL_SEC = 30.0
 _INTER_SENTENCE_SILENCE_MS = 120
 _DOWNLOAD_CHUNK_BYTES = 1024 * 256
 _DOWNLOAD_TIMEOUT_SECONDS = 120
-_FILE_SHA256 = {
+_FILE_SHA256: dict[str, str | tuple[str, ...]] = {
     "kokoro-v1.0.onnx": "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5",
-    "kokoro-v1.1-zh.onnx": "eefec708cbc7aba8e8129b5c2f7cb92e1fe7d281af1e1dd451592d9ff0714a0d",
+    # Re-exported upstream on 2026-08-18 (float speed input, needs kokoro-onnx>=0.6.1).
+    "kokoro-v1.1-zh.onnx": (
+        "859f9ded9f53be16c24857cdab3254a45da53c3afd5ba6ef134c7de3f822e326",
+        "eefec708cbc7aba8e8129b5c2f7cb92e1fe7d281af1e1dd451592d9ff0714a0d",
+    ),
     "voices-v1.0.bin": "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d",
     "voices-v1.1-zh.bin": "14cb6186c99e4f6016871405f62046c5df863ae27465cbdc4ee08be7dd703acd",
+    "config-v1.1-zh.json": "bc333efa5ce4ceff433c8c8e5d027a1eca0166001e4e4a62bea2d26ff7a46890",
 }
 
 _GH_MIRRORS = (
-    "https://ghfast.top/https://github.com",
     "https://gh-proxy.com/https://github.com",
     "https://github.com",
+    # Has cut transfers off mid-file and blacklists some release assets.
+    "https://ghfast.top/https://github.com",
 )
 
 
@@ -69,16 +88,15 @@ _ZH_VOICES_URLS = _mirror(
     "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
     "model-files-v1.1/voices-v1.1-zh.bin"
 )
+# The zh model's zhuyin vocab; kokoro-onnx's built-in v1.0 vocab drops nearly every phoneme.
+_ZH_VOCAB_REVISION = "01e7505bd6a7a2ac4975463114c3a7650a9f7218"
+_ZH_VOCAB_URLS = [
+    f"{host}/hexgrad/Kokoro-82M-v1.1-zh/resolve/{_ZH_VOCAB_REVISION}/config.json"
+    for host in ("https://hf-mirror.com", "https://huggingface.co")
+]
 
 DEFAULT_VOICE_EN = "af_bella"
-DEFAULT_VOICE_ZH = "zf_xiaoxiao"
-_ZH_VOICE_FALLBACKS = (
-    "zf_xiaoxiao",
-    "zf_001",
-    "zf_xiaobei",
-    "zf_xiaoni",
-    "zf_xiaoyi",
-)
+DEFAULT_VOICE_ZH = "zf_001"
 
 
 def _silence_pcm(ms: int, *, sample_rate: int = _TARGET_SR) -> bytes:
@@ -148,7 +166,7 @@ class KokoroOnnxTts:
             if self._ready or self._failed or self._loading:
                 return
             self._loading = True
-        logger.info("正在下载 Kokoro…")
+        logger.info("正在准备 Kokoro（缺文件时自动下载）…")
         thread = threading.Thread(
             target=self._load_background,
             name="kokoro-tts-loader",
@@ -165,11 +183,11 @@ class KokoroOnnxTts:
                 self.start_loading()
             return None
         lang = (language or "en")[:2].lower()
-        # Never synthesize Chinese with the English model — let AutoTts use edge-tts.
+        # Never synthesize Chinese with the English model — let AutoTts use MeloTTS.
         if lang == "zh" and not self._zh_ready:
             if not self._zh_missing_logged:
                 self._zh_missing_logged = True
-                logger.warning("Kokoro 中文模型不可用，跳过 EN 音色朗读中文（将回退 edge-tts）")
+                logger.warning("Kokoro 中文不可用，跳过 EN 音色朗读中文（改用 MeloTTS）")
             return None
         try:
             sentences = split_sentences(text, min_chars=1)
@@ -211,24 +229,13 @@ class KokoroOnnxTts:
 
     def _create_zh(self, text: str) -> tuple[Any, int]:
         assert self._kokoro_zh is not None
+        assert self._zh_g2p is not None
         voice = self._pick_zh_voice()
-        # Prefer misaki G2P when available (recommended for v1.1-zh).
-        if self._zh_g2p is not None:
-            phonemes, _ = self._zh_g2p(text)
-            return cast(
-                tuple[Any, int],
-                self._kokoro_zh.create(phonemes, voice=voice, speed=self._speed, is_phonemes=True),
-            )
-        try:
-            return cast(
-                tuple[Any, int],
-                self._kokoro_zh.create(text, voice=voice, speed=self._speed, lang="cmn"),
-            )
-        except TypeError:
-            return cast(
-                tuple[Any, int],
-                self._kokoro_zh.create(text, voice=voice, speed=self._speed),
-            )
+        phonemes, _ = self._zh_g2p(text)
+        return cast(
+            tuple[Any, int],
+            self._kokoro_zh.create(phonemes, voice=voice, speed=self._speed, is_phonemes=True),
+        )
 
     def _pick_voice(self, lang: str) -> str:
         if lang == "zh":
@@ -242,16 +249,16 @@ class KokoroOnnxTts:
         return next(iter(sorted(self._en_voices)), self._voice_en)
 
     def _pick_zh_voice(self) -> str:
-        voices = self._zh_voices or self._en_voices
-        if self._voice_zh in voices:
-            return self._voice_zh
-        for cand in _ZH_VOICE_FALLBACKS:
-            if cand in voices:
-                return cand
-        zf = sorted(v for v in voices if v.startswith("zf_"))
-        if zf:
-            return zf[0]
-        return self._voice_zh
+        voices = self._zh_voices
+        wanted = KOKORO_LEGACY_ZH_VOICES.get(self._voice_zh, self._voice_zh)
+        if not voices or wanted in voices:
+            return wanted
+        # Keep the requested gender rather than collapsing every voice to one speaker.
+        prefix = "zm_" if wanted.startswith("zm_") else "zf_"
+        same_gender = sorted(v for v in voices if v.startswith(prefix))
+        if same_gender:
+            return same_gender[0]
+        return DEFAULT_VOICE_ZH if DEFAULT_VOICE_ZH in voices else sorted(voices)[0]
 
     @staticmethod
     def _to_pcm16(samples: Any, sr: int) -> bytes | None:
@@ -309,6 +316,7 @@ class KokoroOnnxTts:
             en_voices = self._cache_dir / "voices-v1.0.bin"
             zh_model = self._cache_dir / "kokoro-v1.1-zh.onnx"
             zh_voices = self._cache_dir / "voices-v1.1-zh.bin"
+            zh_vocab = self._cache_dir / "config-v1.1-zh.json"
 
             if not self._ensure_file(en_model, _EN_MODEL_URLS):
                 return False
@@ -318,6 +326,7 @@ class KokoroOnnxTts:
             # Best-effort Chinese assets (optional).
             zh_ok = self._ensure_file(zh_model, _ZH_MODEL_URLS, required=False)
             zh_ok = zh_ok and self._ensure_file(zh_voices, _ZH_VOICES_URLS, required=False)
+            zh_ok = zh_ok and self._ensure_file(zh_vocab, _ZH_VOCAB_URLS, required=False)
 
             try:
                 kokoro_en = Kokoro(str(en_model), str(en_voices))
@@ -329,22 +338,25 @@ class KokoroOnnxTts:
             kokoro_zh = None
             zh_voice_ids: set[str] = set()
             zh_g2p = None
-            if zh_ok and zh_model.exists() and zh_voices.exists():
+            if zh_ok:
                 try:
-                    kokoro_zh = Kokoro(str(zh_model), str(zh_voices))
-                    zh_voice_ids = self._list_voices(kokoro_zh)
-                    try:
-                        from misaki import zh as misaki_zh
+                    from misaki import zh as misaki_zh
 
-                        zh_g2p = misaki_zh.ZHG2P()
-                    except Exception:
-                        zh_g2p = None
-                        logger.warning(
-                            "未安装 misaki[zh]，中文韵律可能偏硬；建议: pip install 'misaki[zh]'"
-                        )
+                    # v1.1-zh was trained on misaki's zhuyin+tone set; espeak "cmn"
+                    # phonemes make it drawl with a foreign accent.
+                    zh_g2p = misaki_zh.ZHG2P(version="1.1")
+                    kokoro_zh = Kokoro(str(zh_model), str(zh_voices), vocab_config=str(zh_vocab))
+                    zh_voice_ids = self._list_voices(kokoro_zh)
+                except ImportError:
+                    zh_g2p = None
+                    logger.warning(
+                        "未安装 misaki[zh]，Kokoro 中文不可用，中文改用 MeloTTS；"
+                        "安装: pip install 'misaki[zh]'"
+                    )
                 except Exception as exc:
-                    logger.warning(f"Kokoro 中文模型加载失败，中文将回退 edge-tts: {exc}")
+                    logger.warning(f"Kokoro 中文模型加载失败，中文改用 MeloTTS: {exc}")
                     kokoro_zh = None
+                    zh_g2p = None
 
             with self._lock:
                 self._kokoro_en = kokoro_en
@@ -392,32 +404,53 @@ class KokoroOnnxTts:
         return set()
 
     def _ensure_file(self, path: Path, urls: str | list[str], *, required: bool = True) -> bool:
-        expected_sha256 = _FILE_SHA256.get(path.name)
+        expected_sha256 = _FILE_SHA256.get(path.name, ())
         if expected_sha256 and matches_sha256(path, expected_sha256):
             return True
-        path.unlink(missing_ok=True)
         if not self._auto_download:
-            if required:
-                logger.warning(f"Kokoro 文件缺失且禁用下载: {path}")
+            if required or path.exists():
+                state = "校验不通过" if path.exists() else "缺失"
+                logger.warning(f"Kokoro 文件{state}且禁用下载: {path}")
             return False
+        path.unlink(missing_ok=True)
         url_list = [urls] if isinstance(urls, str) else list(urls)
-        from src.utils.proxy_env import prepare_model_download_env, without_proxy
+        from src.utils.proxy_env import prepare_model_download_env, use_proxy_for_downloads
 
         prepare_model_download_env()
         path.parent.mkdir(parents=True, exist_ok=True)
         last_exc: Exception | None = None
-        with without_proxy():
-            for url in url_list:
-                try:
-                    logger.info(f"正在下载 Kokoro: {url}")
-                    tmp = path.with_suffix(path.suffix + ".part")
-                    self._download_url(url, tmp, expected_sha256=expected_sha256)
-                    tmp.replace(path)
-                    logger.info(f"Kokoro 已保存: {path}")
-                    return True
-                except Exception as exc:
-                    last_exc = exc
-                    logger.warning(f"Kokoro 镜像失败（{url}）: {exc}")
+        key = f"tts:kokoro:{path.name}"
+        download_progress.begin(key, f"Kokoro · {path.name}", dest=path)
+        # Every mirror serves the same asset, so a partial file carries over between them.
+        tmp = path.with_suffix(path.suffix + ".part")
+        for url in url_list:
+            try:
+                logger.info(f"正在下载 Kokoro: {url}")
+                download_progress.set_source(key, url)
+                fetch_resumable(
+                    url,
+                    tmp,
+                    attempts=6,
+                    progress_key=key,
+                    trust_env=use_proxy_for_downloads(),
+                )
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(f"Kokoro 镜像失败（{url}）: {exc}")
+                continue
+            if tmp.stat().st_size <= 0 or (
+                expected_sha256 and not matches_sha256(tmp, expected_sha256, cache=False)
+            ):
+                tmp.unlink(missing_ok=True)
+                # Mirrors proxy the same asset; another full download would fail the same way.
+                last_exc = URLError(f"SHA-256 mismatch for {path.name}")
+                logger.warning(f"Kokoro 校验失败（{url}），不再尝试其他镜像")
+                break
+            tmp.replace(path)
+            logger.info(f"Kokoro 已保存: {path}")
+            download_progress.finish(key, ok=True)
+            return True
+        download_progress.finish(key, ok=False, error=str(last_exc or ""))
         if required:
             logger.warning(f"Kokoro 下载失败: {last_exc}")
             err = str(last_exc).lower() if last_exc else ""
@@ -430,26 +463,3 @@ class KokoroOnnxTts:
             return False
         logger.info(f"Kokoro 可选资源下载跳过/失败: {last_exc}")
         return False
-
-    @staticmethod
-    def _download_url(url: str, target: Path, *, expected_sha256: str | None = None) -> None:
-        """Download atomically with a timeout and Content-Length validation."""
-        target.unlink(missing_ok=True)
-        request = Request(url, headers={"User-Agent": "translator-intime/1.0"})
-        with urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
-            content_length = response.headers.get("Content-Length")
-            expected = int(content_length) if content_length and content_length.isdigit() else None
-            written = 0
-            with target.open("wb") as output:
-                while chunk := response.read(_DOWNLOAD_CHUNK_BYTES):
-                    output.write(chunk)
-                    written += len(chunk)
-        if expected is not None and written != expected:
-            target.unlink(missing_ok=True)
-            raise URLError(f"下载长度不匹配: got={written} expected={expected}")
-        if expected_sha256 and not matches_sha256(target, expected_sha256):
-            target.unlink(missing_ok=True)
-            raise URLError(f"SHA-256 mismatch for {target.name}")
-        if written <= 0:
-            target.unlink(missing_ok=True)
-            raise URLError("下载文件为空")

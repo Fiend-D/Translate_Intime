@@ -64,3 +64,66 @@ def test_mute_restores_previous_volume_and_mute_state(monkeypatch) -> None:  # n
     ducker.close()
     assert game.SimpleAudioVolume.gain == 0.65
     assert game.SimpleAudioVolume.muted is False
+
+
+def test_failed_restore_keeps_original_volumes_for_retry(monkeypatch) -> None:
+    game = _Session("game", 4321, 0.8)
+    monkeypatch.setattr(session_ducker, "_get_audio_sessions", lambda: [game])
+    ducker = session_ducker.SessionDucker(mode="duck", duck_gain=0.2)
+    ducker.pulse()
+
+    def broken() -> list:
+        raise OSError("COM not ready")
+
+    monkeypatch.setattr(session_ducker, "_get_audio_sessions", broken)
+    ducker.release()
+    monkeypatch.setattr(session_ducker, "_get_audio_sessions", lambda: [game])
+    ducker.release()
+
+    assert game.SimpleAudioVolume.gain == 0.8
+
+
+def test_linux_ducks_pulse_sink_inputs_via_pactl(monkeypatch) -> None:  # noqa: ANN001
+    import json
+
+    listing = [
+        {
+            "index": 7,
+            "mute": False,
+            "volume": {"front-left": {"value": 52428}, "front-right": {"value": 52428}},
+            "properties": {"application.process.id": "4321"},
+        },
+        {
+            "index": 9,
+            "mute": False,
+            "volume": {"mono": {"value": 65536}},
+            "properties": {"application.process.id": str(os.getpid())},
+        },
+        {
+            # PipeWire ALSA streams carry no pid; only the tag marks our own TTS.
+            "index": 11,
+            "mute": False,
+            "volume": {"mono": {"value": 65536}},
+            "properties": {session_ducker.SELF_STREAM_PROP: "1"},
+        },
+    ]
+    calls: list[tuple[str, ...]] = []
+
+    def fake_pactl(*args: str) -> str:
+        calls.append(args)
+        return json.dumps(listing) if args[:2] == ("-f", "json") else ""
+
+    monkeypatch.setattr(session_ducker.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(session_ducker.shutil, "which", lambda _name: "/usr/bin/pactl")
+    monkeypatch.setattr(session_ducker, "_pactl", fake_pactl)
+    ducker = SessionDucker(mode="duck", duck_gain=0.2)
+
+    ducker.pulse()
+    ducker.release()
+
+    changes = [c for c in calls if c[0].startswith("set-")]
+    assert changes == [
+        ("set-sink-input-volume", "7", str(round(0.2 ** (1 / 3) * 65536))),
+        ("set-sink-input-volume", "7", "52428"),
+        ("set-sink-input-mute", "7", "0"),
+    ]

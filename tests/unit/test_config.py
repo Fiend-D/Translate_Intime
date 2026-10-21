@@ -5,7 +5,12 @@ import json
 import pytest
 
 from src.core.exceptions import ConfigValidationError
-from src.models.config import AppConfigModel
+from src.models.config import (
+    DEFAULT_GAME_ASR_MODEL,
+    DEFAULT_MIC_ASR_MODEL,
+    AppConfigModel,
+    default_asr_backend,
+)
 from src.utils import config_manager
 
 
@@ -34,15 +39,61 @@ def test_default_config_is_valid() -> None:
     config = AppConfigModel()
     assert config.source_language == "zh"
     assert config.target_language == "en"
-    assert config.use_volc is True
     assert config.translation_mode == "volc"
-    assert config.economy_asr_backend == "live_captions"
+    assert config.economy_asr_backend == default_asr_backend()
 
 
-def test_translation_mode_economy_sets_use_volc_false() -> None:
-    config = AppConfigModel(translation_mode="economy")
-    assert config.translation_mode == "economy"
-    assert config.use_volc is False
+@pytest.mark.parametrize(("is_windows", "expected"), [(True, "live_captions"), (False, "local")])
+def test_asr_backend_defaults_per_platform(monkeypatch, is_windows: bool, expected: str) -> None:
+    monkeypatch.setattr("sys.platform", "win32" if is_windows else "linux")
+    assert AppConfigModel().economy_asr_backend == expected
+    assert AppConfigModel(economy_asr_backend="").economy_asr_backend == expected
+    stored = AppConfigModel(economy_asr_backend="live_captions").economy_asr_backend
+    assert stored == ("live_captions" if is_windows else "local")
+
+
+@pytest.mark.parametrize(
+    ("field", "stored", "expected"),
+    [
+        ("vad_sensitivity", "extreme", "medium"),
+        ("quality_preset", "", "balanced"),
+        ("capture_backend", "wasapi", "auto"),
+        ("dota_coach_mode", "TURBO", "normal"),
+        ("quality_preset", "turbo", "turbo"),
+    ],
+)
+def test_unknown_choice_values_fall_back_to_default(field: str, stored: str, expected: str) -> None:
+    assert getattr(AppConfigModel(**{field: stored}), field) == expected
+
+
+def test_load_config_drops_removed_keys_from_disk(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "source_language": "zh",
+                "target_language": "en",
+                "use_volc": False,
+                "engine": {"name": "legacy"},
+                "subtitle_font_size": 30,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+
+    loaded = config_manager.load_config()
+
+    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert loaded.subtitle_font_size == 30
+    assert saved["subtitle_font_size"] == 30
+    assert "use_volc" not in saved
+    assert "engine" not in saved
+
+
+def test_missing_config_file_uses_model_defaults(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(config_manager, "_config_path", lambda: tmp_path / "config.json")
+    assert config_manager.load_config() == AppConfigModel()
 
 
 def test_languages_must_differ() -> None:
@@ -58,6 +109,10 @@ def test_invalid_font_size() -> None:
 def test_invalid_opacity() -> None:
     with pytest.raises(ValueError):
         AppConfigModel(subtitle_opacity=1.5)
+
+
+def test_fully_transparent_subtitle_plate_is_allowed() -> None:
+    assert AppConfigModel(subtitle_opacity=0.0).subtitle_opacity == 0.0
 
 
 def test_window_positions_validation() -> None:
@@ -87,7 +142,6 @@ def test_load_config_preserves_intentional_dashscope(tmp_path, monkeypatch) -> N
         encoding="utf-8",
     )
     monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
-    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
     loaded = config_manager.load_config()
     assert loaded.economy_asr_backend == "dashscope"
     assert loaded.economy_dashscope_api_key == "sk-keep"
@@ -108,7 +162,6 @@ def test_load_config_maps_sherpa_whisper_aliases(tmp_path, monkeypatch) -> None:
         encoding="utf-8",
     )
     monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
-    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
     loaded = config_manager.load_config()
     assert loaded.economy_asr_backend == "local"
 
@@ -132,7 +185,6 @@ def test_load_config_ignores_unavailable_keyring(tmp_path, monkeypatch) -> None:
         encoding="utf-8",
     )
     monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
-    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
     monkeypatch.setattr(
         config_manager.keyring,
         "get_password",
@@ -142,22 +194,6 @@ def test_load_config_ignores_unavailable_keyring(tmp_path, monkeypatch) -> None:
     loaded = config_manager.load_config()
 
     assert loaded.volc_api_key == ""
-
-
-def test_legacy_yaml_app_id_is_not_used_as_api_key(tmp_path, monkeypatch) -> None:
-    yaml_path = tmp_path / "config" / "default_config.yaml"
-    yaml_path.parent.mkdir()
-    yaml_path.write_text(
-        "translation:\n  source_lang: zh\n  target_lang: en\n  volc_app_id: app-id-only\n",
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(tmp_path)
-
-    loaded = config_manager._seed_from_yaml_defaults()
-
-    assert loaded is not None
-    assert loaded.volc_api_key == ""
-    assert loaded.volc_console_app_id == "app-id-only"
 
 
 def test_merge_config_updates_preserves_engine_only_settings() -> None:
@@ -186,11 +222,10 @@ def test_merge_config_updates_preserves_engine_only_settings() -> None:
 def test_new_economy_settings_survive_save_load_round_trip(tmp_path, monkeypatch) -> None:
     cfg_file = tmp_path / "config.json"
     monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
-    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
     original = AppConfigModel(
         translation_mode="economy",
         economy_asr_backend="local",
-        economy_asr_local_model="faster-whisper-medium",
+        economy_asr_mic_model="faster-whisper-medium",
         economy_kokoro_voice_en="am_michael",
         economy_kokoro_speed=1.08,
         economy_sentence_min_chars=9,
@@ -210,11 +245,10 @@ def test_new_economy_settings_survive_save_load_round_trip(tmp_path, monkeypatch
 def test_explicit_legacy_looking_values_are_not_migrated_after_save(tmp_path, monkeypatch) -> None:
     cfg_file = tmp_path / "config.json"
     monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
-    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda c: c)
     original = AppConfigModel(
         translation_mode="economy",
         economy_asr_backend="local",
-        economy_asr_local_model="auto",
+        economy_asr_game_model="auto",
         economy_kokoro_voice_en="af_heart",
         economy_utterance_silence_ms=450,
         economy_utterance_max_ms=12000,
@@ -243,6 +277,8 @@ def test_save_stores_secrets_only_in_keyring(tmp_path, monkeypatch, memory_keyri
         volc_iam_ak="iam-ak",
         volc_iam_sk="iam-sk",
         economy_dashscope_api_key="dashscope-key",
+        economy_llm_api_key="llm-key",
+        economy_openai_tts_api_key="tts-key",
     )
 
     config_manager.save_config(config)
@@ -271,7 +307,6 @@ def test_load_migrates_plaintext_secrets_and_scrubs_json(
         encoding="utf-8",
     )
     monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
-    monkeypatch.setattr(config_manager, "_fill_volc_from_yaml", lambda config: config)
 
     loaded = config_manager.load_config()
 
@@ -319,3 +354,95 @@ def test_explicit_secret_clear_deletes_keyring_value(tmp_path, monkeypatch, memo
     )
 
     assert memory_keyring.get_password(config_manager._SERVICE_NAME, "volc_api_key") is None
+
+
+@pytest.mark.parametrize(
+    ("legacy", "mic", "game"),
+    [
+        ("auto", DEFAULT_MIC_ASR_MODEL, "auto"),
+        ("faster-whisper-medium", "faster-whisper-medium", "faster-whisper-medium"),
+        ("", DEFAULT_MIC_ASR_MODEL, DEFAULT_GAME_ASR_MODEL),
+    ],
+)
+def test_legacy_single_asr_model_splits_per_channel(legacy: str, mic: str, game: str) -> None:
+    cfg = AppConfigModel.model_validate({"economy_asr_local_model": legacy})
+    assert (cfg.economy_asr_mic_model, cfg.economy_asr_game_model) == (mic, game)
+
+
+def test_explicit_channel_models_win_over_legacy_field() -> None:
+    cfg = AppConfigModel.model_validate(
+        {"economy_asr_local_model": "auto", "economy_asr_mic_model": "qwen3-asr-0.6b"}
+    )
+    assert cfg.economy_asr_mic_model == "qwen3-asr-0.6b"
+    assert cfg.economy_asr_game_model == "auto"
+
+
+def test_invalid_field_keeps_other_settings_and_backs_up(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"duck_gain": 5, "source_language": "ja"}), encoding="utf-8")
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+
+    loaded = config_manager.load_config()
+
+    assert loaded.source_language == "ja"
+    assert loaded.duck_gain == AppConfigModel().duck_gain
+    assert list(tmp_path.glob("config.json.bad-*"))
+
+
+def test_unparseable_config_is_backed_up_before_failing(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+
+    with pytest.raises(config_manager.ConfigValidationError):
+        config_manager.load_config()
+
+    (backup,) = tmp_path.glob("config.json.bad-*")
+    assert backup.read_text(encoding="utf-8") == "{not json"
+
+
+def test_stale_key_rewrite_keeps_secret_the_keyring_rejected(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps({"removed_setting": 1, "volc_api_key": "plain-key"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(config_manager, "_set_keyring_password", lambda *_a: False)
+
+    loaded = config_manager.load_config()
+
+    on_disk = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert loaded.volc_api_key == "plain-key"
+    assert on_disk["volc_api_key"] == "plain-key"
+    assert "removed_setting" not in on_disk
+
+
+def test_backup_leaves_out_secrets_already_in_keyring(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"duck_gain": 5, "volc_api_key": "secret"}), encoding="utf-8")
+    monkeypatch.setattr(config_manager, "_config_path", lambda: cfg_file)
+
+    config_manager.load_config()
+
+    (backup,) = tmp_path.glob("config.json.bad-*")
+    saved = json.loads(backup.read_text(encoding="utf-8"))
+    assert saved["duck_gain"] == 5
+    assert "volc_api_key" not in saved
+
+
+def test_only_recent_bad_backups_are_kept(tmp_path) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text("{}", encoding="utf-8")
+    for i in range(5):
+        (tmp_path / f"config.json.bad-2020010{i}-000000").write_text("{}", encoding="utf-8")
+
+    config_manager._backup_bad_config(cfg_file)
+
+    assert len(list(tmp_path.glob("config.json.bad-*"))) == 3
+
+
+def test_every_credential_field_is_stored_as_a_secret() -> None:
+    markers = ("api_key", "access_token", "_iam_ak", "_iam_sk")
+    credentials = {name for name in AppConfigModel.model_fields if any(m in name for m in markers)}
+
+    assert credentials <= set(config_manager.SECRET_FIELDS)

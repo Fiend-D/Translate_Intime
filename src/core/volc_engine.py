@@ -42,6 +42,12 @@ _FRAME_SAMPLES = int(16000 * _FRAME_MS / 1000)  # 1280
 _FRAME_BYTES = _FRAME_SAMPLES * 2  # 2560 bytes int16 mono
 _SILENCE_FRAME = b"\x00" * _FRAME_BYTES
 _AUDIO_QUEUE_MAX = 50  # ~1s of 80ms-ish chunks; drop-oldest when full
+_TTS_SENTENCE_GAP_SEC = 0.4  # pause in TTSResponse stream treated as sentence boundary
+_TTS_DROP_FAILSAFE_SEC = 15.0
+_CONNECT_TIMEOUT_SEC = 10.0
+_SESSION_START_TIMEOUT_SEC = 8.0
+# Two auth header candidates plus StartSession, with some slack for the loop hop.
+_CONNECT_BUDGET_SEC = 2 * _CONNECT_TIMEOUT_SEC + _SESSION_START_TIMEOUT_SEC + 4.0
 
 
 def drop_oldest_put(queue: asyncio.Queue[bytes | None], item: bytes | None) -> None:
@@ -119,6 +125,7 @@ class VolcASTClient:
         on_usage: Callable[[dict[str, Any]], None] | None = None,
         session_rotate_minutes: int = 12,
         should_defer_rotate: Callable[[], bool] | None = None,
+        on_lost: Callable[[str], None] | None = None,
     ) -> None:
         self.api_key = api_key
         self.access_token = access_token
@@ -144,6 +151,9 @@ class VolcASTClient:
         self.on_usage = on_usage
         self.session_rotate_minutes = max(0, int(session_rotate_minutes or 0))
         self.should_defer_rotate = should_defer_rotate
+        # Reconnecting gave up: the owner must tear the channel down.
+        self.on_lost = on_lost
+        self._closed = False
 
         self.session_id = str(uuid.uuid4())
         self.connection_id = str(uuid.uuid4())
@@ -160,9 +170,17 @@ class VolcASTClient:
         self._max_reconnect = 5
         self._reconnecting = False
         self._session_started_at = 0.0
+        # Strong refs: the loop only keeps weak references to fire-and-forget tasks.
+        self._background: set[asyncio.Task[None]] = set()
 
         self._source_buf = ""
         self._translation_buf = ""
+
+        # 抢话后丢弃服务端仍在下发的同一句 TTS（事件循环线程读，采集线程写）
+        self._tts_sentence_active = False
+        self._tts_sentence_events_seen = False
+        self._drop_tts_until = 0.0
+        self._last_tts_audio_at = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -170,6 +188,8 @@ class VolcASTClient:
 
     async def connect(self) -> bool:
         """Connect, StartSession, wait for SessionStarted."""
+        if self._closed:
+            return False
         if not self.api_key:
             self._emit_error("火山引擎缺少 API Key / App ID")
             return False
@@ -183,13 +203,16 @@ class VolcASTClient:
         self._http = aiohttp.ClientSession()
         for idx, headers in enumerate(header_candidates):
             try:
-                self._ws = await self._http.ws_connect(
-                    WS_URL,
-                    headers=headers,
-                    max_msg_size=16 * 1024 * 1024,
-                    heartbeat=None,
-                    compress=0,
-                    autoping=True,
+                self._ws = await asyncio.wait_for(
+                    self._http.ws_connect(
+                        WS_URL,
+                        headers=headers,
+                        max_msg_size=16 * 1024 * 1024,
+                        heartbeat=None,
+                        compress=0,
+                        autoping=True,
+                    ),
+                    timeout=_CONNECT_TIMEOUT_SEC,
                 )
                 log_id = self._extract_log_id()
                 used = [h for h in headers if h.startswith("X-Api-")]
@@ -215,7 +238,7 @@ class VolcASTClient:
         self._receiver_task = asyncio.create_task(self._receive_loop())
 
         try:
-            await asyncio.wait_for(self._session_started.wait(), timeout=8.0)
+            await asyncio.wait_for(self._session_started.wait(), timeout=_SESSION_START_TIMEOUT_SEC)
         except TimeoutError:
             self._emit_error("等待 SessionStarted 超时")
             await self._abort_connect_attempt(keep_alive=self._reconnecting)
@@ -269,8 +292,16 @@ class VolcASTClient:
         drop_oldest_put(self._audio_queue, pcm_bytes)
 
     async def close(self) -> None:
+        self._closed = True
         self._running = False
         self._reconnecting = False
+        current = asyncio.current_task()
+        pending = [task for task in self._background if task is not current]
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         if self._rotate_task is not None:
             self._rotate_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -422,7 +453,8 @@ class VolcASTClient:
             raise
         except Exception as exc:
             if self._running and not self._reconnecting:
-                self._emit_error(f"火山发送失败: {exc}")
+                logger.warning(f"火山发送失败: {exc}")
+                self._schedule_reconnect("send-failed")
 
     async def _receive_loop(self) -> None:
         assert self._ws is not None
@@ -442,7 +474,15 @@ class VolcASTClient:
             raise
         except Exception as exc:
             if self._running and not self._reconnecting:
-                self._emit_error(f"火山接收失败: {exc}")
+                logger.warning(f"火山接收失败: {exc}")
+        # The socket is gone; without this the client stays "running" but deaf.
+        if self._running and not self._reconnecting and self._session_started.is_set():
+            self._schedule_reconnect("connection-lost")
+
+    def _schedule_reconnect(self, reason: str) -> None:
+        task = asyncio.create_task(self._try_reconnect(reason))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     @staticmethod
     def _is_packet_timeout(message: str) -> bool:
@@ -453,26 +493,32 @@ class VolcASTClient:
             or "packet timeout" in lower
         )
 
-    async def _try_reconnect(self) -> None:
+    async def _try_reconnect(self, reason: str = "packet-timeout") -> None:
         if not self._running or self._reconnecting:
             return
-        if self._reconnect_attempts >= self._max_reconnect:
-            self._emit_error("火山会话多次超时，请重新开启通道")
-            return
-
-        self._reconnect_attempts += 1
-        self._emit_status(
-            f"火山会话超时，正在重连（{self._reconnect_attempts}/{self._max_reconnect}）…"
-        )
-        ok = await self.rotate_session(
-            reason="packet-timeout",
-            backoff_s=min(1.5 * self._reconnect_attempts, 5.0),
-        )
-        if ok:
-            self._reconnect_attempts = 0
-            self._emit_status("火山会话已重连")
-        else:
-            self._emit_error("火山重连失败")
+        cause = "会话超时" if reason == "packet-timeout" else "连接中断"
+        while self._running:
+            if self._reconnect_attempts >= self._max_reconnect:
+                message = f"火山{cause}，多次重连失败，请检查网络后重新开启通道"
+                logger.error(message)
+                await self._abort_connect_attempt(keep_alive=False)
+                if self.on_lost is not None:
+                    self.on_lost(message)
+                else:
+                    self._emit_error(message)
+                return
+            self._reconnect_attempts += 1
+            self._emit_status(
+                f"火山{cause}，正在重连（{self._reconnect_attempts}/{self._max_reconnect}）…"
+            )
+            ok = await self.rotate_session(
+                reason="packet-timeout",
+                backoff_s=min(1.5 * 2 ** (self._reconnect_attempts - 1), 20.0),
+            )
+            if ok:
+                self._reconnect_attempts = 0
+                self._emit_status("火山会话已重连")
+                return
 
     async def rotate_session(self, *, reason: str = "rotate", backoff_s: float = 0.0) -> bool:
         """Tear down WS and StartSession again while keeping the audio queue."""
@@ -546,11 +592,41 @@ class VolcASTClient:
                     continue
                 mins = max(1, int(age / 60))
                 self._emit_status(f"会话轮转（已运行 {mins}m）")
-                await self.rotate_session(reason="schedule")
+                if not await self.rotate_session(reason="schedule") and self._running:
+                    # The old socket is already closed; retry like a dropped connection.
+                    await self._try_reconnect("connection-lost")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.debug(f"rotate loop ended: {exc}")
+
+    def cancel_current_tts(self) -> bool:
+        """Drop the rest of the TTS sentence being streamed (user barged in).
+
+        Without sentence events from the server, audio is dropped until the
+        stream pauses, which marks the boundary to the next sentence.
+        """
+        now = time.monotonic()
+        if self._tts_sentence_events_seen:
+            if not self._tts_sentence_active:
+                return False
+        elif now - self._last_tts_audio_at > _TTS_SENTENCE_GAP_SEC:
+            return False
+        self._drop_tts_until = now + _TTS_DROP_FAILSAFE_SEC
+        return True
+
+    def _should_drop_tts_audio(self) -> bool:
+        now = time.monotonic()
+        gap = now - self._last_tts_audio_at
+        self._last_tts_audio_at = now
+        if self._drop_tts_until <= 0.0:
+            return False
+        if now >= self._drop_tts_until or (
+            not self._tts_sentence_events_seen and gap > _TTS_SENTENCE_GAP_SEC
+        ):
+            self._drop_tts_until = 0.0
+            return False
+        return True
 
     def _handle_response(self, raw: bytes) -> None:
         response = TranslateResponse()
@@ -573,7 +649,7 @@ class VolcASTClient:
             if self._is_packet_timeout(message):
                 self._emit_status(f"SessionFailed: {message}")
                 if self._running and not self._reconnecting:
-                    asyncio.create_task(self._try_reconnect())
+                    self._schedule_reconnect("packet-timeout")
             else:
                 self._emit_error(f"SessionFailed: {message}")
             return
@@ -620,7 +696,20 @@ class VolcASTClient:
                 self.on_translated_text(final, True)
             return
 
+        if event == Type.TTSSentenceStart:
+            self._tts_sentence_events_seen = True
+            self._tts_sentence_active = True
+            self._drop_tts_until = 0.0
+            return
+
+        if event in (Type.TTSSentenceEnd, Type.TTSEnded):
+            self._tts_sentence_active = False
+            self._drop_tts_until = 0.0
+            return
+
         if event == Type.TTSResponse and response.data:
+            if self._should_drop_tts_audio():
+                return
             if self.on_audio:
                 self.on_audio(bytes(response.data))
             return
@@ -759,11 +848,16 @@ class VolcRuntime:
         self._ready.set()
         loop.run_forever()
 
-    def submit(self, coro: Any) -> Any:
+    def submit(self, coro: Any, *, timeout: float = 20.0) -> Any:
         if self._loop is None:
             raise RuntimeError("VolcRuntime not started")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=20.0)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            # Otherwise the connect keeps running and can attach a client nobody owns.
+            future.cancel()
+            raise
 
     def submit_nowait(self, coro: Any) -> None:
         if self._loop is None:
@@ -778,7 +872,14 @@ class VolcRuntime:
 
     def connect_client(self, name: str, client: VolcASTClient) -> bool:
         self.start_thread()
-        return bool(self.submit(self._connect_client(name, client)))
+        try:
+            return bool(
+                self.submit(self._connect_client(name, client), timeout=_CONNECT_BUDGET_SEC)
+            )
+        except TimeoutError:
+            self.submit_nowait(client.close())
+            client._emit_error("火山引擎连接超时，请检查网络")
+            return False
 
     def disconnect_client(self, name: str) -> None:
         """Close one client; keep runtime alive if others remain."""
@@ -798,6 +899,10 @@ class VolcRuntime:
         if client is None or self._loop is None:
             return
         asyncio.run_coroutine_threadsafe(client.send_audio(pcm), self._loop)
+
+    def cancel_tts(self, name: str) -> bool:
+        client = self._clients.get(name)
+        return client.cancel_current_tts() if client is not None else False
 
     def stop(self) -> None:
         if self._loop is None:

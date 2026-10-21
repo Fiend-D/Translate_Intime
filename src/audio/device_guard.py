@@ -141,9 +141,26 @@ def is_process_exclude_capture(name: Any, device_id: Any = None) -> bool:
     return "wasapi_proc_exclude:" in _blob(name, device_id)
 
 
+def _endpoint_keys(name: Any, device_id: Any = None) -> set[str]:
+    """Comparable keys for an endpoint: its label and any non-numeric device id.
+
+    Kept apart so e.g. a Pulse sink ("sink sink") still matches its "sink.monitor"
+    capture, which a single name+id blob never would.
+    """
+    keys: set[str] = set()
+    for part in (name, device_id):
+        if part is None or isinstance(part, int) or str(part).strip().isdigit():
+            continue
+        key = _endpoint_key(part)
+        if key:
+            keys.add(key)
+    return keys
+
+
 def _endpoint_key(name: Any, device_id: Any = None) -> str:
     """Normalize render/capture labels enough to compare physical endpoints."""
-    text = _blob(name, device_id)
+    text = _blob(name, device_id) if device_id is not None else str(name or "").lower()
+    text = re.sub(r"\.monitor\b", " ", text)
     text = re.sub(r"wasapi_loopback:", " ", text)
     text = re.sub(r"wasapi_proc_exclude:", " ", text)
     text = re.sub(r"\[(?:loopback|默认|推荐)[^\]]*\]", " ", text)
@@ -174,17 +191,15 @@ def shares_physical_output_path(
         return True
     if not is_system_loopback_capture(loopback_name, loopback_device):
         return False
-    out_key = _endpoint_key(output_name, output_device)
-    lb_key = _endpoint_key(loopback_name, loopback_device)
-    if not out_key or not lb_key:
-        return False
     if (
         output_device is not None
         and loopback_device is not None
         and str(output_device) == str(loopback_device)
     ):
         return True
-    return out_key in lb_key or lb_key in out_key
+    out_keys = _endpoint_keys(output_name, output_device)
+    lb_keys = _endpoint_keys(loopback_name, loopback_device)
+    return any(o in lb or lb in o for o in out_keys for lb in lb_keys)
 
 
 def shares_virtual_cable_path(

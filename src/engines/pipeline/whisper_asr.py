@@ -11,7 +11,6 @@ faster-whisper 是基于 CTranslate2 的 Whisper 实现, 比原版快 4 倍以�
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from pathlib import Path
@@ -19,17 +18,21 @@ from typing import Any
 
 import numpy as np
 
+from src.utils import hf_download
 from src.utils.logger import logger
 from src.utils.resource_paths import model_resource_root
 
 _CACHE_ROOT = model_resource_root() / "asr" / "whisper"
 _LOG_INTERVAL_SEC = 30.0
 
-# HuggingFace 镜像 (优先 hf-mirror.com)
-_HF_ENDPOINTS = (
-    "https://hf-mirror.com",
-    "https://huggingface.co",
-)
+# Files faster-whisper needs from a Systran/faster-whisper-* repo
+_WHISPER_FILES = [
+    "config.json",
+    "preprocessor_config.json",
+    "model.bin",
+    "tokenizer.json",
+    "vocabulary.*",
+]
 
 # 模型注册表: model_id → whisper 模型大小 + 元信息
 # faster-whisper 模型大小: tiny / base / small / medium / large-v3
@@ -37,7 +40,7 @@ _MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     "faster-whisper-medium": {
         "title": "Whisper medium 多语言",
         "whisper_size": "medium",
-        "download_mb": 770,
+        "download_mb": 1530,
         "ram_mb": 1500,
         "quality": "优秀，接近辅助字幕，噪声鲁棒",
         "note": "★推荐：中英文准确率最高，CPU可跑",
@@ -46,7 +49,7 @@ _MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     "faster-whisper-large-v3": {
         "title": "Whisper large-v3 多语言",
         "whisper_size": "large-v3",
-        "download_mb": 1550,
+        "download_mb": 3090,
         "ram_mb": 3000,
         "quality": "最高准确率",
         "note": "需要 GPU 才能低延迟；CPU 较慢",
@@ -70,25 +73,16 @@ def whisper_model_info(model_id: str) -> dict[str, Any] | None:
 
 
 def _resolve_device(device_preference: str) -> str:
-    """auto → cpu (faster-whisper CUDA 需要 NVIDIA GPU)."""
+    """auto → CUDA only when CTranslate2 (faster-whisper's runtime) itself sees a GPU."""
     pref = (device_preference or "auto").strip().lower()
     if pref == "cuda":
         return "cuda"
     if pref == "cpu":
         return "cpu"
-    # auto: 检测 CUDA
-    try:
-        import torch  # noqa: F401
-
-        if torch.cuda.is_available():
-            return "cuda"
-    except ImportError:
-        pass
-    # ctranslate2 也能检测
     try:
         import ctranslate2
 
-        if "cuda" in ctranslate2.get_supported_compute_types("cuda"):
+        if int(ctranslate2.get_cuda_device_count() or 0) > 0:
             return "cuda"
     except Exception:
         pass
@@ -264,31 +258,34 @@ class FasterWhisperAsr:
         compute_type = _resolve_compute_type(device)
         cache_dir = whisper_cache_dir(self._model_id)
 
-        # 设置 HF 镜像 (优先 hf-mirror.com)，并绕过系统代理直连下载
-        from src.utils.proxy_env import prepare_model_download_env, without_proxy
-
         cache_dir.mkdir(parents=True, exist_ok=True)
-        prepare_model_download_env()
-        prev_endpoint = os.environ.get("HF_ENDPOINT", "")
-        if not prev_endpoint:
-            os.environ["HF_ENDPOINT"] = _HF_ENDPOINTS[0]
-
         logger.info(
             f"faster-whisper 加载: size={self._whisper_size} device={device} "
             f"compute={compute_type} cache={cache_dir}"
         )
-        try:
-            with without_proxy():
+        local_dir = cache_dir / f"faster-whisper-{self._whisper_size}"
+        if not (local_dir / "model.bin").is_file():
+            try:
+                # Caches made by older versions used faster-whisper's own HF cache layout
                 self._model = WhisperModel(
                     self._whisper_size,
                     device=device,
                     compute_type=compute_type,
                     download_root=str(cache_dir),
+                    local_files_only=True,
                 )
-        finally:
-            # 恢复 HF_ENDPOINT (如果之前没设置)
-            if not prev_endpoint:
-                os.environ.pop("HF_ENDPOINT", None)
+            except Exception:
+                info = _MODEL_REGISTRY.get(self._model_id, {})
+                hf_download.snapshot(
+                    f"Systran/faster-whisper-{self._whisper_size}",
+                    local_dir,
+                    label=str(info.get("title") or self._model_id),
+                    key=f"asr:{self._model_id}",
+                    total_mb=int(info.get("download_mb", 0)),
+                    allow_patterns=_WHISPER_FILES,
+                )
+        if self._model is None:
+            self._model = WhisperModel(str(local_dir), device=device, compute_type=compute_type)
 
         logger.info(
             f"faster-whisper ASR (offline) device={device} compute={compute_type} "

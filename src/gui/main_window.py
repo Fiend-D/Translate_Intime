@@ -1,21 +1,39 @@
-"""SayHey-style dual-channel control panel with dark/light themes."""
+"""Dual-channel control panel: sidebar navigation shell with switchable themes."""
 
 from __future__ import annotations
 
 import contextlib
+import functools
+import shutil
+import sys
 import threading
 import time
+from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, override
 
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QTextCursor
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QFontDatabase,
+    QGuiApplication,
+    QIcon,
+    QPainter,
+    QPixmap,
+    QTextCursor,
+)
 from PyQt6.QtWidgets import (
+    QAbstractScrollArea,
     QAbstractSpinBox,
     QApplication,
+    QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -31,7 +49,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
-    QTabWidget,
+    QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -61,15 +79,40 @@ from src.core.music_share import (
 from src.core.pipeline import TranslationPipeline
 from src.core.usage_tracker import UsageState, UsageTracker
 from src.core.volc_engine import VOLC_VOICE_OPTIONS
+from src.engines.pipeline.model_sources import (
+    ModelSource,
+    asr_source,
+    format_source,
+    hymt_source,
+    kokoro_source,
+    melo_source,
+    nllb_source,
+    silero_source,
+    source_tooltip,
+)
 from src.gui.music_sidebar import MusicSidebarOverlay
 from src.gui.settings_dirty import wire_dirty_tracking
-from src.gui.styles import ThemeMode, get_stylesheet
+from src.gui.styles import (
+    get_stylesheet,
+    install_combo_popup_styling,
+    menu_stylesheet,
+    polish_combo_popup,
+    resolve_theme,
+    theme_choices,
+)
 from src.gui.subtitle_overlay import SubtitleOverlay
 from src.gui.toast import show_toast
-from src.models.config import AppConfigModel
+from src.models.config import AppConfigModel, ThemeKey, normalize_theme_key
 from src.models.enums import Direction
 from src.models.subtitle import SubtitleEntry
-from src.utils.config_manager import load_config, merge_config_updates, save_config
+from src.utils import download_progress
+from src.utils.config_manager import (
+    SECRET_FIELDS,
+    load_config,
+    merge_config_updates,
+    save_config,
+)
+from src.utils.download_progress import format_task
 from src.utils.hotkeys import (
     DEFAULT_HOTKEYS,
     HOTKEY_LABELS,
@@ -78,10 +121,21 @@ from src.utils.hotkeys import (
     HotkeyBridge,
 )
 from src.utils.logger import logger
+from src.utils.resource_paths import resolve_log_dir
 
 
 class _UsageBridge(QObject):
     updated = pyqtSignal(object)  # UsageState
+
+
+class _PreviewBridge(QObject):
+    message = pyqtSignal(str)
+
+
+class _ChannelOpBridge(QObject):
+    """Delivers a finished channel start/stop back to the Qt thread."""
+
+    finished = pyqtSignal(object)  # Callable[[], None]
 
 
 class _MusicBridge(QObject):
@@ -92,25 +146,34 @@ class _MusicBridge(QObject):
 
 
 class _WheelBlockFilter(QObject):
-    """Ignore mouse-wheel on combos/spins/sliders to prevent accidental edits."""
+    """Keep the wheel from editing combos/spins/sliders; scroll the page instead."""
 
     def eventFilter(self, obj: QObject | None, event: QEvent | None) -> bool:  # noqa: N802
         if obj is None or event is None:
             return False
-        if event.type() != QEvent.Type.Wheel:
+        if event.type() != QEvent.Type.Wheel or not isinstance(obj, QWidget):
             return False
-        widget: QWidget | None
-        if isinstance(obj, QWidget):
-            widget = obj
-        else:
-            return False
-        cur: QWidget | None = widget
-        while cur is not None:
+        cur: QWidget | None = obj
+        # Stop at window boundaries: an open combo popup is its own window and must scroll.
+        while cur is not None and not cur.isWindow():
             if isinstance(cur, (QComboBox, QAbstractSpinBox, QSlider)):
-                event.ignore()
+                area = self._scroll_area_of(cur)
+                if area is not None and (viewport := area.viewport()) is not None:
+                    QApplication.sendEvent(viewport, event.clone())
                 return True
             cur = cur.parentWidget()
         return False
+
+    @staticmethod
+    def _scroll_area_of(widget: QWidget) -> QAbstractScrollArea | None:
+        cur = widget.parentWidget()
+        while cur is not None:
+            if isinstance(cur, QAbstractScrollArea):
+                return cur
+            if cur.isWindow():
+                return None
+            cur = cur.parentWidget()
+        return None
 
 
 _LANG_LABELS = [
@@ -120,6 +183,17 @@ _LANG_LABELS = [
     ("한국어 ko", "ko"),
 ]
 
+_PAGE_TITLES = (
+    ("游戏字幕", "听游戏里的外语，实时显示中文字幕浮层"),
+    ("麦克风", "对着麦克风说话，实时译成外语，可播放到虚拟声卡进游戏"),
+    ("音乐分享", "选一个文件夹作曲库，把音乐播到虚拟声卡给队友听"),
+    ("设置", "字幕外观、翻译引擎、推理设备与助手"),
+    ("打字翻译", "输入文字 → 翻译 → 朗读（独立通道，不影响同传）"),
+    ("翻译记录", "本地翻译留档：按会话查看、搜索并导出字幕"),
+)
+_PAGE_TYPED = 4
+_PAGE_TRANSCRIPTS = 5
+
 
 class MainWindow(QMainWindow):
     """Control panel: config only; lyrics overlays carry live subtitles."""
@@ -127,8 +201,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("声渡 SoundFerry")
-        self.setMinimumSize(860, 560)
-        self.resize(1100, 720)
+        self.setMinimumSize(940, 600)
+        self.resize(1240, 780)
 
         self._registry = None
         try:
@@ -136,8 +210,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logger.error(f"Configuration load failed; preserving stored credentials: {exc}")
             self._config = AppConfigModel()
+            self._config_load_error = str(exc)
 
-        self._theme: ThemeMode = self._config.theme_mode  # type: ignore[assignment]
+        self._theme: ThemeKey = self._config.theme_mode
+        self._active_theme = resolve_theme(self._theme)
         self._pipeline: TranslationPipeline | None = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_process_tick)
@@ -147,6 +223,10 @@ class MainWindow(QMainWindow):
         self._resource_timer = QTimer(self)
         self._resource_timer.timeout.connect(self._on_resource_tick)
         self._resource_timer.setInterval(1500)
+        # Model downloads can run without a channel (e.g. voice preview), so poll separately.
+        self._download_timer = QTimer(self)
+        self._download_timer.timeout.connect(self._refresh_downloads)
+        self._download_timer.setInterval(500)
         self._overlays: dict[Direction, SubtitleOverlay] = {}
         self._corpus_hotwords: list[str] = list(getattr(self._config, "hotwords", None) or [])
         self._corpus_glossary: dict[str, str] = dict(getattr(self._config, "glossary", None) or {})
@@ -177,29 +257,57 @@ class MainWindow(QMainWindow):
         self._dota_coach_timer = QTimer(self)
         self._dota_coach_timer.setSingleShot(True)
         self._dota_coach_timer.timeout.connect(self._on_dota_coach_timeout)
+        # Dragging an overlay emits many geometry updates; write the config once it settles.
+        self._geometry_save_timer = QTimer(self)
+        self._geometry_save_timer.setSingleShot(True)
+        self._geometry_save_timer.setInterval(800)
+        self._geometry_save_timer.timeout.connect(self._persist_config)
         self._dota_bridge = DotaCoachBridge(self)
         self._dota_bridge.finished.connect(self._on_dota_coach_finished)
 
-        usage_path = Path(self._config.log_dir).expanduser() / "usage_data.json"
+        usage_path = resolve_log_dir(self._config.log_dir) / "usage_data.json"
+        # Engine connects (Volc WebSocket) and device teardown can take seconds;
+        # one worker keeps channel operations ordered and off the Qt thread.
+        self._channel_ops = ThreadPoolExecutor(max_workers=1, thread_name_prefix="channel-op")
+        # Pending operations per channel ("mic"/"game"); zero counts are removed.
+        self._channel_busy: Counter[str] = Counter()
+        self._channel_bridge = _ChannelOpBridge(self)
+        self._channel_bridge.finished.connect(lambda done: done())
+        self._closing = False
+        self._error_box: QMessageBox | None = None
+        self._error_repeats = 0
+        self._preview_bridge = _PreviewBridge(self)
+        self._preview_bridge.message.connect(self._append_log)
+        self._preview_stop = threading.Event()
+        self._preview_thread: threading.Thread | None = None
         self._usage_bridge = _UsageBridge(self)
         self._usage_bridge.updated.connect(self._on_usage_state)
         self._usage_tracker = UsageTracker(
             usage_path,
             on_update=lambda st: self._usage_bridge.updated.emit(st),
         )
-        self._voice_dialog = None
         self._pack_remain_text = "剩余：未查询"
         self._lang_signals_wired = False
         self._current_tab_index = 0
-        self._suppress_tab_guard = False
+        self._typed_languages_set = False
         self._model_loading_names: tuple[str, ...] = ()
+        self._download_rows: dict[str, tuple[QWidget, QLabel, QProgressBar]] = {}
+        self._download_states: dict[str, str] = {}
+        self._download_status_active = False
+        self._source_updaters: list[Callable[[], None]] = []
         self._wheel_filter = _WheelBlockFilter(self)
 
         self._setup_ui()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self._wheel_filter)
+            self._combo_popup_styler = install_combo_popup_styling(app)
+        for combo in self.findChildren(QComboBox):
+            polish_combo_popup(combo)
         self._app_hotkeys = AppHotkeys(self, self._on_hotkey)
+        hints = QGuiApplication.styleHints()
+        if hints is not None:
+            hints.colorSchemeChanged.connect(self._on_system_scheme_changed)
         self._apply_theme()
         self._load_config_into_ui()
         self._start_resource_monitor()
@@ -211,38 +319,52 @@ class MainWindow(QMainWindow):
         self._dirty_timer.timeout.connect(self._update_save_button)
         self._dirty_timer.start()
         self._append_log("界面已就绪")
+        if getattr(self, "_config_load_error", ""):
+            message = f"配置文件无法读取，已使用默认设置：{self._config_load_error}"
+            self._append_log(message)
+            show_toast("配置文件损坏，已使用默认设置（原文件已备份）", ms=6000)
         self._append_log("提示：语言/设备/VAD/密钥等需点「保存」后生效；字幕外观立即预览")
 
     # ------------------------------------------------------------------ UI
     def _setup_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("appRoot")
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        root.addWidget(self._build_header())
+        self._header = self._build_header()
+        root.addWidget(self._build_sidebar())
+
+        main = QVBoxLayout()
+        main.setContentsMargins(24, 18, 20, 18)
+        main.setSpacing(14)
+        main.addWidget(self._header)
 
         self._progress = QProgressBar()
         self._progress.setTextVisible(False)
         self._progress.setFixedHeight(4)
         self._progress.setVisible(False)
-        root.addWidget(self._progress)
+        main.addWidget(self._progress)
 
         body = QHBoxLayout()
-        body.setSpacing(12)
+        body.setSpacing(16)
 
-        self._tabs = QTabWidget()
-        self._tabs.setObjectName("mainTabs")
-        self._tabs.setDocumentMode(True)
-        self._tabs.addTab(self._wrap_scroll(self._build_game_column()), "游戏字幕")
-        self._tabs.addTab(self._wrap_scroll(self._build_mic_column()), "麦克风")
-        self._tabs.addTab(self._wrap_scroll(self._build_music_column()), "音乐分享")
-        self._tabs.addTab(self._wrap_scroll(self._build_settings_panel()), "设置")
-        self._tabs.currentChanged.connect(self._on_tab_changed)
-        body.addWidget(self._tabs, 1)
-        body.addWidget(self._build_log_panel(), 0)
-        root.addLayout(body, 1)
+        self._pages = QStackedWidget()
+        self._pages.setObjectName("pages")
+        self._pages.addWidget(self._wrap_scroll(self._build_game_column()))
+        self._pages.addWidget(self._wrap_scroll(self._build_mic_column()))
+        self._pages.addWidget(self._wrap_scroll(self._build_music_column()))
+        self._pages.addWidget(self._wrap_scroll(self._build_settings_panel()))
+        self._pages.addWidget(self._wrap_scroll(self._build_typed_page()))
+        self._pages.addWidget(self._build_transcripts_page())
+        body.addWidget(self._pages, 1)
+        self._log_panel = self._build_log_panel()
+        body.addWidget(self._log_panel, 0)
+        main.addLayout(body, 1)
+        root.addLayout(main, 1)
+        self._show_page(0)
 
         self._populate_devices()
         self._spn_font.valueChanged.connect(self._on_look_changed)
@@ -255,7 +377,6 @@ class MainWindow(QMainWindow):
         self._chk_enable_game.toggled.connect(self._on_enable_toggled)
         self._wire_dirty_tracking()
         self._on_enable_toggled()
-        self._refresh_unlock_button()
 
     def _wire_dirty_tracking(self) -> None:
         """Refresh unsaved-state UI for every current and future settings control."""
@@ -271,30 +392,128 @@ class MainWindow(QMainWindow):
         scroll.setWidget(widget)
         return scroll
 
-    def _build_header(self) -> QFrame:
+    def _nav_item(self, text: str, tip: str = "", *, checkable: bool = False) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName("navButton")
+        button.setCheckable(checkable)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        if tip:
+            button.setToolTip(tip)
+        return button
+
+    def _nav_group(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("navGroup")
+        return label
+
+    def _build_sidebar(self) -> QFrame:
         bar = QFrame()
-        bar.setObjectName("headerBar")
+        bar.setObjectName("sidebar")
+        bar.setFixedWidth(212)
         layout = QVBoxLayout(bar)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(14, 18, 14, 14)
+        layout.setSpacing(3)
+
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
+        mark = QLabel("T")
+        mark.setObjectName("logoMark")
+        mark.setFixedSize(34, 34)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.addWidget(mark)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        title = QLabel("Translator")
+        title.setObjectName("appTitle")
+        names.addWidget(title)
+        subtitle = QLabel("InTime · 实时同传")
+        subtitle.setObjectName("appSubtitle")
+        names.addWidget(subtitle)
+        brand.addLayout(names)
+        brand.addStretch()
+        layout.addLayout(brand)
+        layout.addSpacing(10)
+
+        self._nav_group_buttons = QButtonGroup(self)
+        self._nav_group_buttons.setExclusive(True)
+        self._nav_buttons: list[QPushButton] = []
+
+        def add_page(text: str, index: int) -> None:
+            button = self._nav_item(text, checkable=True)
+            button.clicked.connect(lambda _=False, i=index: self._on_nav_clicked(i))
+            self._nav_group_buttons.addButton(button, index)
+            self._nav_buttons.append(button)
+            layout.addWidget(button)
+
+        layout.addWidget(self._nav_group("同传"))
+        add_page("◉   游戏字幕", 0)
+        add_page("◎   麦克风", 1)
+        add_page("♪   音乐分享", 2)
+
+        layout.addWidget(self._nav_group("工具"))
+        add_page("✎   打字翻译", _PAGE_TYPED)
+        add_page("☰   翻译记录", _PAGE_TRANSCRIPTS)
+        self._btn_adjust = self._nav_item(
+            "▣   调整字幕",
+            "显示字幕浮层并解除锁定，可拖拽 / 缩放 / 右键菜单。\n"
+            "调好后在浮层上双击即可锁定（点击穿透）。",
+        )
+        self._btn_adjust.clicked.connect(self._on_preview_overlays)
+        layout.addWidget(self._btn_adjust)
+        self._btn_detect_cable = self._nav_item(
+            "⇆   检测虚拟声卡", "一键检测 VB-Cable / 虚拟声卡链路是否完整"
+        )
+        self._btn_detect_cable.clicked.connect(self._on_detect_vb_cable)
+        layout.addWidget(self._btn_detect_cable)
+
+        layout.addWidget(self._nav_group("系统"))
+        self._btn_hotkeys = self._nav_item("⌨   快捷键", "自定义全局快捷键")
+        self._btn_hotkeys.clicked.connect(self._on_edit_hotkeys)
+        layout.addWidget(self._btn_hotkeys)
+        add_page("⚙   设置", 3)
+
+        layout.addStretch(1)
+        layout.addWidget(self._field_label("主题"))
+        self._cmb_theme = QComboBox()
+        for label, key in theme_choices():
+            self._cmb_theme.addItem(label, key)
+        self._cmb_theme.setToolTip("界面主题，立即生效；「跟随系统」按系统明暗切换")
+        self._cmb_theme.currentIndexChanged.connect(self._on_theme_selected)
+        layout.addWidget(self._cmb_theme)
+        version = QLabel("v0.4")
+        version.setObjectName("statusLabel")
+        layout.addWidget(version)
+        return bar
+
+    def _build_header(self) -> QWidget:
+        bar = QWidget()
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        row1 = QHBoxLayout()
-        title = QLabel("Translator InTime")
-        title.setObjectName("appTitle")
-        row1.addWidget(title)
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        self._page_title = QLabel()
+        self._page_title.setObjectName("pageTitle")
+        titles.addWidget(self._page_title)
+        self._page_subtitle = QLabel()
+        self._page_subtitle.setObjectName("appSubtitle")
+        titles.addWidget(self._page_subtitle)
+        layout.addLayout(titles)
+        layout.addStretch()
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self._badge = QLabel("Idle")
         self._badge.setObjectName("badgeLabel")
-        row1.addWidget(self._badge)
-        row1.addStretch()
+        layout.addWidget(self._badge)
 
         self._status_label = QLabel("状态：空闲")
-        self._status_label.setObjectName("statusLabel")
-        row1.addWidget(self._status_label)
+        self._status_label.setObjectName("pill")
+        layout.addWidget(self._status_label)
 
         self._latency_label = QLabel("延迟：—")
-        self._latency_label.setObjectName("statusLabel")
-        row1.addWidget(self._latency_label)
+        self._latency_label.setObjectName("pill")
+        layout.addWidget(self._latency_label)
 
         self._btn_usage = QPushButton("用量 —")
         self._btn_usage.setObjectName("ghostButton")
@@ -303,56 +522,26 @@ class MainWindow(QMainWindow):
             "点击查看明细；设置里填 IAM AK/SK 可查询资源包剩余量。"
         )
         self._btn_usage.clicked.connect(self._on_open_usage)
-        row1.addWidget(self._btn_usage)
-        layout.addLayout(row1)
+        layout.addWidget(self._btn_usage)
 
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        self._btn_adjust = QPushButton("调整字幕")
-        self._btn_adjust.setObjectName("ghostButton")
-        self._btn_adjust.setToolTip("打开字幕浮层以便拖拽/缩放；若已锁定会先解锁")
-        self._btn_adjust.clicked.connect(self._on_preview_overlays)
-        row2.addWidget(self._btn_adjust)
-
-        self._btn_unlock = QPushButton("解锁字幕")
-        self._btn_unlock.setObjectName("ghostButton")
-        self._btn_unlock.setToolTip(
-            "字幕锁定后会点击穿透，无法在浮层上操作。\n点这里解除锁定，即可再次拖拽/右键菜单。"
+        self._chk_advanced = QCheckBox("全部设备")
+        self._chk_advanced.setToolTip(
+            "「游戏声音」列表中也显示虚拟线缆捕获源（CABLE Output 等）。\n"
+            "一般不需要：选错会把自己的译文再翻译一遍。"
         )
-        self._btn_unlock.clicked.connect(self._on_unlock_overlays)
-        row2.addWidget(self._btn_unlock)
-
-        self._btn_hotkeys = QPushButton("快捷键")
-        self._btn_hotkeys.setObjectName("ghostButton")
-        self._btn_hotkeys.setToolTip("自定义全局快捷键")
-        self._btn_hotkeys.clicked.connect(self._on_edit_hotkeys)
-        row2.addWidget(self._btn_hotkeys)
-
-        self._btn_typed = QPushButton("打字翻译")
-        self._btn_typed.setObjectName("ghostButton")
-        self._btn_typed.setToolTip("文本翻译并朗读（独立通道）")
-        self._btn_typed.clicked.connect(self._on_typed_translate)
-        row2.addWidget(self._btn_typed)
-
-        self._btn_detect_cable = QPushButton("检测虚拟声卡")
-        self._btn_detect_cable.setObjectName("ghostButton")
-        self._btn_detect_cable.setToolTip("一键检测 VB-Cable / 虚拟声卡链路是否完整")
-        self._btn_detect_cable.clicked.connect(self._on_detect_vb_cable)
-        row2.addWidget(self._btn_detect_cable)
-
-        self._chk_advanced = QCheckBox("高级")
-        self._chk_advanced.setToolTip("显示译文输出设备、游戏声音捕获等高级选项")
         self._chk_advanced.toggled.connect(self._on_advanced_toggled)
-        row2.addWidget(self._chk_advanced)
+        layout.addWidget(self._chk_advanced)
 
-        self._btn_theme = QPushButton("浅色" if self._theme == "dark" else "深色")
-        self._btn_theme.setObjectName("iconButton")
-        self._btn_theme.setToolTip("切换明暗主题")
-        self._btn_theme.clicked.connect(self._toggle_theme)
-        row2.addWidget(self._btn_theme)
+        self._btn_status_panel = QPushButton("◨ 面板")
+        self._btn_status_panel.setObjectName("iconButton")
+        self._btn_status_panel.setCheckable(True)
+        self._btn_status_panel.setChecked(True)
+        self._btn_status_panel.setToolTip("显示 / 收起右侧运行状态面板")
+        self._btn_status_panel.toggled.connect(self._on_status_panel_toggled)
+        layout.addWidget(self._btn_status_panel)
 
         self._btn_save = QPushButton("保存")
-        self._btn_save.setObjectName("ghostButton")
+        self._btn_save.setObjectName("accentButton")
         self._btn_save.setToolTip(
             "保存设置到本地。\n"
             "需保存后生效：语言、设备、语音输出、VAD/质量档位、原文闪避、"
@@ -360,13 +549,9 @@ class MainWindow(QMainWindow):
             "立即生效：字幕字号/透明度/历史上限/显示原文、浮层显隐、主题。"
         )
         self._btn_save.clicked.connect(self._on_save)
-        row2.addWidget(self._btn_save)
-
-        version = QLabel("v0.3")
-        version.setObjectName("statusLabel")
-        row2.addWidget(version)
-        row2.addStretch()
-        layout.addLayout(row2)
+        layout.addWidget(self._btn_save)
+        for pill in (self._badge, self._status_label, self._latency_label):
+            pill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         return bar
 
     def _build_game_column(self) -> QFrame:
@@ -433,6 +618,7 @@ class MainWindow(QMainWindow):
         opts.addWidget(self._chk_show_game)
         opts.addWidget(self._chk_play_game)
         opts.addStretch()
+        opts.addWidget(self._refresh_devices_button())
         layout.addLayout(opts)
 
         self._game_preview = self._preview_box("游戏语音翻译字幕将显示在桌面浮层…")
@@ -517,6 +703,7 @@ class MainWindow(QMainWindow):
         opts.addWidget(self._chk_show_mic)
         opts.addWidget(self._chk_play_mic)
         opts.addStretch()
+        opts.addWidget(self._refresh_devices_button())
         layout.addLayout(opts)
 
         self._mic_preview = self._preview_box("麦克风翻译结果将显示在桌面浮层…")
@@ -619,57 +806,470 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
         return card
 
-    def _build_settings_panel(self) -> QFrame:
+    _SETTINGS_TABS = ("常规", "云端服务", "本地模型", "助手")
+
+    def _build_settings_panel(self) -> QWidget:
+        root = QWidget()
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
+
+        seg = QFrame()
+        seg.setObjectName("segBar")
+        seg_lay = QHBoxLayout(seg)
+        seg_lay.setContentsMargins(4, 4, 4, 4)
+        seg_lay.setSpacing(4)
+        self._settings_tab_group = QButtonGroup(self)
+        self._settings_tab_group.setExclusive(True)
+        for index, name in enumerate(self._SETTINGS_TABS):
+            button = QPushButton(name)
+            button.setObjectName("segButton")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._settings_tab_group.addButton(button, index)
+            seg_lay.addWidget(button)
+        seg_lay.addStretch(1)
+        self._settings_tab_group.idClicked.connect(self._show_settings_tab)
+        outer.addWidget(seg)
+
+        self._settings_stack = QStackedWidget()
+        self._usage_pills: dict[str, QLabel] = {}
+        for build in (
+            self._build_settings_general,
+            self._build_settings_cloud,
+            self._build_settings_local,
+            self._build_settings_assistant,
+        ):
+            page = QWidget()
+            lay = QVBoxLayout(page)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(12)
+            build(lay)
+            lay.addStretch(1)
+            self._settings_stack.addWidget(page)
+        outer.addWidget(self._settings_stack, 1)
+        self._show_settings_tab(0)
+        self._refresh_settings_usage()
+        return root
+
+    def _show_settings_tab(self, index: int) -> None:
+        # QStackedWidget sizes to its tallest page; ignore hidden pages so short
+        # tabs do not leave a long empty scroll area.
+        for i in range(self._settings_stack.count()):
+            page = self._settings_stack.widget(i)
+            if page is None:
+                continue
+            policy = QSizePolicy.Policy.Preferred if i == index else QSizePolicy.Policy.Ignored
+            page.setSizePolicy(QSizePolicy.Policy.Preferred, policy)
+        self._settings_stack.setCurrentIndex(index)
+        button = self._settings_tab_group.button(index)
+        if button is not None:
+            button.setChecked(True)
+        self._settings_stack.updateGeometry()
+
+    def _settings_card(
+        self,
+        parent: QVBoxLayout,
+        title: str,
+        *,
+        kind: str = "",
+        usage_key: str = "",
+        desc: str = "",
+    ) -> QVBoxLayout:
         card = self._card()
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        label = QLabel(title)
+        label.setObjectName("sectionTitle")
+        header.addWidget(label)
+        if kind:
+            tag = QLabel({"local": "本地", "cloud": "云端"}[kind])
+            tag.setObjectName("kindLocal" if kind == "local" else "kindCloud")
+            header.addWidget(tag, 0, Qt.AlignmentFlag.AlignVCenter)
+        header.addStretch(1)
+        if usage_key:
+            pill = QLabel("未使用")
+            pill.setObjectName("usageOff")
+            header.addWidget(pill, 0, Qt.AlignmentFlag.AlignVCenter)
+            self._usage_pills[usage_key] = pill
+        layout.addLayout(header)
+        if desc:
+            hint = QLabel(desc)
+            hint.setObjectName("fieldLabel")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+        parent.addWidget(card)
+        return layout
 
-        title = QLabel("通用设置")
-        title.setObjectName("sectionTitle")
-        layout.addWidget(title)
+    def _field_hint(self, layout: QVBoxLayout, text: str) -> None:
+        label = QLabel(text)
+        label.setObjectName("fieldLabel")
+        layout.addWidget(label)
 
+    def _model_source_row(
+        self, layout: QVBoxLayout, source: Callable[[], ModelSource | None]
+    ) -> None:
+        """Download origin + storage folder under a model picker, refreshed on selection."""
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        text = QLabel()
+        text.setObjectName("sourceLabel")
+        text.setWordWrap(True)
+        text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(text, 1)
+        button = QPushButton("打开目录")
+        button.setObjectName("ghostButton")
+        lay.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(row)
+        current: list[ModelSource] = []
+
+        def refresh() -> None:
+            src = source()
+            row.setVisible(src is not None)
+            current[:] = [src] if src is not None else []
+            if src is not None:
+                text.setText(format_source(src))
+                text.setToolTip(source_tooltip(src))
+                button.setToolTip(str(src.path))
+
+        def open_folder() -> None:
+            if current:
+                self._open_model_folder(current[0].path)
+
+        button.clicked.connect(open_folder)
+        refresh()
+        self._source_updaters.append(refresh)
+
+    def _refresh_model_sources(self, *_args: object) -> None:
+        for refresh in self._source_updaters:
+            refresh()
+
+    @staticmethod
+    def _asr_combo_source(combo: QComboBox) -> ModelSource | None:
+        return asr_source(str(combo.currentData() or ""))
+
+    def _open_model_folder(self, path: Path) -> None:
+        # Not downloaded yet: open the nearest existing parent so the user sees where it goes.
+        target = path if path.is_dir() else path.parent
+        while not target.exists() and target != target.parent:
+            target = target.parent
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))):
+            self._append_log(f"无法打开目录：{target}")
+
+    def _refresh_downloads(self) -> None:
+        tasks = download_progress.snapshot()
+        for task in tasks:
+            previous = self._download_states.get(task.key)
+            if previous != task.state:
+                if task.state == "running":
+                    self._append_log(f"开始下载 {task.label}：{task.url or '准备中'} → {task.dest}")
+                elif task.state == "done":
+                    self._append_log(f"下载完成：{task.label} → {task.dest}")
+                else:
+                    self._append_log(format_task(task))
+                    show_toast(format_task(task), ms=4000)
+                self._download_states[task.key] = task.state
+        live = {task.key for task in tasks}
+        for key in [k for k in self._download_states if k not in live]:
+            del self._download_states[key]
+        self._render_download_rows(tasks)
+        self._render_download_status(tasks)
+
+    def _render_download_rows(self, tasks: list[download_progress.DownloadTask]) -> None:
+        live = {task.key for task in tasks}
+        for key in [k for k in self._download_rows if k not in live]:
+            widget, _label, _bar = self._download_rows.pop(key)
+            widget.deleteLater()
+        for task in tasks:
+            if task.key not in self._download_rows:
+                widget = QWidget()
+                lay = QVBoxLayout(widget)
+                lay.setContentsMargins(0, 0, 0, 0)
+                lay.setSpacing(4)
+                label = QLabel()
+                label.setObjectName("fieldLabel")
+                label.setWordWrap(True)
+                bar = QProgressBar()
+                bar.setTextVisible(False)
+                bar.setFixedHeight(6)
+                lay.addWidget(label)
+                lay.addWidget(bar)
+                self._download_list.addWidget(widget)
+                self._download_rows[task.key] = (widget, label, bar)
+            _widget, label, bar = self._download_rows[task.key]
+            source = f"\n来源：{task.url}" if task.url and task.state == "running" else ""
+            label.setText(format_task(task) + source)
+            label.setToolTip(f"存放：{task.dest}")
+            frac = task.fraction
+            if task.state == "done":
+                bar.setRange(0, 1000)
+                bar.setValue(1000)
+            elif frac is None:
+                bar.setRange(0, 0)
+            else:
+                bar.setRange(0, 1000)
+                bar.setValue(int(frac * 1000))
+        self._download_card.setVisible(bool(tasks))
+
+    def _render_download_status(self, tasks: list[download_progress.DownloadTask]) -> None:
+        running = [task for task in tasks if task.state == "running"]
+        if not running:
+            if self._download_status_active:
+                self._download_status_active = False
+                self._progress.setVisible(False)
+                self._model_loading_names = ()
+                self._restore_status_label()
+            return
+        self._download_status_active = True
+        task = running[0]
+        more = f" 等 {len(running)} 项" if len(running) > 1 else ""
+        self._status_label.setText(f"状态：下载 {format_task(task)}{more}")
+        self._progress.setVisible(True)
+        frac = task.fraction
+        if frac is None:
+            self._progress.setRange(0, 0)
+        else:
+            self._progress.setRange(0, 1000)
+            self._progress.setValue(int(frac * 1000))
+
+    def _sub_title(self, layout: QVBoxLayout, text: str, usage_key: str = "") -> None:
+        row = QHBoxLayout()
+        label = QLabel(text)
+        label.setObjectName("subTitle")
+        row.addWidget(label)
+        row.addStretch(1)
+        if usage_key:
+            pill = QLabel("未使用")
+            pill.setObjectName("usageOff")
+            row.addWidget(pill, 0, Qt.AlignmentFlag.AlignVCenter)
+            self._usage_pills[usage_key] = pill
+        layout.addLayout(row)
+
+    def _form_row(self, layout: QVBoxLayout, label: str, *widgets: QWidget) -> QHBoxLayout:
+        row = QHBoxLayout()
+        caption = self._field_label(label)
+        caption.setMinimumWidth(76)
+        row.addWidget(caption)
+        for widget in widgets:
+            row.addWidget(widget, 1 if isinstance(widget, (QComboBox, QLineEdit)) else 0)
+        layout.addLayout(row)
+        return row
+
+    def _secret_edit(self, placeholder: str) -> QLineEdit:
+        edit = QLineEdit()
+        edit.setEchoMode(QLineEdit.EchoMode.Password)
+        edit.setPlaceholderText(placeholder)
+        return edit
+
+    def _voice_combo(self, engine_id: str, lang: str) -> QComboBox:
+        from src.engines.pipeline.tts_catalog import tts_engine
+
+        info = tts_engine(engine_id)
+        combo = QComboBox()
+        self._prep_combo(combo)
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for voice in info.voices_zh if lang == "zh" else info.voices_en:
+            combo.addItem(voice.label, voice.id)
+        combo.setToolTip("可从列表选择，也可直接粘贴音色 ID")
+        combo.editTextChanged.connect(self._update_save_button)
+        return combo
+
+    def _tts_voice_rows(self, layout: QVBoxLayout, engine_id: str) -> None:
+        from src.engines.pipeline.tts_catalog import voice_fields
+
+        fields = voice_fields(engine_id)
+        if fields is None:
+            return
+        zh = self._voice_combo(engine_id, "zh")
+        en = self._voice_combo(engine_id, "en")
+        self._tts_voice_combos[fields[0]] = zh
+        self._tts_voice_combos[fields[1]] = en
+        preview = QPushButton("试听")
+        preview.setObjectName("ghostButton")
+        preview.setToolTip("用当前音色合成一句示例并从默认扬声器播放")
+        preview.clicked.connect(lambda: self._on_preview_tts(engine_id))
+        self._form_row(layout, "中文音色", zh, preview)
+        self._form_row(layout, "外语音色", en)
+
+    @staticmethod
+    def _voice_value(combo: QComboBox) -> str:
+        text = combo.currentText().strip()
+        index = combo.findText(text)
+        if index >= 0 and combo.itemData(index) is not None:
+            return str(combo.itemData(index))
+        return text
+
+    @staticmethod
+    def _set_voice_value(combo: QComboBox, value: str) -> None:
+        combo.blockSignals(True)
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        else:
+            combo.setEditText(value)
+        combo.blockSignals(False)
+
+    # ── 常规 ────────────────────────────────────────────────────────────
+    def _build_settings_general(self, page: QVBoxLayout) -> None:
         save_tip = QLabel(
-            "立即生效：字幕外观（字号/透明度等）、浮层显隐、主题。\n"
-            "需点「保存」生效：语言、设备、VAD/质量档位、闪避、捕获、密钥/音色、Dota 等。"
-            "未保存时切换标签或关闭窗口会提醒。"
+            "立即生效：字幕外观、浮层显隐、主题、识别/翻译模型。"
+            "其余设置点右上角「保存」后生效，未保存时切换页面或关闭窗口会提醒。"
         )
         save_tip.setObjectName("fieldLabel")
         save_tip.setWordWrap(True)
-        layout.addWidget(save_tip)
+        page.addWidget(save_tip)
 
-        row = QHBoxLayout()
-        row.addWidget(self._field_label("字号"))
-        self._spn_font = QSpinBox()
-        self._spn_font.setRange(12, 64)
-        row.addWidget(self._spn_font)
-        row.addWidget(self._field_label("透明度"))
-        self._spn_opacity = QDoubleSpinBox()
-        self._spn_opacity.setRange(0.3, 1.0)
-        self._spn_opacity.setSingleStep(0.05)
-        row.addWidget(self._spn_opacity)
-        row.addStretch()
-        layout.addLayout(row)
-
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(self._field_label("翻译引擎"))
+        layout = self._settings_card(
+            page,
+            "翻译引擎",
+            desc="选「本地」的组件在「本地模型」页设置模型；选「云端」的在「云端服务」页填写账号与音色。",
+        )
         self._cmb_translation_mode = QComboBox()
         self._prep_combo(self._cmb_translation_mode)
-        self._cmb_translation_mode.addItem("火山同传（低延迟）", "volc")
-        self._cmb_translation_mode.addItem(
-            "经济模式（Fun-ASR + NLLB本地翻译 + Kokoro语音）", "economy"
-        )
+        self._cmb_translation_mode.addItem("云端 · 火山同传（低延迟，按量计费）", "volc")
+        self._cmb_translation_mode.addItem("经济模式（识别 + 翻译 + 语音 自由组合）", "economy")
         self._cmb_translation_mode.setToolTip(
             "切换翻译引擎。若通道正在运行会先停止，无需重启应用。\n"
-            "经济模式 = 阿里云 Fun-ASR + NLLB 本地翻译 + Kokoro 语音；\n"
-            "首次运行会后台下载模型到 ~/.cache/translator_intime/。"
+            "火山同传：一个云端服务完成识别、翻译与配音；\n"
+            "经济模式：下面三项可分别选本地或云端。"
         )
         self._cmb_translation_mode.currentIndexChanged.connect(self._on_translation_mode_changed)
-        mode_row.addWidget(self._cmb_translation_mode, 1)
-        layout.addLayout(mode_row)
+        self._cmb_translation_mode.currentIndexChanged.connect(self._refresh_settings_usage)
+        self._form_row(layout, "引擎", self._cmb_translation_mode)
 
-        preset_row = QHBoxLayout()
-        preset_row.addWidget(self._field_label("质量档位"))
+        self._economy_rows = QWidget()
+        eco = QVBoxLayout(self._economy_rows)
+        eco.setContentsMargins(0, 0, 0, 0)
+        eco.setSpacing(10)
+        self._cmb_asr_backend = QComboBox()
+        self._prep_combo(self._cmb_asr_backend)
+        if sys.platform.startswith("win"):
+            self._cmb_asr_backend.addItem(
+                "本地 · Windows Live Captions（系统级，推荐）", "live_captions"
+            )
+        self._cmb_asr_backend.addItem(
+            "本地 · 离线模型（SenseVoice / Zipformer / Whisper）", "local"
+        )
+        self._cmb_asr_backend.addItem("云端 · 阿里云 Fun-ASR（DashScope）", "dashscope")
+        self._cmb_asr_backend.addItem("云端 · Qwen3-ASR-Flash（DashScope）", "qwen_flash")
+        self._cmb_asr_backend.addItem("云端 · 豆包极速识别（火山）", "doubao_flash")
+        self._cmb_asr_backend.setToolTip(
+            "Live Captions：Windows 11 22H2+ 系统级识别，零占用；\n"
+            "离线模型：在「本地模型」页为麦克风/游戏分别选模型；\n"
+            "Fun-ASR / Qwen3-ASR-Flash：需 DashScope API Key；\n"
+            "豆包极速识别：复用火山 API Key，中文与热词效果最好。"
+        )
+        self._cmb_asr_backend.currentIndexChanged.connect(self._on_asr_backend_changed)
+        self._cmb_asr_backend.currentIndexChanged.connect(self._refresh_settings_usage)
+        self._form_row(eco, "语音识别", self._cmb_asr_backend)
+
+        self._cmb_mt_backend = QComboBox()
+        self._prep_combo(self._cmb_mt_backend)
+        self._cmb_mt_backend.addItem("本地 · NLLB（离线）", "nllb")
+        self._cmb_mt_backend.addItem("本地 · Hy-MT2 1.8B（llama.cpp）", "hymt")
+        self._cmb_mt_backend.addItem("云端 · 大模型 LLM（OpenAI 兼容，推荐）", "llm")
+        self._cmb_mt_backend.addItem("云端 · MyMemory（免费）", "mymemory")
+        self._cmb_mt_backend.addItem("自动（NLLB → Argos → MyMemory）", "auto")
+        self._cmb_mt_backend.setToolTip(
+            "LLM：DeepSeek / 通义 / Ollama / LM Studio 等，带上下文与术语表，失败回退 NLLB；\n"
+            "Hy-MT2：腾讯混元翻译 GGUF（约 1.1GB），需 pip install llama-cpp-python。\n"
+            "保存后重新开启通道生效。"
+        )
+        self._cmb_mt_backend.currentIndexChanged.connect(self._refresh_settings_usage)
+        self._form_row(eco, "翻译", self._cmb_mt_backend)
+
+        from src.engines.pipeline.tts_catalog import TTS_ENGINE_ORDER, tts_engine
+
+        self._cmb_tts_backend = QComboBox()
+        self._prep_combo(self._cmb_tts_backend)
+        for engine_id in TTS_ENGINE_ORDER:
+            info = tts_engine(engine_id)
+            self._cmb_tts_backend.addItem(info.combo_label, engine_id)
+            self._cmb_tts_backend.setItemData(
+                self._cmb_tts_backend.count() - 1,
+                f"{info.needs}\n{info.note}".strip(),
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        self._cmb_tts_backend.setToolTip(
+            "开启「语音输出」后播报译文用的语音引擎；云端引擎失败时自动回退 Edge TTS。\n"
+            "保存后重新开启通道生效。"
+        )
+        self._cmb_tts_backend.currentIndexChanged.connect(self._refresh_settings_usage)
+        self._spn_tts_speed = QDoubleSpinBox()
+        self._spn_tts_speed.setRange(0.7, 1.3)
+        self._spn_tts_speed.setSingleStep(0.05)
+        self._spn_tts_speed.setDecimals(2)
+        self._spn_tts_speed.setPrefix("语速 ")
+        self._spn_tts_speed.setToolTip("经济模式语音合成语速（1.00 = 正常），对所有语音引擎生效")
+        self._form_row(eco, "语音合成", self._cmb_tts_backend, self._spn_tts_speed)
+
+        self._lbl_engine_hint = QLabel()
+        self._lbl_engine_hint.setObjectName("fieldLabel")
+        self._lbl_engine_hint.setWordWrap(True)
+        eco.addWidget(self._lbl_engine_hint)
+        layout.addWidget(self._economy_rows)
+
+        layout = self._settings_card(page, "字幕外观", desc="立即生效")
+        self._spn_font = QSpinBox()
+        self._spn_font.setRange(12, 72)
+        self._spn_font.setToolTip("默认窗口大小下的字号；拖大字幕窗口时文字按比例放大")
+        self._spn_opacity = QSpinBox()
+        self._spn_opacity.setRange(0, 100)
+        self._spn_opacity.setSingleStep(5)
+        self._spn_opacity.setSuffix(" %")
+        self._spn_opacity.setToolTip("只影响字幕底板；0% 为全透明，文字始终清晰")
+        self._spn_history = QSpinBox()
+        self._spn_history.setRange(0, 40)
+        self._spn_history.setToolTip(
+            "字幕浮层最多保留的已定稿句数；实际显示行数随窗口高度自动增减（拉高可回看更多）"
+        )
+        row = self._form_row(layout, "字号", self._spn_font)
+        row.addWidget(self._field_label("底板不透明度"))
+        row.addWidget(self._spn_opacity)
+        row.addWidget(self._field_label("历史句数"))
+        row.addWidget(self._spn_history)
+        row.addStretch(1)
+
+        self._subtitle_text_color = "#FFFFFF"
+        self._subtitle_bg_color = "#141418"
+        self._btn_text_color = QPushButton("文字颜色")
+        self._btn_text_color.setObjectName("ghostButton")
+        self._btn_text_color.clicked.connect(lambda: self._pick_subtitle_color("text"))
+        self._btn_bg_color = QPushButton("底板颜色")
+        self._btn_bg_color.setObjectName("ghostButton")
+        self._btn_bg_color.clicked.connect(lambda: self._pick_subtitle_color("bg"))
+        self._cmb_subtitle_font = QComboBox()
+        self._prep_combo(self._cmb_subtitle_font)
+        self._cmb_subtitle_font.addItem("默认字体", "")
+        for family in QFontDatabase.families():
+            self._cmb_subtitle_font.addItem(family, family)
+        self._cmb_subtitle_font.setToolTip("字幕浮层字体，立即生效")
+        self._cmb_subtitle_font.currentIndexChanged.connect(self._on_look_changed)
+        self._chk_subtitle_follow_theme = QCheckBox("跟随主题")
+        self._chk_subtitle_follow_theme.setChecked(True)
+        self._chk_subtitle_follow_theme.setToolTip(
+            "字幕浮层使用当前主题的配色；关闭后使用右侧自定义的文字/底板颜色"
+        )
+        self._chk_subtitle_follow_theme.toggled.connect(self._on_subtitle_follow_toggled)
+        style_row = QHBoxLayout()
+        style_row.addWidget(self._chk_subtitle_follow_theme)
+        style_row.addWidget(self._btn_text_color)
+        style_row.addWidget(self._btn_bg_color)
+        style_row.addWidget(self._cmb_subtitle_font, 1)
+        layout.addLayout(style_row)
+        self._refresh_color_buttons()
+        self._chk_show_original = QCheckBox("浮层显示原文")
+        self._chk_show_original.setChecked(True)
+        layout.addWidget(self._chk_show_original)
+
+        layout = self._settings_card(page, "声音处理", desc="更改后需重新开启通道")
         self._cmb_quality = QComboBox()
         self._prep_combo(self._cmb_quality)
         self._cmb_quality.addItem("质量优先", "quality")
@@ -681,28 +1281,29 @@ class MainWindow(QMainWindow):
             "质量优先：尽量多送音频\n"
             "均衡：推荐\n"
             "省额度：更严门控，游戏通道也开 VAD\n"
-            "低延迟：更短挂起\n"
-            "更改后需重新开启通道"
+            "低延迟：更短挂起"
         )
         self._cmb_quality.currentIndexChanged.connect(self._on_quality_preset_changed)
-        preset_row.addWidget(self._cmb_quality, 1)
-        layout.addLayout(preset_row)
+        self._form_row(layout, "质量档位", self._cmb_quality)
 
-        vad_col = QVBoxLayout()
-        vad_col.setSpacing(4)
-        self._chk_vad = QCheckBox("麦克风 VAD（减空噪幻觉）")
+        self._chk_vad = QCheckBox("麦克风 VAD")
         self._chk_vad.setChecked(True)
-        self._chk_vad.setToolTip("仅作用于麦克风通道。静音/空噪不送火山。\n更改后需重新开启通道。")
-        vad_col.addWidget(self._chk_vad)
+        self._chk_vad.setToolTip("仅作用于麦克风通道。静音/空噪不送识别，减少幻觉。")
         self._chk_vad_game = QCheckBox("游戏/视频 VAD")
         self._chk_vad_game.setChecked(True)
-        self._chk_vad_game.setToolTip(
-            "作用于游戏字幕通道。默认优先 Silero，空噪较多时建议保持开启。"
+        self._chk_vad_game.setToolTip("作用于游戏字幕通道。默认优先 Silero，空噪较多时建议开启。")
+        self._chk_aec = QCheckBox("软件回声消除")
+        self._chk_aec.setChecked(True)
+        self._chk_aec.setToolTip(
+            "外放音箱时消除麦克风里的译文回声，抢话只认真人说话。\n"
+            "译文只进虚拟声卡或戴耳机时自动不生效。"
         )
-        vad_col.addWidget(self._chk_vad_game)
-        vad_row = QHBoxLayout()
-        vad_row.addLayout(vad_col, 1)
-        vad_row.addWidget(self._field_label("灵敏度"))
+        checks = QHBoxLayout()
+        for chk in (self._chk_vad, self._chk_vad_game, self._chk_aec):
+            checks.addWidget(chk)
+        checks.addStretch(1)
+        layout.addLayout(checks)
+
         self._cmb_vad_sens = QComboBox()
         self._prep_combo(self._cmb_vad_sens)
         self._cmb_vad_sens.addItem("宽松", "low")
@@ -711,331 +1312,492 @@ class MainWindow(QMainWindow):
         self._cmb_vad_sens.setToolTip(
             "宽松：小声也送（易漏噪）\n标准：推荐（麦克风）\n严格：只送明显人声"
         )
-        vad_row.addWidget(self._cmb_vad_sens)
-        vad_row.addWidget(self._field_label("后端"))
         self._cmb_vad_backend = QComboBox()
         self._prep_combo(self._cmb_vad_backend)
         self._cmb_vad_backend.addItem("自动 Silero", "auto")
         self._cmb_vad_backend.addItem("仅 Silero", "silero")
         self._cmb_vad_backend.addItem("仅电平", "rms")
-        self._cmb_vad_backend.setToolTip(
-            "自动：优先 Silero ONNX，不可用时回退电平 VAD。\n更改后需重新开启通道。"
-        )
-        vad_row.addWidget(self._cmb_vad_backend)
-        layout.addLayout(vad_row)
+        self._cmb_vad_backend.setToolTip("自动：优先 Silero ONNX，不可用时回退电平 VAD。")
+        row = self._form_row(layout, "VAD 灵敏度", self._cmb_vad_sens)
+        row.addWidget(self._field_label("后端"))
+        row.addWidget(self._cmb_vad_backend, 1)
 
-        duck_row = QHBoxLayout()
-        duck_row.addWidget(self._field_label("原文闪避"))
+        is_windows = sys.platform.startswith("win")
         self._cmb_original_audio = QComboBox()
         self._prep_combo(self._cmb_original_audio)
         self._cmb_original_audio.addItem("压低其他应用", "duck")
         self._cmb_original_audio.addItem("静音其他应用", "mute")
         self._cmb_original_audio.addItem("不处理（混听）", "mix")
-        self._cmb_original_audio.setToolTip(
-            "播放译文语音时，对其他应用做闪避（仅 Windows）。\n"
-            "需开启麦克风/游戏「语音输出」才生效。"
-        )
-        duck_row.addWidget(self._cmb_original_audio, 1)
-        duck_row.addWidget(self._field_label("压低"))
         self._spn_duck_gain = QDoubleSpinBox()
         self._spn_duck_gain.setRange(0.0, 1.0)
         self._spn_duck_gain.setSingleStep(0.05)
         self._spn_duck_gain.setDecimals(2)
-        self._spn_duck_gain.setToolTip("duck 模式下其他应用音量（0=近乎静音，1=不压）")
-        duck_row.addWidget(self._spn_duck_gain)
-        layout.addLayout(duck_row)
+        self._spn_duck_gain.setPrefix("音量 ")
+        self._spn_duck_gain.setToolTip("压低模式下其他应用的音量（0 = 近乎静音，1 = 不压）")
+        mixer = "Windows 音量合成器" if is_windows else "PulseAudio / PipeWire（pactl）"
+        self._cmb_original_audio.setToolTip(
+            f"播放译文语音时，按应用压低或静音其他声音（{mixer}），播完自动恢复。\n"
+            "需开启麦克风/游戏「语音输出」才生效。"
+        )
+        if not is_windows and shutil.which("pactl") is None:
+            self._cmb_original_audio.setToolTip("未找到 pactl，Linux 上的原文闪避不可用")
+            self._cmb_original_audio.setEnabled(False)
+            self._spn_duck_gain.setEnabled(False)
+        self._form_row(layout, "原文闪避", self._cmb_original_audio, self._spn_duck_gain)
 
-        cap_row = QHBoxLayout()
-        cap_row.addWidget(self._field_label("游戏捕获"))
         self._cmb_capture_backend = QComboBox()
         self._prep_combo(self._cmb_capture_backend)
-        self._cmb_capture_backend.addItem("自动（系统 Loopback）", "auto")
-        self._cmb_capture_backend.addItem("系统 Loopback", "loopback")
-        self._cmb_capture_backend.setToolTip(
-            "Windows 使用扬声器/耳机 Loopback，会捕获该设备的全部声音。\n"
-            "为避免译文回灌，请把 TTS/音乐输出到 CABLE Input 或另一设备。\n"
-            "Linux 使用 monitor。"
-        )
-        cap_row.addWidget(self._cmb_capture_backend, 1)
-        layout.addLayout(cap_row)
+        if is_windows:
+            self._cmb_capture_backend.addItem("自动（WASAPI Loopback）", "auto")
+            self._cmb_capture_backend.addItem("WASAPI Loopback", "loopback")
+            self._cmb_capture_backend.setToolTip(
+                "捕获扬声器/耳机的全部声音。为避免译文回灌，\n"
+                "请把 TTS/音乐输出到 CABLE Input 或另一设备。"
+            )
+        else:
+            self._cmb_capture_backend.addItem("自动（PulseAudio / PipeWire monitor）", "auto")
+            self._cmb_capture_backend.addItem("系统 monitor", "loopback")
+            self._cmb_capture_backend.setToolTip(
+                "捕获输出设备的 monitor 源。为避免译文回灌，请把 TTS/音乐输出到虚拟声卡。"
+            )
+        self._form_row(layout, "游戏捕获", self._cmb_capture_backend)
 
-        rotate_row = QHBoxLayout()
-        rotate_row.addWidget(self._field_label("会话轮转(分)"))
-        self._spn_rotate = QSpinBox()
-        self._spn_rotate.setRange(0, 120)
-        self._spn_rotate.setToolTip("定期重建火山会话；0=关闭。默认 12 分钟。")
-        rotate_row.addWidget(self._spn_rotate)
-        rotate_row.addStretch()
-        layout.addLayout(rotate_row)
-
-        tip_rate = QLabel(
-            "提示：「同传语速」只影响合成语音快慢，不改变识别准确度。"
-            "译不准多半是口音/源语言/背景音乐，可加热词或换更清晰音源。"
-        )
-        tip_rate.setObjectName("fieldLabel")
-        tip_rate.setWordWrap(True)
-        layout.addWidget(tip_rate)
-
-        voice_row = QHBoxLayout()
-        voice_row.addWidget(self._field_label("同传音色"))
-        self._cmb_volc_voice = QComboBox()
-        self._cmb_volc_voice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        for sid, label in VOLC_VOICE_OPTIONS:
-            self._cmb_volc_voice.addItem(label, sid)
-        self._cmb_volc_voice.setToolTip(
-            "开启「语音输出」后生效。\n"
-            "原音色：复刻说话人声音（默认）\n"
-            "公版音色：仅目标语为中文/英文时可用\n"
-            "更改后需重新开启通道"
-        )
-        voice_row.addWidget(self._cmb_volc_voice, 1)
-        self._btn_pick_voice = QPushButton("音色库…")
-        self._btn_pick_voice.setObjectName("ghostButton")
-        self._btn_pick_voice.setToolTip("打开豆包 / Seed TTS 2.0 / Qwen 音色选择（可拖动悬浮试听）")
-        self._btn_pick_voice.clicked.connect(self._on_open_voice_picker)
-        voice_row.addWidget(self._btn_pick_voice)
-        layout.addLayout(voice_row)
-
-        rate_row = QHBoxLayout()
-        rate_row.addWidget(self._field_label("同传语速"))
-        self._spn_speech_rate = QSpinBox()
-        self._spn_speech_rate.setRange(-50, 100)
-        self._spn_speech_rate.setSingleStep(10)
-        self._spn_speech_rate.setToolTip(
-            "火山 AST 语速：-50≈0.5x，0=正常，100≈2.0x。更改后需重新开启通道。"
-        )
-        rate_row.addWidget(self._spn_speech_rate)
-        rate_row.addWidget(self._field_label("历史上限"))
-        self._spn_history = QSpinBox()
-        self._spn_history.setRange(0, 40)
-        self._spn_history.setToolTip(
-            "字幕浮层最多保留的已定稿句数；实际显示行数随窗口高度自动增减（拉高可回看更多）"
-        )
-        rate_row.addWidget(self._spn_history)
-        rate_row.addStretch()
-        layout.addLayout(rate_row)
-
-        archive_row = QHBoxLayout()
-        self._chk_transcript_logging = QCheckBox("淇濆瓨缈昏瘧璁板綍")
-        self._chk_transcript_logging.setToolTip(
-            "\u5173\u95ed\u540e\u4e0d\u518d\u5c06\u539f\u6587\u548c\u8bd1\u6587"
-            "\u5199\u5165\u672c\u5730\u6587\u4ef6"
-        )
-        archive_row.addWidget(self._chk_transcript_logging)
-        archive_row.addWidget(self._field_label("淇濈暀澶╂暟"))
+        layout = self._settings_card(page, "记录与词表")
+        self._chk_transcript_logging = QCheckBox("保存翻译记录")
+        self._chk_transcript_logging.setToolTip("关闭后不再将原文和译文写入本地文件")
         self._spn_transcript_retention = QSpinBox()
         self._spn_transcript_retention.setRange(1, 3650)
-        self._spn_transcript_retention.setSuffix(" \u5929")
+        self._spn_transcript_retention.setPrefix("保留 ")
+        self._spn_transcript_retention.setSuffix(" 天")
         self._chk_transcript_logging.toggled.connect(self._spn_transcript_retention.setEnabled)
+        archive_row = QHBoxLayout()
+        archive_row.addWidget(self._chk_transcript_logging)
         archive_row.addWidget(self._spn_transcript_retention)
-        archive_row.addStretch()
+        archive_row.addStretch(1)
         layout.addLayout(archive_row)
-
-        corpus_row = QHBoxLayout()
-        self._chk_show_original = QCheckBox("浮层显示原文")
-        self._chk_show_original.setChecked(True)
-        corpus_row.addWidget(self._chk_show_original)
         self._btn_corpus = QPushButton("热词/术语")
         self._btn_corpus.setObjectName("ghostButton")
         self._btn_corpus.clicked.connect(self._on_edit_corpus)
-        corpus_row.addWidget(self._btn_corpus)
         self._btn_vb_hint = QPushButton("检测虚拟声卡")
         self._btn_vb_hint.setObjectName("ghostButton")
         self._btn_vb_hint.setToolTip("一键检测 VB-Cable / 虚拟声卡链路")
         self._btn_vb_hint.clicked.connect(self._on_device_guide)
-        corpus_row.addWidget(self._btn_vb_hint)
-        corpus_row.addStretch()
-        layout.addLayout(corpus_row)
-
         self._lbl_corpus = QLabel("热词 0 / 术语 0")
         self._lbl_corpus.setObjectName("fieldLabel")
-        layout.addWidget(self._lbl_corpus)
+        corpus_row = QHBoxLayout()
+        corpus_row.addWidget(self._btn_corpus)
+        corpus_row.addWidget(self._btn_vb_hint)
+        corpus_row.addWidget(self._lbl_corpus)
+        corpus_row.addStretch(1)
+        layout.addLayout(corpus_row)
 
-        self._txt_volc_key = QLineEdit()
-        self._txt_volc_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._txt_volc_key.setPlaceholderText("火山 API Key")
+        self._btn_stop = QPushButton("停止全部")
+        self._btn_stop.setObjectName("dangerButton")
+        self._btn_stop.setEnabled(False)
+        self._btn_stop.clicked.connect(self._on_stop)
+        page.addWidget(self._btn_stop)
+
+    # ── 云端服务 ─────────────────────────────────────────────────────────
+    def _build_settings_cloud(self, page: QVBoxLayout) -> None:
+        tip = QLabel(
+            "以下服务需要联网，密钥只保存在系统钥匙串。右侧标签显示当前组合是否用到该服务。"
+        )
+        tip.setObjectName("fieldLabel")
+        tip.setWordWrap(True)
+        page.addWidget(tip)
+        self._tts_voice_combos: dict[str, QComboBox] = {}
+
+        layout = self._settings_card(
+            page,
+            "火山引擎 · 豆包语音",
+            kind="cloud",
+            usage_key="volc",
+            desc="用于：火山同传、豆包极速识别、豆包语音合成。新版控制台填 API Key 即可；"
+            "旧版填数字 AppID + Access Token。",
+        )
+        self._txt_volc_key = self._secret_edit("API Key（或旧版 AppID）")
         layout.addWidget(self._txt_volc_key)
-
-        self._txt_volc_token = QLineEdit()
-        self._txt_volc_token.setEchoMode(QLineEdit.EchoMode.Password)
-        self._txt_volc_token.setPlaceholderText("兼容 Token（可选）")
+        self._txt_volc_token = self._secret_edit("Access Token（旧版 AppID 鉴权时填写）")
         layout.addWidget(self._txt_volc_token)
 
-        iam_tip = QLabel(
-            "查询资源包剩余量需要火山 IAM AccessKey/SecretKey（与语音 API Key 不同）。"
-            "可不填；不填时仍显示本地 UsageResponse 累计用量。"
+        self._sub_title(layout, "火山同传", "volc_ast")
+        self._cmb_volc_voice = QComboBox()
+        self._prep_combo(self._cmb_volc_voice)
+        self._cmb_volc_voice.setEditable(True)
+        self._cmb_volc_voice.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for sid, label in VOLC_VOICE_OPTIONS:
+            self._cmb_volc_voice.addItem(label, sid)
+        self._cmb_volc_voice.editTextChanged.connect(self._update_save_button)
+        self._cmb_volc_voice.setToolTip(
+            "开启「语音输出」后生效。\n"
+            "原音色：复刻说话人声音（默认）\n"
+            "公版音色：仅目标语为中文/英文时可用，也可直接粘贴音色 ID"
         )
-        iam_tip.setObjectName("fieldLabel")
-        iam_tip.setWordWrap(True)
-        layout.addWidget(iam_tip)
-        self._txt_volc_iam_ak = QLineEdit()
-        self._txt_volc_iam_ak.setEchoMode(QLineEdit.EchoMode.Password)
-        self._txt_volc_iam_ak.setPlaceholderText("IAM AccessKey（可选，查剩余额度）")
-        layout.addWidget(self._txt_volc_iam_ak)
-        self._txt_volc_iam_sk = QLineEdit()
-        self._txt_volc_iam_sk.setEchoMode(QLineEdit.EchoMode.Password)
-        self._txt_volc_iam_sk.setPlaceholderText("IAM SecretKey（可选）")
-        layout.addWidget(self._txt_volc_iam_sk)
+        self._form_row(layout, "同传音色", self._cmb_volc_voice)
+        self._spn_speech_rate = QSpinBox()
+        self._spn_speech_rate.setRange(-50, 100)
+        self._spn_speech_rate.setSingleStep(10)
+        self._spn_speech_rate.setToolTip(
+            "火山同传语速：-50≈0.5x，0=正常，100≈2.0x。只影响合成语音快慢，不改变识别准确度。"
+        )
+        self._spn_rotate = QSpinBox()
+        self._spn_rotate.setRange(0, 120)
+        self._spn_rotate.setSuffix(" 分钟")
+        self._spn_rotate.setToolTip("定期重建火山会话；0=关闭。默认 12 分钟。")
+        row = self._form_row(layout, "同传语速", self._spn_speech_rate)
+        row.addWidget(self._field_label("会话轮转"))
+        row.addWidget(self._spn_rotate)
+        row.addStretch(1)
+
+        self._sub_title(layout, "豆包语音合成（经济模式）", "doubao_tts")
+        doubao_tip = QLabel(
+            "小智同款音色「湾湾小何」等；需在火山控制台开通「语音合成大模型」并购买对应音色。"
+        )
+        doubao_tip.setObjectName("fieldLabel")
+        doubao_tip.setWordWrap(True)
+        layout.addWidget(doubao_tip)
+        self._tts_voice_rows(layout, "doubao")
+
+        self._sub_title(layout, "资源包额度（可选）")
+        self._txt_volc_iam_ak = self._secret_edit("IAM AccessKey（与语音 API Key 不同）")
+        self._txt_volc_iam_sk = self._secret_edit("IAM SecretKey")
+        iam_row = QHBoxLayout()
+        iam_row.addWidget(self._txt_volc_iam_ak, 1)
+        iam_row.addWidget(self._txt_volc_iam_sk, 1)
+        layout.addLayout(iam_row)
         self._txt_volc_console_app = QLineEdit()
         self._txt_volc_console_app.setPlaceholderText("控制台 AppID（可选，数字）")
-        layout.addWidget(self._txt_volc_console_app)
-        pack_row = QHBoxLayout()
         self._lbl_pack_remain = QLabel(self._pack_remain_text)
         self._lbl_pack_remain.setObjectName("fieldLabel")
         self._lbl_pack_remain.setWordWrap(True)
-        pack_row.addWidget(self._lbl_pack_remain, 1)
         btn_refresh_pack = QPushButton("刷新额度")
         btn_refresh_pack.setObjectName("ghostButton")
         btn_refresh_pack.clicked.connect(self._on_refresh_pack_quota)
+        pack_row = QHBoxLayout()
+        pack_row.addWidget(self._txt_volc_console_app, 1)
         pack_row.addWidget(btn_refresh_pack)
         layout.addLayout(pack_row)
+        layout.addWidget(self._lbl_pack_remain)
 
-        self._txt_dashscope_key = QLineEdit()
-        self._txt_dashscope_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._txt_dashscope_key.setPlaceholderText("DashScope API Key（经济模式云端 ASR）")
-        self._txt_dashscope_key.setToolTip(
-            "经济模式云端 ASR 使用阿里云百炼 DashScope Key；也可设置环境变量 DASHSCOPE_API_KEY。\n"
-            "切换为「本地 ASR」后此项可不填。"
+        layout = self._settings_card(
+            page,
+            "阿里云百炼 · DashScope",
+            kind="cloud",
+            usage_key="dashscope",
+            desc="用于：Fun-ASR / Qwen3-ASR-Flash 识别、CosyVoice 语音合成。"
+            "也可设置环境变量 DASHSCOPE_API_KEY。",
         )
+        self._txt_dashscope_key = self._secret_edit("DashScope API Key")
         layout.addWidget(self._txt_dashscope_key)
+        self._sub_title(layout, "CosyVoice 语音合成（经济模式）", "cosyvoice")
+        self._txt_cosyvoice_model = QLineEdit()
+        self._txt_cosyvoice_model.setPlaceholderText("cosyvoice-v2")
+        self._txt_cosyvoice_model.setToolTip("CosyVoice 模型名；v2 音色以 _v2 结尾")
+        self._form_row(layout, "模型", self._txt_cosyvoice_model)
+        self._tts_voice_rows(layout, "cosyvoice")
 
-        # ASR 后端选择: 云端 dashscope / 本地 sherpa-onnx
-        asr_row = QHBoxLayout()
-        asr_row.addWidget(self._field_label("ASR 后端"))
-        self._cmb_asr_backend = QComboBox()
-        self._prep_combo(self._cmb_asr_backend)
-        self._cmb_asr_backend.addItem("Windows Live Captions（系统级，推荐）", "live_captions")
-        self._cmb_asr_backend.addItem("本地模型（faster-whisper / sherpa-onnx）", "local")
-        self._cmb_asr_backend.addItem("云端 DashScope Fun-ASR", "dashscope")
-        self._cmb_asr_backend.setToolTip(
-            "Live Captions：系统级ASR，零占用高准确率，仅Win11 22H2+；\n"
-            "本地：下载模型到 resource/asr/，离线运行；\n"
-            "云端：需 DashScope API Key，按量计费。"
+        layout = self._settings_card(
+            page,
+            "大模型翻译 · OpenAI 兼容",
+            kind="cloud",
+            usage_key="llm",
+            desc="用于：翻译 = 大模型 LLM。DeepSeek / 通义 / 本机 Ollama / LM Studio 均可，"
+            "失败时自动回退 NLLB。",
         )
-        self._cmb_asr_backend.currentIndexChanged.connect(self._on_asr_backend_changed)
-        asr_row.addWidget(self._cmb_asr_backend, 1)
-        layout.addLayout(asr_row)
+        self._txt_llm_url = QLineEdit()
+        self._txt_llm_url.setPlaceholderText(
+            "接口地址，如 https://api.deepseek.com/v1 或 http://127.0.0.1:11434/v1"
+        )
+        layout.addWidget(self._txt_llm_url)
+        self._txt_llm_model = QLineEdit()
+        self._txt_llm_model.setPlaceholderText("模型名，如 deepseek-chat / qwen-plus / qwen3:8b")
+        self._txt_llm_key = self._secret_edit("API Key（本地 Ollama 可不填）")
+        llm_row = QHBoxLayout()
+        llm_row.addWidget(self._txt_llm_model, 1)
+        llm_row.addWidget(self._txt_llm_key, 1)
+        layout.addLayout(llm_row)
 
-        # 本地 ASR 模型选择 (sherpa-onnx)
-        local_asr_row = QHBoxLayout()
-        local_asr_row.addWidget(self._field_label("本地 ASR 模型"))
-        self._cmb_local_asr_model = QComboBox()
-        self._prep_combo(self._cmb_local_asr_model)
+        layout = self._settings_card(
+            page,
+            "Edge TTS · 微软",
+            kind="cloud",
+            usage_key="edge",
+            desc="免费、无需账号（需联网）。小智服务端默认语音；其他云端语音失败时也回退到这里。",
+        )
+        self._tts_voice_rows(layout, "edge")
+
+        layout = self._settings_card(
+            page,
+            "自建 / 第三方语音合成 · OpenAI 兼容",
+            kind="cloud",
+            usage_key="openai_tts",
+            desc="对接 /v1/audio/speech：OpenAI、硅基流动 CosyVoice2、Kokoro-FastAPI，"
+            "或本机 GPT-SoVITS / FishSpeech / IndexTTS 的兼容服务（小智 OpenAITTS / CustomTTS 同类）。",
+        )
+        self._txt_openai_tts_url = QLineEdit()
+        self._txt_openai_tts_url.setPlaceholderText(
+            "接口地址，如 https://api.openai.com/v1 或 http://127.0.0.1:8880/v1"
+        )
+        layout.addWidget(self._txt_openai_tts_url)
+        self._txt_openai_tts_model = QLineEdit()
+        self._txt_openai_tts_model.setPlaceholderText(
+            "模型名，如 tts-1 / FunAudioLLM/CosyVoice2-0.5B"
+        )
+        self._txt_openai_tts_key = self._secret_edit("API Key（本机服务可不填）")
+        openai_row = QHBoxLayout()
+        openai_row.addWidget(self._txt_openai_tts_model, 1)
+        openai_row.addWidget(self._txt_openai_tts_key, 1)
+        layout.addLayout(openai_row)
+        self._tts_voice_rows(layout, "openai")
+
+    # ── 本地模型 ─────────────────────────────────────────────────────────
+    def _build_settings_local(self, page: QVBoxLayout) -> None:
         from src.engines.pipeline.model_catalog import (
             ASR_OPTIONS,
             NLLB_OPTIONS,
             format_kokoro_info,
             format_option_label,
         )
+        from src.utils.resource_paths import model_resource_root
 
-        for opt in ASR_OPTIONS:
-            self._cmb_local_asr_model.addItem(format_option_label(opt), opt.id)
-        self._cmb_local_asr_model.setToolTip(
-            "本地 sherpa-onnx 流式 ASR 模型。缓存至 项目内 resource/asr/。\n"
-            "更改后立即生效（运行中会停止通道）。"
+        tip = QLabel(
+            f"离线运行，首次使用时自动下载到 {model_resource_root()}。"
+            "识别和翻译模型更改后立即生效（运行中会停止通道）。"
         )
-        self._cmb_local_asr_model.currentIndexChanged.connect(self._on_local_asr_model_changed)
-        local_asr_row.addWidget(self._cmb_local_asr_model, 1)
-        layout.addLayout(local_asr_row)
+        tip.setObjectName("fieldLabel")
+        tip.setWordWrap(True)
+        page.addWidget(tip)
 
-        economy_tip = QLabel("经济模式 = ASR + NLLB本地翻译 + Kokoro语音（首次运行后台下载模型）")
-        economy_tip.setObjectName("fieldLabel")
-        economy_tip.setWordWrap(True)
-        layout.addWidget(economy_tip)
-        nllb_row = QHBoxLayout()
-        nllb_row.addWidget(self._field_label("NLLB 模型"))
+        self._download_card = self._card()
+        self._download_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        dl_layout = QVBoxLayout(self._download_card)
+        dl_layout.setContentsMargins(16, 14, 16, 14)
+        dl_layout.setSpacing(8)
+        dl_title = QLabel("正在下载")
+        dl_title.setObjectName("sectionTitle")
+        dl_layout.addWidget(dl_title)
+        self._download_list = QVBoxLayout()
+        self._download_list.setSpacing(8)
+        dl_layout.addLayout(self._download_list)
+        self._download_card.setVisible(False)
+        page.addWidget(self._download_card)
+
+        layout = self._settings_card(
+            page,
+            "语音识别模型",
+            kind="local",
+            usage_key="local_asr",
+            desc="用于：语音识别 = 离线模型。两个通道选同一模型时共用一份内存。",
+        )
+        self._asr_model_combos: dict[str, QComboBox] = {}
+        for field, label_text, tip_text in (
+            (
+                "economy_asr_mic_model",
+                "麦克风",
+                "我说话用的模型。近场单人说中文推荐 SenseVoice（小智服务端同款）。",
+            ),
+            (
+                "economy_asr_game_model",
+                "游戏/视频",
+                "游戏/视频声音用的模型。英文对白混 BGM 推荐「智能路由」或 Whisper。",
+            ),
+        ):
+            combo = QComboBox()
+            self._prep_combo(combo)
+            for opt in ASR_OPTIONS:
+                if opt.id != "windows-live-captions":
+                    combo.addItem(format_option_label(opt), opt.id)
+            combo.setToolTip(tip_text)
+            combo.currentIndexChanged.connect(
+                lambda _i, f=field, c=combo: self._on_channel_asr_model_changed(f, c)
+            )
+            self._form_row(layout, label_text, combo)
+            self._model_source_row(layout, functools.partial(self._asr_combo_source, combo))
+            combo.currentIndexChanged.connect(self._refresh_model_sources)
+            self._asr_model_combos[field] = combo
+        self._cmb_mic_asr_model = self._asr_model_combos["economy_asr_mic_model"]
+        self._cmb_game_asr_model = self._asr_model_combos["economy_asr_game_model"]
+        self._field_hint(layout, "语音活动检测（所有本地识别共用）")
+        self._model_source_row(layout, silero_source)
+
+        layout = self._settings_card(
+            page,
+            "翻译模型",
+            kind="local",
+            usage_key="local_mt",
+            desc="用于：翻译 = NLLB / 自动，以及大模型翻译失败时的回退。"
+            "Hy-MT2 模型（约 1.1GB）在首次使用时单独下载。",
+        )
         self._cmb_nllb_model = QComboBox()
         self._prep_combo(self._cmb_nllb_model)
-
         for opt in NLLB_OPTIONS:
             self._cmb_nllb_model.addItem(format_option_label(opt), opt.id)
-        self._cmb_nllb_model.setToolTip(
-            "本地 NLLB CTranslate2 模型。更改后立即生效（运行中会停止通道）；\n"
-            "模型缓存至 项目内 resource/nllb/"
-        )
+        self._cmb_nllb_model.setToolTip("本地 NLLB CTranslate2 模型，缓存至 resource/nllb/")
         self._cmb_nllb_model.currentIndexChanged.connect(self._on_nllb_model_changed)
-        nllb_row.addWidget(self._cmb_nllb_model, 1)
-        layout.addLayout(nllb_row)
-        self._lbl_kokoro_info = QLabel(format_kokoro_info())
-        self._lbl_kokoro_info.setObjectName("fieldLabel")
-        self._lbl_kokoro_info.setWordWrap(True)
-        layout.addWidget(self._lbl_kokoro_info)
+        self._form_row(layout, "NLLB", self._cmb_nllb_model)
+        self._model_source_row(
+            layout, lambda: nllb_source(str(self._cmb_nllb_model.currentData() or ""))
+        )
+        self._cmb_nllb_model.currentIndexChanged.connect(self._refresh_model_sources)
+        self._field_hint(layout, "Hy-MT2 大模型翻译（翻译选 Hy-MT2 时使用）")
+        self._model_source_row(layout, hymt_source)
 
-        # 设备偏好 (CPU/GPU)
+        layout = self._settings_card(
+            page,
+            "Kokoro 语音合成",
+            kind="local",
+            usage_key="kokoro",
+            desc=format_kokoro_info()
+            + "。中文音色需 v1.1-zh 模型（自动下载），未就绪时用 v1.0 的晓晓。",
+        )
+        self._tts_voice_rows(layout, "kokoro")
+        self._model_source_row(layout, kokoro_source)
+
+        layout = self._settings_card(
+            page,
+            "MeloTTS 语音合成",
+            kind="local",
+            usage_key="melo",
+            desc="sherpa-onnx VITS 单音色模型，首次使用下载约 170MB；"
+            "中英夹杂的句子读得更顺，适合游戏术语多的场景。",
+        )
+        melo_preview = QPushButton("试听")
+        melo_preview.setObjectName("ghostButton")
+        melo_preview.clicked.connect(lambda: self._on_preview_tts("melo"))
+        melo_row = QHBoxLayout()
+        melo_row.addStretch(1)
+        melo_row.addWidget(melo_preview)
+        layout.addLayout(melo_row)
+        self._model_source_row(layout, melo_source)
+
         from src.utils.device_utils import detect_cuda_available, get_device_options
 
-        device_row = QHBoxLayout()
-        device_row.addWidget(self._field_label("推理设备"))
+        layout = self._settings_card(
+            page,
+            "推理设备",
+            kind="local",
+            usage_key="device",
+            desc="本地识别 / 翻译 / 语音模型使用的设备。",
+        )
         self._cmb_device_pref = QComboBox()
         self._prep_combo(self._cmb_device_pref)
         for label, value in get_device_options():
             self._cmb_device_pref.addItem(label, value)
-        self._cmb_device_pref.setToolTip(
-            "选择本地模型 (ASR/MT/TTS) 的推理设备。\n"
-            "自动：有 NVIDIA GPU 时用 GPU，否则 CPU；\n"
-            "CPU：强制 CPU（兼容性最好）；\n"
-            "GPU (CUDA)：强制 GPU（需 NVIDIA 显卡 + CUDA onnxruntime）。"
-        )
-        if not detect_cuda_available():
+        if detect_cuda_available():
+            self._cmb_device_pref.setToolTip(
+                "自动：有 NVIDIA GPU 时用 GPU，否则 CPU；\n"
+                "CPU：强制 CPU（兼容性最好）；\n"
+                "GPU (CUDA)：强制 GPU（需 NVIDIA 显卡 + CUDA onnxruntime）。"
+            )
+        else:
             self._cmb_device_pref.setToolTip(
                 "当前未检测到 NVIDIA GPU 或 CUDA onnxruntime。\n"
                 "安装 onnxruntime-gpu 和 NVIDIA 驱动后可选择 GPU。"
             )
         self._cmb_device_pref.currentIndexChanged.connect(self._on_device_pref_changed)
-        device_row.addWidget(self._cmb_device_pref, 1)
-        layout.addLayout(device_row)
+        self._form_row(layout, "默认设备", self._cmb_device_pref)
+        task_row = QHBoxLayout()
+        self._task_device_combos: dict[str, QComboBox] = {}
+        for task, label in (("asr", "识别"), ("mt", "翻译"), ("tts", "语音")):
+            combo = QComboBox()
+            self._prep_combo(combo)
+            combo.addItem(f"{label}：跟随", "")
+            combo.addItem(f"{label}：CPU", "cpu")
+            combo.addItem(f"{label}：GPU", "cuda")
+            combo.setToolTip(f"{label}模型单独指定推理设备；「跟随」使用默认设备")
+            task_row.addWidget(combo, 1)
+            self._task_device_combos[task] = combo
+        self._cmb_asr_device = self._task_device_combos["asr"]
+        self._cmb_mt_device = self._task_device_combos["mt"]
+        self._cmb_tts_device = self._task_device_combos["tts"]
+        layout.addLayout(task_row)
 
-        # 实时资源占用标签
-        self._lbl_resource = QLabel("CPU 0% | RAM 0.0GB")
-        self._lbl_resource.setObjectName("fieldLabel")
-        self._lbl_resource.setStyleSheet("color: #888; font-size: 11px;")
-        layout.addWidget(self._lbl_resource)
-
-        layout.addWidget(self._field_label("Dota 助手（语音教练）"))
-        coach_row = QHBoxLayout()
+    # ── 助手 ────────────────────────────────────────────────────────────
+    def _build_settings_assistant(self, page: QVBoxLayout) -> None:
+        layout = self._settings_card(
+            page,
+            "Dota 助手（语音教练）",
+            desc="用法：先开麦克风通道 → Ctrl+Alt+K 待命 → 说话等定稿 → 自动发送；再按一次取消。",
+        )
         self._chk_dota_coach = QCheckBox("启用")
         self._chk_dota_coach.setChecked(True)
         self._chk_dota_coach.setToolTip(
             "快捷键待命后，把麦克风定稿原文发到本机 Dota Tracker /ai/ask"
         )
-        coach_row.addWidget(self._chk_dota_coach)
         self._cmb_dota_mode = QComboBox()
         self._prep_combo(self._cmb_dota_mode)
         self._cmb_dota_mode.addItem("普通", "normal")
         self._cmb_dota_mode.addItem("加速", "turbo")
         self._cmb_dota_mode.setToolTip("影响 AI 时间节奏建议")
+        coach_row = QHBoxLayout()
+        coach_row.addWidget(self._chk_dota_coach)
         coach_row.addWidget(self._cmb_dota_mode)
-        coach_row.addStretch()
+        coach_row.addStretch(1)
         layout.addLayout(coach_row)
         self._txt_dota_url = QLineEdit()
         self._txt_dota_url.setPlaceholderText(DEFAULT_COACH_URL)
         self._txt_dota_url.setToolTip("Dota Tracker 的 /ai/ask 地址")
         layout.addWidget(self._txt_dota_url)
-        coach_tip = QLabel(
-            "用法：先开麦克风通道 → Ctrl+Alt+K 待命 → 说话等定稿 → 自动发送；再按一次取消。"
+
+    def _refresh_settings_usage(self, *_args: object) -> None:
+        """Mark which cloud/local cards the current engine combination uses."""
+        if not hasattr(self, "_cmb_tts_backend") or not hasattr(self, "_usage_pills"):
+            return
+        from src.engines.pipeline.tts_catalog import tts_engine
+
+        volc = (self._cmb_translation_mode.currentData() or "volc") == "volc"
+        eco = not volc
+        asr = self._cmb_asr_backend.currentData() or ""
+        mt = self._cmb_mt_backend.currentData() or ""
+        tts = self._cmb_tts_backend.currentData() or ""
+        local_asr = eco and asr == "local"
+        local_mt = eco and mt in ("nllb", "auto", "llm")
+        local_tts = eco and tts in ("kokoro", "melo", "auto")
+        usage = {
+            "volc": volc or (eco and (asr == "doubao_flash" or tts == "doubao")),
+            "volc_ast": volc,
+            "doubao_tts": eco and tts == "doubao",
+            "dashscope": eco and (asr in ("dashscope", "qwen_flash") or tts == "cosyvoice"),
+            "cosyvoice": eco and tts == "cosyvoice",
+            "llm": eco and mt == "llm",
+            "edge": eco and tts == "edge",
+            "openai_tts": eco and tts == "openai",
+            "local_asr": local_asr,
+            "local_mt": local_mt or (eco and mt == "hymt"),
+            "kokoro": eco and tts in ("kokoro", "auto"),
+            "melo": eco and tts == "melo",
+            "device": local_asr or local_mt or local_tts or (eco and mt == "hymt"),
+        }
+        for key, pill in self._usage_pills.items():
+            on = usage.get(key, False)
+            name = "usageOn" if on else "usageOff"
+            pill.setText("● 使用中" if on else "未使用")
+            if pill.objectName() != name:
+                pill.setObjectName(name)
+                style = pill.style()
+                if style is not None:
+                    style.unpolish(pill)
+                    style.polish(pill)
+
+        self._economy_rows.setVisible(eco)
+        info = tts_engine(tts)
+        asr_where = "本地模型" if asr in ("local", "live_captions") else "云端服务"
+        mt_where = "本地模型" if mt in ("nllb", "hymt", "auto") else "云端服务"
+        tts_where = {"local": "本地模型", "cloud": "云端服务", "auto": "本地模型"}[info.kind]
+        self._lbl_engine_hint.setText(
+            f"识别 → 「{asr_where}」页　翻译 → 「{mt_where}」页　语音 → 「{tts_where}」页"
+            f"（{info.needs}）"
         )
-        coach_tip.setObjectName("appSubtitle")
-        coach_tip.setWordWrap(True)
-        layout.addWidget(coach_tip)
-
-        self._btn_stop = QPushButton("停止全部")
-        self._btn_stop.setObjectName("dangerButton")
-        self._btn_stop.setEnabled(False)
-        self._btn_stop.clicked.connect(self._on_stop)
-        layout.addWidget(self._btn_stop)
-
-        layout.addStretch(1)
-        return card
 
     def _build_log_panel(self) -> QFrame:
         card = self._card()
         card.setObjectName("logSidePanel")
         card.setMinimumWidth(260)
-        card.setMaximumWidth(340)
+        card.setMaximumWidth(320)
         card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
         log_header = QHBoxLayout()
         log_title = QLabel("运行状态")
@@ -1043,16 +1805,17 @@ class MainWindow(QMainWindow):
         log_header.addWidget(log_title)
         log_header.addStretch()
         btn_clear = QPushButton("清空")
-        btn_clear.setObjectName("ghostButton")
+        btn_clear.setObjectName("accentButton")
         btn_clear.setToolTip("清空状态日志")
         btn_clear.clicked.connect(self._on_clear_log)
         log_header.addWidget(btn_clear)
-        btn_transcript = QPushButton("记录")
-        btn_transcript.setObjectName("ghostButton")
-        btn_transcript.setToolTip("查看本地翻译留档，支持搜索与导出")
-        btn_transcript.clicked.connect(self._on_open_transcripts)
-        log_header.addWidget(btn_transcript)
         layout.addLayout(log_header)
+
+        metrics = QHBoxLayout()
+        metrics.setSpacing(8)
+        self._metric_latency = self._metric_tile(metrics, "端到端延迟", "—", "metricValue")
+        self._lbl_resource = self._metric_tile(metrics, "资源占用", "CPU 0%\nRAM 0.0GB")
+        layout.addLayout(metrics)
 
         self._side_status = QLabel("空闲")
         self._side_status.setObjectName("fieldLabel")
@@ -1060,11 +1823,41 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._side_status)
 
         self._log_view = QTextEdit()
+        # Long gaming sessions log continuously; keep memory and append cost bounded.
+        log_doc = self._log_view.document()
+        if log_doc is not None:
+            log_doc.setMaximumBlockCount(2000)
         self._log_view.setObjectName("logView")
         self._log_view.setReadOnly(True)
         self._log_view.setMinimumHeight(160)
         layout.addWidget(self._log_view, 1)
         return card
+
+    def _metric_tile(
+        self, row: QHBoxLayout, title: str, value: str, value_style: str = "metricSmall"
+    ) -> QLabel:
+        tile = QFrame()
+        tile.setObjectName("metricTile")
+        lay = QVBoxLayout(tile)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(2)
+        caption = QLabel(title)
+        caption.setObjectName("statusLabel")
+        lay.addWidget(caption)
+        label = QLabel(value)
+        label.setObjectName(value_style)
+        label.setWordWrap(True)
+        lay.addWidget(label)
+        row.addWidget(tile, 1)
+        return label
+
+    def _set_latency(self, latency_ms: int | None) -> None:
+        if latency_ms is None:
+            self._latency_label.setText("延迟：—")
+            self._metric_latency.setText("—")
+            return
+        self._latency_label.setText(f"延迟：{latency_ms} ms")
+        self._metric_latency.setText(f"{latency_ms} ms")
 
     def _on_clear_log(self) -> None:
         self._log_view.clear()
@@ -1111,16 +1904,55 @@ class MainWindow(QMainWindow):
             combo.addItem(label, code)
 
     def _apply_theme(self) -> None:
-        self.setStyleSheet(get_stylesheet(self._theme))
-        self._btn_theme.setText("浅色" if self._theme == "dark" else "深色")
+        self._active_theme = resolve_theme(self._theme)
+        self.setStyleSheet(get_stylesheet(self._active_theme))
+        self._cmb_theme.blockSignals(True)
+        self._select_combo_data(self._cmb_theme, self._theme)
+        self._cmb_theme.blockSignals(False)
+        if getattr(self, "_btn_text_color", None) is not None:
+            self._refresh_color_buttons()
+            for overlay in self._overlays.values():
+                overlay.set_appearance(**self._overlay_appearance())
+                overlay.set_menu_style(menu_stylesheet(self._active_theme))
 
-    def _toggle_theme(self) -> None:
-        self._theme = "light" if self._theme == "dark" else "dark"
+    def _on_theme_selected(self, _index: int) -> None:
+        key = normalize_theme_key(self._cmb_theme.currentData())
+        if key == self._theme:
+            return
+        self._theme = key
         self._apply_theme()
-        self._config = self._config.model_copy(update={"theme_mode": self._theme})
+        self._config = self._config.model_copy(update={"theme_mode": key})
         self._persist_config()
-        self._btn_theme.setText("浅色" if self._theme == "dark" else "深色")
-        self._append_log(f"已切换到{'深色' if self._theme == 'dark' else '浅色'}模式")
+        self._append_log(f"主题已切换为「{self._cmb_theme.currentText()}」")
+
+    def _on_system_scheme_changed(self, *_args: object) -> None:
+        if self._theme == "system":
+            self._apply_theme()
+
+    def _show_page(self, index: int) -> None:
+        self._pages.setCurrentIndex(index)
+        self._current_tab_index = index
+        title, subtitle = _PAGE_TITLES[index]
+        self._page_title.setText(title)
+        self._page_subtitle.setText(subtitle)
+        if index == _PAGE_TRANSCRIPTS:
+            self._transcript_panel.set_log_dir(resolve_log_dir(self._config.log_dir))
+        elif index == _PAGE_TYPED and not self._typed_languages_set:
+            # Same direction as the mic channel (you type what you would say).
+            self._typed_languages_set = True
+            self._typed_panel.set_languages(
+                self._cmb_mic_source.currentData() or "zh",
+                self._cmb_mic_target.currentData() or "en",
+            )
+        button = self._nav_group_buttons.button(index)
+        if button is not None:
+            button.setChecked(True)
+
+    def _on_status_panel_toggled(self, visible: bool) -> None:
+        self._log_panel.setVisible(visible)
+        if self._config.status_panel_visible != visible:
+            self._config = self._config.model_copy(update={"status_panel_visible": visible})
+            self._persist_config()
 
     def _append_log(self, message: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1188,7 +2020,7 @@ class MainWindow(QMainWindow):
                 continue
             seen_mic.add(idx)
             label = format_device_label("mic", name, idx)
-            self._cmb_input.addItem(label, idx)
+            self._add_device_item(self._cmb_input, label, idx, name)
         self._cmb_input.setToolTip(role_hint("mic") + "\n" + vb_cable_setup_hint())
 
         # ---- 译文播放到 ----
@@ -1197,19 +2029,21 @@ class MainWindow(QMainWindow):
         seen_out: set[Any] = set()
         preferred_out: list[tuple[Any, str]] = []
         other_out: list[tuple[Any, str]] = []
+        out_names: dict[str, str] = {}
         for dev in outputs:
             idx = dev["index"]
             if idx in seen_out:
                 continue
             seen_out.add(idx)
             name = str(dev["name"])
+            out_names[str(idx)] = name
             label = format_device_label("output", name, idx)
             if self._is_preferred_virtual_output(name):
                 preferred_out.append((idx, label))
             else:
                 other_out.append((idx, label))
         for idx, label in preferred_out + other_out:
-            self._cmb_output.addItem(label, idx)
+            self._add_device_item(self._cmb_output, label, idx, out_names.get(str(idx), ""))
         self._cmb_output.setToolTip(
             role_hint("output")
             + "\n队友听翻译：选 CABLE Input 或 Voicemeeter Input（需安装虚拟声卡）"
@@ -1231,6 +2065,7 @@ class MainWindow(QMainWindow):
         preferred: list[tuple[Any, str]] = []
         vb_loop: list[tuple[Any, str]] = []
         others: list[tuple[Any, str]] = []
+        lb_names: dict[str, str] = {}
         seen_lb: set[Any] = set()
         advanced = bool(getattr(self, "_chk_advanced", None) and self._chk_advanced.isChecked())
 
@@ -1249,6 +2084,7 @@ class MainWindow(QMainWindow):
             ):
                 continue
             seen_lb.add(idx)
+            lb_names[str(idx)] = name
             label = format_device_label("loopback", name, idx)
             if is_vb_cable_capture(name, idx) or is_vb_cable_input(name, idx):
                 vb_loop.append((idx, label))
@@ -1268,20 +2104,24 @@ class MainWindow(QMainWindow):
             if idx in seen_lb:
                 continue
             seen_lb.add(idx)
+            lb_names[str(idx)] = name
             label = format_device_label("loopback", name, idx)
             if is_vb_cable_capture(name, idx) or is_vb_cable_input(name, idx):
                 vb_loop.append((idx, label))
             else:
                 others.append((idx, label))
 
-        for idx, label in preferred:
-            self._cmb_loopback.addItem(label, idx)
-        for idx, label in others:
-            self._cmb_loopback.addItem(label, idx)
-        # 虚拟线缆捕获仅高级模式列出，避免误选
-        if advanced:
-            for idx, label in vb_loop:
-                self._cmb_loopback.addItem(label, idx)
+        saved_lb = (str(self._config.loopback_device), self._config.loopback_device_name)
+        # 虚拟线缆捕获仅高级模式列出，避免误选；已保存的那一项始终保留，否则会显示为"未连接"
+        shown_vb = [
+            (idx, label)
+            for idx, label in vb_loop
+            if advanced
+            or str(idx) == saved_lb[0]
+            or (saved_lb[1] and lb_names.get(str(idx)) == saved_lb[1])
+        ]
+        for idx, label in preferred + others + shown_vb:
+            self._add_device_item(self._cmb_loopback, label, idx, lb_names.get(str(idx), ""))
         self._cmb_loopback.setToolTip(role_hint("loopback"))
 
         # 未配置过捕获源时：自动选系统 Loopback（避开虚拟线）
@@ -1311,6 +2151,57 @@ class MainWindow(QMainWindow):
             )
 
     # -------------------------------------------------------------- config
+    _DEVICE_NAME_ROLE = Qt.ItemDataRole.UserRole + 1
+    _DEVICE_MISSING_ROLE = Qt.ItemDataRole.UserRole + 2
+
+    def _add_device_item(self, combo: QComboBox, label: str, idx: Any, name: str) -> None:
+        combo.addItem(label, idx)
+        combo.setItemData(combo.count() - 1, name, self._DEVICE_NAME_ROLE)
+
+    def _select_device(self, combo: QComboBox, idx: Any, name: str) -> None:
+        """Pick the saved device by name first; keep a placeholder if it is unplugged."""
+        if idx is None and not name:
+            combo.setCurrentIndex(0)
+            return
+        if name:
+            # One endpoint can be listed by several sources under the same name.
+            same_name = [
+                i for i in range(combo.count()) if combo.itemData(i, self._DEVICE_NAME_ROLE) == name
+            ]
+            exact = [i for i in same_name if str(combo.itemData(i)) == str(idx)]
+            if exact or same_name:
+                combo.setCurrentIndex((exact or same_name)[0])
+                return
+        for i in range(combo.count()):
+            if str(combo.itemData(i)) == str(idx):
+                item_name = combo.itemData(i, self._DEVICE_NAME_ROLE) or ""
+                if not name or item_name == name:
+                    combo.setCurrentIndex(i)
+                    return
+        # Saved device is not connected: keep the setting instead of silently erasing it.
+        combo.addItem(f"⚠ 未连接：{name or idx}", idx)
+        last = combo.count() - 1
+        combo.setItemData(last, name, self._DEVICE_NAME_ROLE)
+        combo.setItemData(last, True, self._DEVICE_MISSING_ROLE)
+        combo.setCurrentIndex(last)
+
+    def _combo_device_name(self, combo: QComboBox) -> str:
+        if combo.currentData() is None:
+            return ""
+        return str(combo.currentData(self._DEVICE_NAME_ROLE) or "")
+
+    def _missing_devices(self, channel: Literal["mic", "game"]) -> list[str]:
+        combos = [self._cmb_input] if channel == "mic" else [self._cmb_loopback]
+        if (channel == "mic" and self._chk_play_mic.isChecked()) or (
+            channel == "game" and self._chk_play_game.isChecked()
+        ):
+            combos.append(self._cmb_output)
+        return [
+            self._combo_device_name(c) or str(c.currentData())
+            for c in combos
+            if c.currentData(self._DEVICE_MISSING_ROLE)
+        ]
+
     def _select_combo_data(self, combo: QComboBox, value: Any) -> None:
         if value is None:
             combo.setCurrentIndex(0)
@@ -1402,8 +2293,9 @@ class MainWindow(QMainWindow):
 
     def _load_config_into_ui(self) -> None:
         cfg = self._config
-        self._theme = cfg.theme_mode  # type: ignore[assignment]
-        self._apply_theme()
+        self._theme = cfg.theme_mode
+        self._btn_status_panel.setChecked(cfg.status_panel_visible)
+        self._log_panel.setVisible(cfg.status_panel_visible)
 
         self._select_lang(self._cmb_mic_source, cfg.source_language)
         self._select_lang(self._cmb_mic_target, cfg.target_language)
@@ -1417,7 +2309,16 @@ class MainWindow(QMainWindow):
         self._chk_play_mic.setChecked(cfg.play_mic_voice)
         self._chk_play_game.setChecked(cfg.play_game_voice)
         self._spn_font.setValue(cfg.subtitle_font_size)
-        self._spn_opacity.setValue(cfg.subtitle_opacity)
+        self._spn_opacity.setValue(round(cfg.subtitle_opacity * 100))
+        self._subtitle_text_color = getattr(cfg, "subtitle_text_color", "#FFFFFF") or "#FFFFFF"
+        self._subtitle_bg_color = getattr(cfg, "subtitle_bg_color", "#141418") or "#141418"
+        self._chk_subtitle_follow_theme.blockSignals(True)
+        self._chk_subtitle_follow_theme.setChecked(cfg.subtitle_follow_theme)
+        self._chk_subtitle_follow_theme.blockSignals(False)
+        self._apply_theme()
+        self._select_combo_data(
+            self._cmb_subtitle_font, getattr(cfg, "subtitle_font_family", "") or ""
+        )
         self._cmb_translation_mode.blockSignals(True)
         self._select_combo_data(
             self._cmb_translation_mode,
@@ -1429,24 +2330,12 @@ class MainWindow(QMainWindow):
             self._txt_dashscope_key.setText(getattr(cfg, "economy_dashscope_api_key", "") or "")
         if hasattr(self, "_cmb_asr_backend"):
             self._cmb_asr_backend.blockSignals(True)
-            asr_ui = getattr(cfg, "economy_asr_backend", "live_captions") or "live_captions"
-            # Combo only has local|live_captions|dashscope; map aliases for display.
-            if asr_ui in ("sherpa", "whisper"):
-                asr_ui = "local"
-            self._select_combo_data(self._cmb_asr_backend, asr_ui)
+            self._select_combo_data(self._cmb_asr_backend, cfg.economy_asr_backend)
             self._cmb_asr_backend.blockSignals(False)
-        if hasattr(self, "_cmb_local_asr_model"):
-            self._cmb_local_asr_model.blockSignals(True)
-            self._select_combo_data(
-                self._cmb_local_asr_model,
-                getattr(
-                    cfg,
-                    "economy_asr_local_model",
-                    "faster-whisper-medium",
-                )
-                or "faster-whisper-medium",
-            )
-            self._cmb_local_asr_model.blockSignals(False)
+        for field, combo in self._asr_model_combos.items():
+            combo.blockSignals(True)
+            self._select_combo_data(combo, getattr(cfg, field))
+            combo.blockSignals(False)
         if hasattr(self, "_cmb_device_pref"):
             self._cmb_device_pref.blockSignals(True)
             self._select_combo_data(
@@ -1466,20 +2355,38 @@ class MainWindow(QMainWindow):
                 or "JustFrederik/nllb-200-distilled-600M-ct2-int8",
             )
             self._cmb_nllb_model.blockSignals(False)
+        if hasattr(self, "_cmb_mt_backend"):
+            self._select_combo_data(
+                self._cmb_mt_backend, getattr(cfg, "economy_mt_backend", "nllb") or "nllb"
+            )
+            self._txt_llm_url.setText(getattr(cfg, "economy_llm_base_url", "") or "")
+            self._txt_llm_model.setText(getattr(cfg, "economy_llm_model", "") or "")
+            self._txt_llm_key.setText(getattr(cfg, "economy_llm_api_key", "") or "")
+        self._select_combo_data(self._cmb_tts_backend, cfg.economy_tts_backend)
+        self._spn_tts_speed.setValue(cfg.economy_kokoro_speed)
+        for field, combo in self._tts_voice_combos.items():
+            self._set_voice_value(combo, getattr(cfg, field))
+        self._txt_cosyvoice_model.setText(cfg.economy_cosyvoice_model)
+        self._txt_openai_tts_url.setText(cfg.economy_openai_tts_url)
+        self._txt_openai_tts_model.setText(cfg.economy_openai_tts_model)
+        self._txt_openai_tts_key.setText(cfg.economy_openai_tts_api_key)
+        for task, combo in getattr(self, "_task_device_combos", {}).items():
+            self._select_combo_data(combo, getattr(cfg, f"economy_{task}_device", "") or "")
         self._txt_volc_token.setText(cfg.volc_access_token)
         self._txt_volc_iam_ak.setText(getattr(cfg, "volc_iam_ak", "") or "")
         self._txt_volc_iam_sk.setText(getattr(cfg, "volc_iam_sk", "") or "")
         self._txt_volc_console_app.setText(getattr(cfg, "volc_console_app_id", "") or "")
         self._chk_vad.setChecked(bool(getattr(cfg, "vad_enabled", True)))
         self._chk_vad_game.setChecked(bool(getattr(cfg, "vad_game_enabled", False)))
+        self._chk_aec.setChecked(bool(getattr(cfg, "aec_enabled", True)))
         self._select_combo_data(
             self._cmb_vad_sens, getattr(cfg, "vad_sensitivity", "medium") or "medium"
         )
         self._select_combo_data(
             self._cmb_vad_backend, getattr(cfg, "vad_backend", "auto") or "auto"
         )
-        self._vad_open_ms = int(getattr(cfg, "vad_open_ms", 80) or 80)
-        self._vad_hangover_ms = int(getattr(cfg, "vad_hangover_ms", 600) or 600)
+        self._vad_open_ms = int(cfg.vad_open_ms)
+        self._vad_hangover_ms = int(cfg.vad_hangover_ms)
         self._cmb_quality.blockSignals(True)
         self._select_combo_data(
             self._cmb_quality, getattr(cfg, "quality_preset", "balanced") or "balanced"
@@ -1488,17 +2395,17 @@ class MainWindow(QMainWindow):
         self._select_combo_data(
             self._cmb_original_audio, getattr(cfg, "original_audio", "mix") or "mix"
         )
-        self._spn_duck_gain.setValue(float(getattr(cfg, "duck_gain", 0.2) or 0.2))
+        self._spn_duck_gain.setValue(float(cfg.duck_gain))
         self._select_combo_data(
             self._cmb_capture_backend, getattr(cfg, "capture_backend", "auto") or "auto"
         )
         self._spn_rotate.setValue(int(getattr(cfg, "volc_session_rotate_minutes", 12) or 0))
         self._chk_dota_coach.setChecked(bool(getattr(cfg, "dota_coach_enabled", True)))
-        self._txt_dota_url.setText(getattr(cfg, "dota_coach_url", "") or DEFAULT_COACH_URL)
+        self._txt_dota_url.setText(cfg.dota_coach_url)
         self._select_combo_data(
             self._cmb_dota_mode, getattr(cfg, "dota_coach_mode", "normal") or "normal"
         )
-        self._select_combo_data(self._cmb_volc_voice, getattr(cfg, "volc_speaker_id", "") or "")
+        self._set_voice_value(self._cmb_volc_voice, getattr(cfg, "volc_speaker_id", "") or "")
         self._spn_speech_rate.setValue(int(getattr(cfg, "volc_speech_rate", 0) or 0))
         self._spn_history.setValue(int(getattr(cfg, "subtitle_history_lines", 2) or 0))
         self._chk_transcript_logging.setChecked(cfg.transcript_logging_enabled)
@@ -1509,10 +2416,11 @@ class MainWindow(QMainWindow):
         self._chk_advanced.blockSignals(False)
         # Re-enumerate so advanced loopback list matches checkbox
         self._populate_devices()
-        self._select_combo_data(self._cmb_input, cfg.input_device)
-        if cfg.output_device is not None:
-            self._select_combo_data(self._cmb_output, cfg.output_device)
-        self._select_combo_data(self._cmb_loopback, cfg.loopback_device)
+        self._select_device(self._cmb_input, cfg.input_device, cfg.input_device_name)
+        if cfg.output_device is not None or cfg.output_device_name:
+            self._select_device(self._cmb_output, cfg.output_device, cfg.output_device_name)
+        self._select_device(self._cmb_loopback, cfg.loopback_device, cfg.loopback_device_name)
+        self._rebind_devices_by_name()
         self._apply_advanced_visibility()
         self._corpus_hotwords = list(getattr(cfg, "hotwords", None) or [])
         self._corpus_glossary = dict(getattr(cfg, "glossary", None) or {})
@@ -1531,7 +2439,37 @@ class MainWindow(QMainWindow):
             self._cmb_game_target.currentIndexChanged.connect(self._sync_lang_pairs_from_game)
             self._lang_signals_wired = True
         self._on_enable_toggled()
+        self._refresh_settings_usage()
+        self._refresh_model_sources()
         self._update_save_button()
+
+    def _rebind_devices_by_name(self) -> None:
+        """Adopt today's index for a renamed-in-place device, and backfill names."""
+        update: dict[str, Any] = {}
+        for field, combo in (
+            ("input_device", self._cmb_input),
+            ("output_device", self._cmb_output),
+            ("loopback_device", self._cmb_loopback),
+        ):
+            if combo.currentData(self._DEVICE_MISSING_ROLE):
+                continue
+            idx, name = combo.currentData(), self._combo_device_name(combo)
+            saved_idx = getattr(self._config, field)
+            saved_name = getattr(self._config, f"{field}_name")
+            name_count = sum(
+                1 for i in range(combo.count()) if combo.itemData(i, self._DEVICE_NAME_ROLE) == name
+            )
+            if saved_name and name == saved_name and name_count == 1 and str(idx) != str(saved_idx):
+                update[field] = idx  # same device, new index after a replug
+            elif not saved_name and saved_idx is not None and str(idx) == str(saved_idx) and name:
+                update[f"{field}_name"] = name  # config from before names were stored
+        if not update:
+            return
+        moved = {k for k in update if not k.endswith("_name")}
+        self._config = self._config.model_copy(update=update)
+        if moved:
+            self._append_log("音频设备编号已变化，已按设备名重新匹配")
+            self._persist_config()
 
     def _config_snapshot(self, cfg: AppConfigModel) -> dict[str, Any]:
         return cfg.model_dump(mode="json")
@@ -1569,13 +2507,7 @@ class MainWindow(QMainWindow):
             if persist:
                 cleared = {
                     field
-                    for field in (
-                        "volc_api_key",
-                        "volc_access_token",
-                        "volc_iam_ak",
-                        "volc_iam_sk",
-                        "economy_dashscope_api_key",
-                    )
+                    for field in SECRET_FIELDS
                     if str(getattr(previous, field, "") or "").strip()
                     and not str(getattr(updated, field, "") or "").strip()
                 }
@@ -1619,35 +2551,29 @@ class MainWindow(QMainWindow):
         del cancel_btn
         return "cancel"
 
-    def _on_tab_changed(self, index: int) -> None:
+    def _on_nav_clicked(self, index: int) -> None:
         prev = self._current_tab_index
-        if index == prev or self._suppress_tab_guard:
-            self._current_tab_index = index
+        if index == prev:
+            self._show_page(index)
             return
         if not self._is_dirty():
-            self._current_tab_index = index
+            self._show_page(index)
             return
 
-        choice = self._ask_unsaved("切换标签")
+        choice = self._ask_unsaved("切换页面")
         if choice == "save":
             if not self._commit_from_ui(persist=True):
-                self._revert_tab(prev)
+                self._show_page(prev)
                 return
-            self._current_tab_index = index
             self._append_log("配置已保存")
+            self._show_page(index)
             return
         if choice == "discard":
             self._load_config_into_ui()
-            self._current_tab_index = index
             self._append_log("已丢弃未保存的修改")
+            self._show_page(index)
             return
-        self._revert_tab(prev)
-
-    def _revert_tab(self, index: int) -> None:
-        self._suppress_tab_guard = True
-        self._tabs.setCurrentIndex(index)
-        self._suppress_tab_guard = False
-        self._current_tab_index = index
+        self._show_page(prev)
 
     def _collect_config_from_ui(self) -> AppConfigModel:
         # Merge into the complete loaded model. Engine-only/new settings that do
@@ -1658,7 +2584,11 @@ class MainWindow(QMainWindow):
             source_language=self._cmb_mic_source.currentData(),
             target_language=self._cmb_mic_target.currentData(),
             subtitle_font_size=self._spn_font.value(),
-            subtitle_opacity=self._spn_opacity.value(),
+            subtitle_opacity=self._overlay_opacity(),
+            subtitle_text_color=self._subtitle_text_color,
+            subtitle_bg_color=self._subtitle_bg_color,
+            subtitle_follow_theme=self._chk_subtitle_follow_theme.isChecked(),
+            subtitle_font_family=self._cmb_subtitle_font.currentData() or "",
             log_dir=self._config.log_dir,
             debug_mode=self._config.debug_mode,
             subtitle_window_positions=self._config.subtitle_window_positions,
@@ -1671,8 +2601,10 @@ class MainWindow(QMainWindow):
             input_device=self._cmb_input.currentData(),
             output_device=self._cmb_output.currentData(),
             loopback_device=self._cmb_loopback.currentData(),
+            input_device_name=self._combo_device_name(self._cmb_input),
+            output_device_name=self._combo_device_name(self._cmb_output),
+            loopback_device_name=self._combo_device_name(self._cmb_loopback),
             translation_mode=self._cmb_translation_mode.currentData() or "volc",
-            use_volc=(self._cmb_translation_mode.currentData() or "volc") == "volc",
             volc_api_key=self._txt_volc_key.text().strip(),
             economy_dashscope_api_key=(
                 self._txt_dashscope_key.text().strip()
@@ -1682,23 +2614,18 @@ class MainWindow(QMainWindow):
             economy_asr_backend=(
                 self._cmb_asr_backend.currentData()
                 if hasattr(self, "_cmb_asr_backend") and self._cmb_asr_backend.currentData()
-                else getattr(self._config, "economy_asr_backend", "live_captions")
-                or "live_captions"
+                else self._config.economy_asr_backend
             ),
             economy_asr_model=getattr(self._config, "economy_asr_model", "fun-asr-realtime")
             or "fun-asr-realtime",
-            economy_asr_local_model=(
-                self._cmb_local_asr_model.currentData()
-                if hasattr(self, "_cmb_local_asr_model") and self._cmb_local_asr_model.currentData()
-                else getattr(
-                    self._config,
-                    "economy_asr_local_model",
-                    "faster-whisper-medium",
-                )
-                or "faster-whisper-medium"
+            economy_asr_mic_model=(
+                self._cmb_mic_asr_model.currentData() or self._config.economy_asr_mic_model
             ),
-            economy_mt_backend=getattr(self._config, "economy_mt_backend", "nllb") or "nllb",
-            economy_tts_backend=getattr(self._config, "economy_tts_backend", "kokoro") or "kokoro",
+            economy_asr_game_model=(
+                self._cmb_game_asr_model.currentData() or self._config.economy_asr_game_model
+            ),
+            **self._collect_economy_mt_fields(),
+            **self._collect_tts_fields(),
             economy_nllb_model=(
                 self._cmb_nllb_model.currentData()
                 if hasattr(self, "_cmb_nllb_model") and self._cmb_nllb_model.currentData()
@@ -1712,11 +2639,6 @@ class MainWindow(QMainWindow):
             economy_offline_setup_done=bool(
                 getattr(self._config, "economy_offline_setup_done", False)
             ),
-            economy_kokoro_voice_en=getattr(self._config, "economy_kokoro_voice_en", "af_bella")
-            or "af_bella",
-            economy_kokoro_voice_zh=getattr(self._config, "economy_kokoro_voice_zh", "zf_xiaoxiao")
-            or "zf_xiaoxiao",
-            economy_kokoro_speed=float(getattr(self._config, "economy_kokoro_speed", 0.92) or 0.92),
             economy_sentence_min_chars=int(
                 getattr(self._config, "economy_sentence_min_chars", 4) or 4
             ),
@@ -1747,7 +2669,7 @@ class MainWindow(QMainWindow):
                 getattr(self._config, "economy_utterance_tail_rms", 0.003) or 0.003
             ),
             volc_access_token=self._txt_volc_token.text().strip(),
-            volc_speaker_id=self._cmb_volc_voice.currentData() or "",
+            volc_speaker_id=self._voice_value(self._cmb_volc_voice),
             volc_speech_rate=self._spn_speech_rate.value(),
             volc_iam_ak=self._txt_volc_iam_ak.text().strip(),
             volc_iam_sk=self._txt_volc_iam_sk.text().strip(),
@@ -1766,10 +2688,11 @@ class MainWindow(QMainWindow):
             show_advanced_devices=self._chk_advanced.isChecked(),
             vad_enabled=self._chk_vad.isChecked(),
             vad_game_enabled=self._chk_vad_game.isChecked(),
+            aec_enabled=self._chk_aec.isChecked(),
             vad_backend=self._cmb_vad_backend.currentData() or "auto",
             vad_sensitivity=self._cmb_vad_sens.currentData() or "medium",
-            vad_open_ms=int(getattr(self, "_vad_open_ms", 80) or 80),
-            vad_hangover_ms=int(getattr(self, "_vad_hangover_ms", 600) or 600),
+            vad_open_ms=int(getattr(self, "_vad_open_ms", self._config.vad_open_ms)),
+            vad_hangover_ms=int(getattr(self, "_vad_hangover_ms", self._config.vad_hangover_ms)),
             vad_preroll_ms=int(getattr(self._config, "vad_preroll_ms", 300) or 300),
             vad_barge_in_ms=int(getattr(self._config, "vad_barge_in_ms", 200) or 200),
             quality_preset=self._cmb_quality.currentData() or "balanced",
@@ -1780,7 +2703,7 @@ class MainWindow(QMainWindow):
             duck_gain=float(self._spn_duck_gain.value()),
             volc_session_rotate_minutes=int(self._spn_rotate.value()),
             dota_coach_enabled=self._chk_dota_coach.isChecked(),
-            dota_coach_url=self._txt_dota_url.text().strip() or DEFAULT_COACH_URL,
+            dota_coach_url=self._txt_dota_url.text().strip(),
             dota_coach_mode=self._cmb_dota_mode.currentData() or "normal",
             dota_coach_arm_seconds=int(getattr(self._config, "dota_coach_arm_seconds", 12) or 12),
         )
@@ -1817,24 +2740,8 @@ class MainWindow(QMainWindow):
             self._cmb_translation_mode.blockSignals(False)
             return
 
-        stopped = False
-        if self._pipeline is not None and self._pipeline.active_channels():
-            with contextlib.suppress(Exception):
-                self._pipeline.stop()
-            stopped = True
-            self._timer.stop()
-            self._btn_stop.setEnabled(False)
-            self._progress.setVisible(False)
-            self._badge.setText("Idle")
-            self._refresh_channel_buttons()
-            self._on_enable_toggled()
-
-        if self._pipeline is not None:
-            with contextlib.suppress(Exception):
-                self._pipeline.set_translation_mode(mode)  # type: ignore[arg-type]
-        self._config = self._config.model_copy(
-            update={"translation_mode": mode, "use_volc": mode == "volc"}
-        )
+        stopped = self._reset_engine_for_setting({"translation_mode": mode})
+        self._config = self._config.model_copy(update={"translation_mode": mode})
         self._persist_config()
 
         label = "火山同传" if mode == "volc" else "经济模式"
@@ -1885,6 +2792,38 @@ class MainWindow(QMainWindow):
                 self._append_log(warn)
                 show_toast(warn)
 
+    def _reset_economy_engine(self, update: dict[str, Any]) -> bool:
+        if (getattr(self._config, "translation_mode", "volc") or "volc") != "economy":
+            return False
+        return self._reset_engine_for_setting(update)
+
+    def _reset_engine_for_setting(self, update: dict[str, Any]) -> bool:
+        """Stop channels and drop the engine so the next start uses ``update``.
+
+        Runs on the channel worker behind any pending start, never on the Qt thread.
+        Returns True when a channel was running or about to run.
+        """
+        pipeline = self._pipeline
+        if pipeline is None:
+            return False
+        stopped = bool(pipeline.active_channels() or self._channel_busy)
+        if stopped:
+            self._close_overlays()
+            self._timer.stop()
+            self._btn_stop.setEnabled(False)
+            self._progress.setVisible(False)
+            self._badge.setText("Idle")
+
+        def work() -> Callable[[], None]:
+            if pipeline.active_channels():
+                pipeline.stop()
+            pipeline.close_engine()
+            pipeline._config = pipeline._config.model_copy(update=update)
+            return self._on_enable_toggled
+
+        self._run_channel_op(("mic", "game"), work)
+        return stopped
+
     def _ensure_economy_offline_setup(self) -> bool:
         """Show first-run offline model dialog if needed. Returns False if cancelled."""
         if bool(getattr(self._config, "economy_offline_setup_done", False)):
@@ -1925,26 +2864,7 @@ class MainWindow(QMainWindow):
         if model_id == current and bool(getattr(self._config, "economy_offline_setup_done", False)):
             return
 
-        stopped = False
-        mode = getattr(self._config, "translation_mode", "volc") or "volc"
-        if mode == "economy" and self._pipeline is not None:
-            if self._pipeline.active_channels():
-                with contextlib.suppress(Exception):
-                    self._pipeline.stop()
-                stopped = True
-                self._timer.stop()
-                self._btn_stop.setEnabled(False)
-                self._progress.setVisible(False)
-                self._badge.setText("Idle")
-                self._refresh_channel_buttons()
-                self._on_enable_toggled()
-            with contextlib.suppress(Exception):
-                self._pipeline.close_engine()
-            # Refresh pipeline config so next start uses the new model.
-            self._pipeline._config = self._pipeline._config.model_copy(
-                update={"economy_nllb_model": model_id}
-            )
-
+        stopped = self._reset_economy_engine({"economy_nllb_model": model_id})
         self._config = self._config.model_copy(
             update={
                 "economy_nllb_model": model_id,
@@ -1966,88 +2886,160 @@ class MainWindow(QMainWindow):
         backend = self._cmb_asr_backend.currentData()
         if not backend:
             return
-        current = getattr(self._config, "economy_asr_backend", "live_captions") or "live_captions"
-        if backend == current:
+        if backend == self._config.economy_asr_backend:
             return
 
-        stopped = False
-        mode = getattr(self._config, "translation_mode", "volc") or "volc"
-        if mode == "economy" and self._pipeline is not None:
-            if self._pipeline.active_channels():
-                with contextlib.suppress(Exception):
-                    self._pipeline.stop()
-                stopped = True
-                self._timer.stop()
-                self._btn_stop.setEnabled(False)
-                self._progress.setVisible(False)
-                self._badge.setText("Idle")
-                self._refresh_channel_buttons()
-                self._on_enable_toggled()
-            with contextlib.suppress(Exception):
-                self._pipeline.close_engine()
-            self._pipeline._config = self._pipeline._config.model_copy(
-                update={"economy_asr_backend": backend}
-            )
+        stopped = self._reset_economy_engine({"economy_asr_backend": backend})
 
         self._config = self._config.model_copy(update={"economy_asr_backend": backend})
         self._persist_config()
 
-        if backend == "live_captions":
-            label = "Windows Live Captions"
-            import sys
-
-            if not sys.platform.startswith("win"):
-                warn = "Live Captions 仅支持 Windows；Linux/macOS 将自动使用本地 ASR"
-                self._append_log(warn)
-                show_toast(warn)
-        elif backend in ("local", "sherpa", "whisper"):
-            label = "本地 ASR（faster-whisper / sherpa-onnx）"
-        else:
-            label = "云端 DashScope Fun-ASR"
+        label = self._cmb_asr_backend.currentText()
         msg = f"已切换 ASR 后端为 {label}，将在下次启动通道时生效"
         if stopped:
             msg = f"已切换 ASR 后端为 {label}，通道已停止；重新开启后生效"
         self._append_log(msg)
         show_toast(msg)
 
-    def _on_local_asr_model_changed(self) -> None:
-        """切换本地 sherpa-onnx ASR 模型，运行中会停止通道。"""
-        if not hasattr(self, "_cmb_local_asr_model"):
-            return
-        model_id = self._cmb_local_asr_model.currentData()
-        if not model_id:
-            return
-        current = getattr(self._config, "economy_asr_local_model", "") or ""
-        if model_id == current:
+    def _on_channel_asr_model_changed(self, field: str, combo: QComboBox) -> None:
+        """切换某一通道的本地 ASR 模型，运行中会停止通道。"""
+        model_id = combo.currentData()
+        if not model_id or model_id == getattr(self._config, field):
             return
 
-        stopped = False
-        mode = getattr(self._config, "translation_mode", "volc") or "volc"
-        if mode == "economy" and self._pipeline is not None:
-            if self._pipeline.active_channels():
-                with contextlib.suppress(Exception):
-                    self._pipeline.stop()
-                stopped = True
-                self._timer.stop()
-                self._btn_stop.setEnabled(False)
-                self._progress.setVisible(False)
-                self._badge.setText("Idle")
-                self._refresh_channel_buttons()
-                self._on_enable_toggled()
-            with contextlib.suppress(Exception):
-                self._pipeline.close_engine()
-            self._pipeline._config = self._pipeline._config.model_copy(
-                update={"economy_asr_local_model": model_id}
-            )
+        stopped = self._reset_economy_engine({field: model_id})
 
-        self._config = self._config.model_copy(update={"economy_asr_local_model": model_id})
+        self._config = self._config.model_copy(update={field: model_id})
         self._persist_config()
 
-        msg = "已切换本地 ASR 模型，将在下次启动通道时生效"
+        channel = "麦克风" if field == "economy_asr_mic_model" else "游戏"
+        msg = f"已切换{channel}识别模型，将在下次启动通道时生效"
         if stopped:
-            msg = "已切换本地 ASR 模型，通道已停止；重新开启后生效"
+            msg = f"已切换{channel}识别模型，通道已停止；重新开启后生效"
         self._append_log(msg)
         show_toast(msg)
+
+    _PREVIEW_LINES: tuple[tuple[str, str], ...] = (
+        ("zh", "你好，这是语音试听，欢迎使用实时同传。"),
+        ("en", "Hello, this is a voice preview."),
+    )
+
+    def _on_preview_tts(self, engine_id: str) -> None:
+        from src.engines.pipeline.tts_catalog import tts_engine
+
+        if self._preview_thread is not None and self._preview_thread.is_alive():
+            self._append_log("上一段试听还在进行，请稍候")
+            return
+        try:
+            draft = self._collect_config_from_ui()
+        except Exception as exc:
+            self._append_log(f"试听失败：设置无效（{exc}）")
+            return
+        draft = draft.model_copy(update={"economy_tts_backend": engine_id})
+        title = tts_engine(engine_id).title
+        self._append_log(f"正在试听 {title}…（本地模型首次使用需下载）")
+        self._preview_stop.clear()
+        self._preview_thread = threading.Thread(
+            target=self._run_tts_preview,
+            args=(draft, title),
+            name="tts-preview",
+            daemon=True,
+        )
+        self._preview_thread.start()
+
+    def _run_tts_preview(self, config: AppConfigModel, title: str) -> None:
+        emit = self._preview_bridge.message.emit
+        try:
+            self._synthesize_preview(config, title, emit)
+        except Exception as exc:
+            logger.exception("TTS preview failed")
+            emit(f"{title} 试听失败：{exc}")
+
+    def _synthesize_preview(
+        self, config: AppConfigModel, title: str, emit: Callable[[str], None]
+    ) -> None:
+        import numpy as np
+
+        from src.engines.pipeline.engine import build_tts
+
+        tts = build_tts(config)
+        # Preview the chosen engine itself, not the Edge fallback.
+        tts = getattr(tts, "inner", tts)
+        tts.start()
+        try:
+            deadline = time.monotonic() + 300
+            while getattr(tts, "warming_up", False) and time.monotonic() < deadline:
+                if self._preview_stop.wait(0.2):
+                    return
+            if not tts.configured:
+                emit(f"{title} 未就绪：请检查账号/接口地址，或等待模型下载完成（详见日志）")
+                return
+            lines: tuple[tuple[str, str], ...] = self._PREVIEW_LINES
+            if config.economy_tts_backend == "melo":
+                lines = (("zh", "你好，this is MeloTTS，中英混读试听。"),)
+            chunks = [tts.synthesize(text, language=lang) for lang, text in lines]
+            pcm = b"".join(c for c in chunks if c)
+        finally:
+            tts.stop()
+        if not pcm:
+            emit(f"{title} 合成失败：请检查密钥与音色 ID（详见日志）")
+            return
+        if self._preview_stop.is_set():
+            return
+        try:
+            import sounddevice as sd
+
+            sd.play(np.frombuffer(pcm, dtype=np.int16), 16000)
+            emit(f"{title} 试听播放中（默认扬声器）")
+            sd.wait()
+        except Exception as exc:
+            emit(f"试听播放失败：{exc}")
+
+    def _stop_tts_preview(self) -> None:
+        self._preview_stop.set()
+        if self._preview_thread is not None and self._preview_thread.is_alive():
+            with contextlib.suppress(Exception):
+                import sounddevice as sd
+
+                sd.stop()
+            self._preview_thread.join(timeout=1.0)
+        self._preview_thread = None
+
+    def _collect_tts_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "economy_tts_backend": self._cmb_tts_backend.currentData() or "kokoro",
+            "economy_kokoro_speed": round(self._spn_tts_speed.value(), 2),
+            "economy_cosyvoice_model": self._txt_cosyvoice_model.text().strip() or "cosyvoice-v2",
+            "economy_openai_tts_url": self._txt_openai_tts_url.text().strip(),
+            "economy_openai_tts_model": self._txt_openai_tts_model.text().strip(),
+            "economy_openai_tts_api_key": self._txt_openai_tts_key.text().strip(),
+        }
+        for field, combo in self._tts_voice_combos.items():
+            fields[field] = self._voice_value(combo) or getattr(self._config, field)
+        return fields
+
+    def _collect_economy_mt_fields(self) -> dict[str, Any]:
+        cfg = self._config
+        fields: dict[str, Any] = {
+            key: getattr(cfg, key)
+            for key in (
+                "economy_mt_backend",
+                "economy_llm_base_url",
+                "economy_llm_model",
+                "economy_llm_api_key",
+                "economy_asr_device",
+                "economy_mt_device",
+                "economy_tts_device",
+            )
+        }
+        if hasattr(self, "_cmb_mt_backend"):
+            fields["economy_mt_backend"] = self._cmb_mt_backend.currentData() or "nllb"
+            fields["economy_llm_base_url"] = self._txt_llm_url.text().strip()
+            fields["economy_llm_model"] = self._txt_llm_model.text().strip()
+            fields["economy_llm_api_key"] = self._txt_llm_key.text().strip()
+        for task, combo in getattr(self, "_task_device_combos", {}).items():
+            fields[f"economy_{task}_device"] = combo.currentData() or ""
+        return fields
 
     def _on_device_pref_changed(self) -> None:
         """切换推理设备 (CPU/GPU/auto)，运行中会停止通道。"""
@@ -2060,24 +3052,7 @@ class MainWindow(QMainWindow):
         if pref == current:
             return
 
-        stopped = False
-        mode = getattr(self._config, "translation_mode", "volc") or "volc"
-        if mode == "economy" and self._pipeline is not None:
-            if self._pipeline.active_channels():
-                with contextlib.suppress(Exception):
-                    self._pipeline.stop()
-                stopped = True
-                self._timer.stop()
-                self._btn_stop.setEnabled(False)
-                self._progress.setVisible(False)
-                self._badge.setText("Idle")
-                self._refresh_channel_buttons()
-                self._on_enable_toggled()
-            with contextlib.suppress(Exception):
-                self._pipeline.close_engine()
-            self._pipeline._config = self._pipeline._config.model_copy(
-                update={"device_preference": pref}
-            )
+        stopped = self._reset_economy_engine({"device_preference": pref})
 
         self._config = self._config.model_copy(update={"device_preference": pref})
         self._persist_config()
@@ -2113,12 +3088,13 @@ class MainWindow(QMainWindow):
         self._resource_monitor = ResourceMonitor(interval_ms=1500)
         self._resource_monitor.start()
         self._resource_timer.start()
+        self._download_timer.start()
 
     def _on_resource_tick(self) -> None:
         """定时刷新资源占用标签."""
         if not hasattr(self, "_lbl_resource") or self._resource_monitor is None:
             return
-        self._lbl_resource.setText(self._resource_monitor.format_text())
+        self._lbl_resource.setText(self._resource_monitor.format_text().replace(" | ", "\n"))
 
     def _refresh_corpus_label(self) -> None:
         hw = getattr(self, "_corpus_hotwords", None) or []
@@ -2149,43 +3125,46 @@ class MainWindow(QMainWindow):
             "（已保存；重新开启通道后生效）"
         )
 
-    def _on_typed_translate(self) -> None:
-        from src.gui.typed_dialog import TypedTranslateDialog
+    def _build_typed_page(self) -> QFrame:
+        from src.gui.typed_panel import TypedTranslatePanel
+
+        card = self._card()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        self._typed_panel = TypedTranslatePanel()
+        self._typed_panel.translated.connect(self._persist_typed_translation)
+        layout.addWidget(self._typed_panel)
+        return card
+
+    def _build_transcripts_page(self) -> QFrame:
+        from src.gui.transcript_panel import TranscriptPanel
+
+        card = self._card()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        self._transcript_panel = TranscriptPanel(resolve_log_dir(self._config.log_dir))
+        layout.addWidget(self._transcript_panel)
+        return card
+
+    def _persist_typed_translation(self, original: str, translated: str) -> None:
         from src.utils.logger import SubtitleLogger
 
-        dlg = TypedTranslateDialog(
-            source=self._cmb_mic_source.currentData() or "zh",
-            target=self._cmb_mic_target.currentData() or "en",
-            parent=self,
-        )
-
-        def _persist(original: str, translated: str) -> None:
-            try:
-                if not self._config.transcript_logging_enabled:
-                    return
-                if self._pipeline is not None:
-                    self._pipeline.log_typed_translation(original, translated)
-                else:
-                    if getattr(self, "_archive_logger", None) is None:
-                        self._archive_logger = SubtitleLogger(
-                            Path(self._config.log_dir),
-                            enabled=self._config.transcript_logging_enabled,
-                            retention_days=self._config.transcript_retention_days,
-                        )
-                    self._archive_logger.log_typed(original, translated)
-                self._append_log("打字翻译已写入留档")
-            except Exception as exc:
-                logger.warning(f"打字翻译留档失败: {exc}")
-
-        dlg.translated.connect(_persist)
-        dlg.exec()
-
-    def _on_open_transcripts(self) -> None:
-        from src.gui.transcript_dialog import TranscriptDialog
-
-        log_dir = Path(self._config.log_dir).expanduser()
-        dlg = TranscriptDialog(log_dir, parent=self)
-        dlg.exec()
+        try:
+            if not self._config.transcript_logging_enabled:
+                return
+            if self._pipeline is not None:
+                self._pipeline.log_typed_translation(original, translated)
+            else:
+                if getattr(self, "_archive_logger", None) is None:
+                    self._archive_logger = SubtitleLogger(
+                        resolve_log_dir(self._config.log_dir),
+                        enabled=self._config.transcript_logging_enabled,
+                        retention_days=self._config.transcript_retention_days,
+                    )
+                self._archive_logger.log_typed(original, translated)
+            self._append_log("打字翻译已写入留档")
+        except Exception as exc:
+            logger.warning(f"打字翻译留档失败: {exc}")
 
     def _on_open_usage(self) -> None:
         from src.gui.usage_dialog import UsageDialog
@@ -2262,65 +3241,57 @@ class MainWindow(QMainWindow):
             self._refresh_usage_chip(self._usage_tracker.state)
             QMessageBox.warning(self, "额度查询失败", str(exc))
 
-    def _on_open_voice_picker(self) -> None:
-        from src.gui.voice_selector_dialog import VoiceSelectorDialog
-
-        current = self._cmb_volc_voice.currentData() or ""
-        if self._voice_dialog is not None:
-            try:
-                self._voice_dialog.raise_()
-                self._voice_dialog.activateWindow()
-                return
-            except RuntimeError:
-                self._voice_dialog = None
-
-        dlg = VoiceSelectorDialog(current_voice=current, parent=self, catalog="doubao")
-        self._voice_dialog = dlg
-
-        def _apply(sid: str) -> None:
-            # Ensure combo has the option (Seed / Qwen IDs may be new)
-            found = False
-            for i in range(self._cmb_volc_voice.count()):
-                if self._cmb_volc_voice.itemData(i) == sid:
-                    self._cmb_volc_voice.setCurrentIndex(i)
-                    found = True
-                    break
-            if not found:
-                label = sid or "原音色（复刻）"
-                self._cmb_volc_voice.addItem(label, sid)
-                self._cmb_volc_voice.setCurrentIndex(self._cmb_volc_voice.count() - 1)
-            self._append_log(f"已选择音色：{sid or '原音色复刻'}（请点「保存」后重新开通道）")
-            self._update_save_button()
-
-        dlg.voice_selected.connect(_apply)
-        dlg.show()
-
     def _on_device_guide(self) -> None:
         self._on_detect_vb_cable()
 
-    def _on_advanced_toggled(self, checked: bool) -> None:
-        mic = self._cmb_input.currentData()
-        out = self._cmb_output.currentData()
-        lb = self._cmb_loopback.currentData()
-        self._apply_advanced_visibility()
+    def _refresh_devices_button(self) -> QPushButton:
+        btn = QPushButton("刷新设备")
+        btn.setObjectName("ghostButton")
+        btn.setToolTip("重新扫描音频设备（插拔耳机/声卡后使用），已选设备按名称保留")
+        btn.clicked.connect(self._on_refresh_devices)
+        return btn
+
+    def _repopulate_devices_keeping_selection(self) -> None:
+        picks = [
+            (c, c.currentData(), self._combo_device_name(c))
+            for c in (self._cmb_input, self._cmb_output, self._cmb_loopback)
+        ]
         self._populate_devices()
-        self._select_combo_data(self._cmb_input, mic)
-        if out is not None:
-            self._select_combo_data(self._cmb_output, out)
-        elif self._config.output_device is None:
-            pass  # populate already auto-picked CABLE
-        if lb is not None:
-            self._select_combo_data(self._cmb_loopback, lb)
+        for combo, idx, name in picks:
+            if idx is not None or combo is not self._cmb_output:
+                self._select_device(combo, idx, name)
+
+    def _on_refresh_devices(self) -> None:
+        running = bool(
+            self._channel_busy or (self._pipeline is not None and self._pipeline.active_channels())
+        )
+        rescanned = False
+        if not running:
+            from src.audio.device_listing import rescan_portaudio
+
+            rescanned = rescan_portaudio()
+        self._repopulate_devices_keeping_selection()
+        self._rebind_devices_by_name()
+        self._update_save_button()
+        if running:
+            self._append_log("音频设备列表已刷新；新插入的设备需先停止通道再刷新才会出现")
+        else:
+            self._append_log("音频设备已重新扫描" if rescanned else "音频设备列表已刷新")
+
+    def _on_advanced_toggled(self, checked: bool) -> None:
+        self._apply_advanced_visibility()
+        self._repopulate_devices_keeping_selection()
         self._config = self._config.model_copy(update={"show_advanced_devices": bool(checked)})
         self._persist_config()
-        self._append_log("已开启高级设备选项" if checked else "已隐藏高级设备选项（使用自动推荐）")
+        self._append_log(
+            "游戏声音列表已显示虚拟线缆捕获源" if checked else "游戏声音列表已隐藏虚拟线缆捕获源"
+        )
 
     def _apply_advanced_visibility(self) -> None:
-        advanced = self._chk_advanced.isChecked()
-        if hasattr(self, "_output_row"):
-            self._output_row.setVisible(advanced)
-        if hasattr(self, "_loopback_row"):
-            self._loopback_row.setVisible(advanced)
+        # Output and capture pickers stay visible; the toggle only widens the capture list.
+        for row in (getattr(self, "_output_row", None), getattr(self, "_loopback_row", None)):
+            if row is not None:
+                row.setVisible(True)
 
     def _on_detect_vb_cable(self) -> None:
         inputs = list(getattr(self, "_device_cache_inputs", None) or [])
@@ -2370,6 +3341,16 @@ class MainWindow(QMainWindow):
         show_toast("已自动避开虚拟线冲突")
 
     def _validate_devices_for_start(self, channel: Literal["mic", "game"]) -> bool:
+        missing = self._missing_devices(channel)
+        if missing:
+            QMessageBox.warning(
+                self,
+                "设备未连接",
+                "以下已保存的音频设备当前未连接：\n"
+                + "\n".join(missing)
+                + "\n\n请插上设备后点「刷新设备」，或在下拉框里改选其它设备。",
+            )
+            return False
         self._try_auto_avoid_shared_cable(channel)
         mic_active = self._pipeline is not None and self._pipeline.is_channel_active(
             Direction.OUTBOUND
@@ -2534,81 +3515,47 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ overlays
     def _on_geometry_changed(self, direction: Direction, geom: tuple[int, int, int, int]) -> None:
         self._config.subtitle_window_positions[direction.value] = geom
-        self._persist_config()
+        self._geometry_save_timer.start()
 
     def _on_lock_changed(self, direction: Direction, locked: bool) -> None:
         self._config.overlay_locked[direction.value] = locked
         label = "麦克风" if direction == Direction.OUTBOUND else "游戏"
         self._append_log(f"{label}字幕已{'锁定（点击穿透）' if locked else '解锁'}")
-        self._refresh_unlock_button()
         self._persist_config()
-
-    def _any_overlay_locked(self) -> bool:
-        for _direction, overlay in self._overlays.items():
-            if overlay.is_locked():
-                return True
-        # Also respect persisted state when overlay not yet created
-        for key, locked in (self._config.overlay_locked or {}).items():
-            if locked and key in {"outbound", "inbound"}:
-                # If overlay exists, already counted; if not, still locked in config
-                direction = Direction.OUTBOUND if key == "outbound" else Direction.INBOUND
-                if direction not in self._overlays:
-                    return True
-        return False
-
-    def _refresh_unlock_button(self) -> None:
-        btn = getattr(self, "_btn_unlock", None)
-        if btn is None:
-            return
-        locked = self._any_overlay_locked()
-        btn.setEnabled(locked)
-        btn.setText("解锁字幕" if locked else "字幕未锁")
-
-    def _on_unlock_overlays(self) -> None:
-        unlocked = 0
-        for direction in (Direction.OUTBOUND, Direction.INBOUND):
-            overlay = self._overlays.get(direction)
-            if overlay is not None and overlay.is_locked():
-                overlay.set_locked(False)
-                unlocked += 1
-            elif self._config.overlay_locked.get(direction.value, False):
-                self._config.overlay_locked[direction.value] = False
-                unlocked += 1
-        if unlocked:
-            self._persist_config()
-            self._append_log("字幕浮层已解锁，可拖拽 / 右键菜单")
-        else:
-            self._append_log("当前没有锁定的字幕浮层")
-        self._refresh_unlock_button()
 
     def _ensure_overlay(self, direction: Direction) -> SubtitleOverlay:
         overlay = self._overlays.get(direction)
         if overlay is not None:
             return overlay
         locked = bool(self._config.overlay_locked.get(direction.value, False))
+        text_color, background_color = self._overlay_colors()
         overlay = SubtitleOverlay(
             direction,
             font_size=self._spn_font.value(),
-            opacity=self._spn_opacity.value(),
+            opacity=self._overlay_opacity(),
             locked=locked,
             history_lines=self._spn_history.value(),
             show_original=self._chk_show_original.isChecked(),
+            text_color=text_color,
+            background_color=background_color,
+            font_family=self._cmb_subtitle_font.currentData() or "",
             on_geometry_changed=self._on_geometry_changed,
             on_lock_changed=self._on_lock_changed,
+            on_font_size_requested=self._spn_font.setValue,
+            on_opacity_requested=self._on_overlay_opacity_requested,
         )
+        overlay.set_menu_style(menu_stylesheet(self._active_theme))
         pos = self._config.subtitle_window_positions.get(direction.value)
         if pos:
             overlay.restore_geometry_tuple(pos)
         overlay.show()
         self._overlays[direction] = overlay
-        self._refresh_unlock_button()
         return overlay
 
     def _close_overlays(self) -> None:
         for overlay in self._overlays.values():
             overlay.close()
         self._overlays.clear()
-        self._refresh_unlock_button()
 
     def _on_preview_overlays(self) -> None:
         # Ensure at least one overlay checkbox is on for preview
@@ -2620,20 +3567,80 @@ class MainWindow(QMainWindow):
         for overlay in self._overlays.values():
             if overlay.is_locked():
                 overlay.set_locked(False)
-        self._refresh_unlock_button()
-        self._append_log("已打开字幕浮层，可拖拽 / 缩放 / 双击锁定；锁定后点「解锁字幕」")
+        self._append_log("已打开字幕浮层，可拖拽 / 缩放；双击锁定，要再调整就再点「调整字幕」")
 
     def _on_look_changed(self, *_args: Any) -> None:
         for overlay in self._overlays.values():
             overlay.set_font_size(self._spn_font.value())
-            overlay.set_opacity(self._spn_opacity.value())
+            overlay.set_opacity(self._overlay_opacity())
             overlay.set_history_lines(self._spn_history.value())
             overlay.set_show_original(self._chk_show_original.isChecked())
+            overlay.set_appearance(**self._overlay_appearance())
         self._update_save_button()
+
+    def _overlay_opacity(self) -> float:
+        return self._spn_opacity.value() / 100.0
+
+    def _on_overlay_opacity_requested(self, opacity: float) -> None:
+        self._spn_opacity.setValue(round(opacity * 100))
+
+    def _overlay_colors(self) -> tuple[str, str]:
+        if self._chk_subtitle_follow_theme.isChecked():
+            return self._active_theme.overlay_text, self._active_theme.overlay_bg
+        return self._subtitle_text_color, self._subtitle_bg_color
+
+    def _overlay_appearance(self) -> dict[str, str]:
+        text_color, background_color = self._overlay_colors()
+        return {
+            "text_color": text_color,
+            "background_color": background_color,
+            "font_family": self._cmb_subtitle_font.currentData() or "",
+        }
+
+    def _on_subtitle_follow_toggled(self, _checked: bool) -> None:
+        self._refresh_color_buttons()
+        self._on_look_changed()
+
+    def _pick_subtitle_color(self, which: Literal["text", "bg"]) -> None:
+        current = self._subtitle_text_color if which == "text" else self._subtitle_bg_color
+        title = "字幕文字颜色" if which == "text" else "字幕底板颜色"
+        color = QColorDialog.getColor(QColor(current), self, title)
+        if not color.isValid():
+            return
+        if which == "text":
+            self._subtitle_text_color = color.name().upper()
+        else:
+            self._subtitle_bg_color = color.name().upper()
+        self._refresh_color_buttons()
+        self._on_look_changed()
+
+    def _color_swatch(self, color: str) -> QIcon:
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor(self._active_theme.border))
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(1, 1, 14, 14)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _refresh_color_buttons(self) -> None:
+        follow = self._chk_subtitle_follow_theme.isChecked()
+        text_color, background_color = self._overlay_colors()
+        for button, color in (
+            (self._btn_text_color, text_color),
+            (self._btn_bg_color, background_color),
+        ):
+            button.setEnabled(not follow)
+            button.setIcon(self._color_swatch(color))
 
     # ------------------------------------------------------------ pipeline
     def _on_channel_toggle(self, channel: Literal["mic", "game"]) -> None:
         """Toggle one independent channel without touching the other."""
+        if channel in self._channel_busy:
+            self._append_log("通道正在启动/停止，请稍候…")
+            return
         direction = Direction.OUTBOUND if channel == "mic" else Direction.INBOUND
         active = self._pipeline is not None and self._pipeline.is_channel_active(direction)
         if active:
@@ -2651,6 +3658,7 @@ class MainWindow(QMainWindow):
         self._pipeline.latency_reported.connect(self._on_latency_reported)
         self._pipeline.error_occurred.connect(self._on_error)
         self._pipeline.log_message.connect(self._append_log)
+        self._pipeline.channel_lost.connect(self._on_channel_lost)
         self._pipeline.usage_reported.connect(self._on_pipeline_usage)
         self._usage_tracker.reset_session()
         self._pipeline._input_device = self._config.input_device
@@ -2710,66 +3718,128 @@ class MainWindow(QMainWindow):
             f"out={self._config.output_device!r}"
         )
 
-        try:
-            ok, reason = pipeline.can_start()
-            if not ok:
-                raise RuntimeError(reason)
-            pipeline.start_channel(direction, play_voice=play_voice)
-            if not self._timer.isActive():
-                self._timer.start()
-            self._sync_overlays_visibility(preview=False)
-            self._refresh_channel_buttons()
-            mode = pipeline.mode
-            badge = "火山" if mode == "volc" else "经济"
-            self._badge.setText(badge)
-            self._update_model_loading_indicator()
-            self._btn_stop.setEnabled(True)
-            mode_label = "火山" if mode == "volc" else "经济"
-            self._append_log(f"{label}通道已启动（{mode_label}）")
-            if mode == "economy" and reason:
-                self._append_log(reason)
-            if play_voice:
-                out_dev_name = self._resolve_output_device_name()
-                self._append_log(f"{label}已开启语音输出 → 输出设备: {out_dev_name}")
-            self._on_enable_toggled()
-        except Exception as exc:
-            self._append_log(f"{label}启动失败: {exc}")
-            QMessageBox.critical(self, "启动失败", str(exc))
-            if self._pipeline is not None and not self._pipeline.active_channels():
-                with contextlib.suppress(Exception):
-                    self._pipeline.stop()
+        def work() -> Callable[[], None]:
+            try:
+                ok, reason = pipeline.can_start()
+                if not ok:
+                    raise RuntimeError(reason)
+                pipeline.start_channel(direction, play_voice=play_voice)
+            except Exception as exc:
+                if not pipeline.active_channels():
+                    with contextlib.suppress(Exception):
+                        pipeline.stop()
+                return functools.partial(
+                    self._finish_channel_start, channel, pipeline, play_voice, "", exc
+                )
+            return functools.partial(
+                self._finish_channel_start, channel, pipeline, play_voice, reason, None
+            )
+
+        self._run_channel_op(channel, work)
+
+    def _run_channel_op(
+        self,
+        channels: Literal["mic", "game"] | tuple[Literal["mic", "game"], ...],
+        work: Callable[[], Callable[[], None]],
+    ) -> None:
+        """Run ``work`` on the serial channel worker; its result runs on the GUI thread."""
+        names = (channels,) if isinstance(channels, str) else channels
+        self._channel_busy.update(names)
+        self._refresh_channel_buttons()
+
+        def run() -> None:
+            try:
+                done = work()
+            except Exception as exc:
+                logger.exception("Channel operation failed")
+                done = functools.partial(self._append_log, f"通道操作失败: {exc}")
+
+            def finish() -> None:
+                self._channel_busy.subtract(names)
+                self._channel_busy = +self._channel_busy
+                if self._closing:
+                    return
+                done()
+                self._refresh_channel_buttons()
+
+            if not self._closing:
+                self._channel_bridge.finished.emit(finish)
+
+        self._channel_ops.submit(run)
+
+    def _finish_channel_start(
+        self,
+        channel: Literal["mic", "game"],
+        pipeline: TranslationPipeline,
+        play_voice: bool,
+        reason: str,
+        error: Exception | None,
+    ) -> None:
+        label = "麦克风" if channel == "mic" else "游戏字幕"
+        if error is not None:
+            self._append_log(f"{label}启动失败: {error}")
+            self._show_error_once("启动失败", str(error))
+            # A still-queued operation (e.g. the other channel starting) owns this pipeline too.
+            if (
+                self._pipeline is pipeline
+                and not pipeline.active_channels()
+                and not self._channel_busy
+            ):
                 self._pipeline = None
                 self._timer.stop()
                 self._btn_stop.setEnabled(False)
                 self._progress.setVisible(False)
-            self._refresh_channel_buttons()
+                self._restore_status_label()
             self._on_enable_toggled()
+            return
+        if not self._timer.isActive():
+            self._timer.start()
+        self._sync_overlays_visibility(preview=False)
+        mode = pipeline.mode
+        mode_label = "火山" if mode == "volc" else "经济"
+        self._badge.setText(mode_label)
+        self._progress.setVisible(False)
+        self._update_model_loading_indicator()
+        self._restore_status_label()
+        self._btn_stop.setEnabled(True)
+        self._append_log(f"{label}通道已启动（{mode_label}）")
+        if mode == "economy" and reason:
+            self._append_log(reason)
+        if play_voice:
+            out_dev_name = self._resolve_output_device_name()
+            self._append_log(f"{label}已开启语音输出 → 输出设备: {out_dev_name}")
+        self._on_enable_toggled()
 
     def _stop_one_channel(self, channel: Literal["mic", "game"]) -> None:
         if self._pipeline is None:
             return
         direction = Direction.OUTBOUND if channel == "mic" else Direction.INBOUND
         label = "麦克风" if channel == "mic" else "游戏字幕"
-        if not self._pipeline.is_channel_active(direction):
+        # A busy channel may be mid-start; queue the stop behind it.
+        if not self._pipeline.is_channel_active(direction) and channel not in self._channel_busy:
             self._append_log(f"{label}通道本来就未运行")
             self._refresh_channel_buttons()
             return
 
-        self._pipeline.stop_channel(direction)
-        # Close only that overlay
         overlay = self._overlays.pop(direction, None)
         if overlay is not None:
             overlay.close()
+        pipeline = self._pipeline
 
+        def work() -> Callable[[], None]:
+            pipeline.stop_channel(direction)
+            return functools.partial(self._finish_channel_stop, label)
+
+        self._run_channel_op(channel, work)
+
+    def _finish_channel_stop(self, label: str) -> None:
         self._append_log(f"{label}通道已关闭")
-        self._refresh_channel_buttons()
-
-        if not self._pipeline.active_channels():
+        if self._pipeline is None or not self._pipeline.active_channels():
             self._timer.stop()
             self._btn_stop.setEnabled(False)
             self._progress.setVisible(False)
             self._status_label.setText("状态：已停止")
-            self._latency_label.setText("延迟：—")
+            self._set_latency(None)
             self._badge.setText("Idle")
             self._append_log("全部通道已停止")
         else:
@@ -2818,9 +3888,13 @@ class MainWindow(QMainWindow):
                 style.polish(btn)
             btn.update()
 
+        if "mic" in self._channel_busy:
+            self._btn_mic.setText("…  处理中")
+        if "game" in self._channel_busy:
+            self._btn_game.setText("…  处理中")
         self._btn_stop.setEnabled(mic_on or game_on)
-        self._btn_mic.setEnabled(True)
-        self._btn_game.setEnabled(True)
+        self._btn_mic.setEnabled("mic" not in self._channel_busy)
+        self._btn_game.setEnabled("game" not in self._channel_busy)
 
     def _set_running_ui(self, running: bool) -> None:
         # Kept for compatibility; prefer _refresh_channel_buttons
@@ -2833,17 +3907,36 @@ class MainWindow(QMainWindow):
     def _on_stop(self) -> None:
         """Stop all channels."""
         self._timer.stop()
-        if self._pipeline is not None:
-            for direction in list(self._pipeline.active_channels()):
-                self._pipeline.stop_channel(direction)
+        pipeline = self._pipeline
+        if pipeline is not None:
+            pairs: tuple[tuple[Literal["mic", "game"], Direction], ...] = (
+                ("mic", Direction.OUTBOUND),
+                ("game", Direction.INBOUND),
+            )
+            for channel, direction in pairs:
+                if self._closing:
+                    pipeline.stop_channel(direction)
+                elif pipeline.is_channel_active(direction) or channel in self._channel_busy:
+                    # Queued behind a pending start so that channel ends up stopped too.
+                    self._run_channel_op(
+                        channel,
+                        functools.partial(self._stop_channel_work, pipeline, direction),
+                    )
         self._close_overlays()
         self._refresh_channel_buttons()
         self._on_enable_toggled()
         self._progress.setVisible(False)
         self._status_label.setText("状态：已停止")
-        self._latency_label.setText("延迟：—")
+        self._set_latency(None)
         self._badge.setText("Idle")
         self._append_log("已停止全部通道")
+
+    @staticmethod
+    def _stop_channel_work(
+        pipeline: TranslationPipeline, direction: Direction
+    ) -> Callable[[], None]:
+        pipeline.stop_channel(direction)
+        return lambda: None
 
     def _sync_overlays_visibility(self, *, preview: bool = False) -> None:
         wanted: list[Direction] = []
@@ -2866,7 +3959,7 @@ class MainWindow(QMainWindow):
         for direction in wanted:
             overlay = self._ensure_overlay(direction)
             overlay.set_font_size(self._spn_font.value())
-            overlay.set_opacity(self._spn_opacity.value())
+            overlay.set_opacity(self._overlay_opacity())
             overlay.set_history_lines(self._spn_history.value())
             overlay.set_show_original(self._chk_show_original.isChecked())
             if preview:
@@ -2890,6 +3983,9 @@ class MainWindow(QMainWindow):
     def _update_model_loading_indicator(self) -> None:
         """Keep model download/loading visible instead of showing a false 100%."""
         names = self._pipeline.loading_models if self._pipeline is not None else ()
+        if names and self._download_status_active:
+            self._model_loading_names = names
+            return
         if names:
             if names != self._model_loading_names:
                 detail = "、".join(names)
@@ -2906,7 +4002,13 @@ class MainWindow(QMainWindow):
             self._append_log(f"模型已就绪：{'、'.join(self._model_loading_names)}")
             self._progress.setRange(0, 100)
             self._progress.setValue(100)
+            self._progress.setVisible(False)
+            self._restore_status_label()
         self._model_loading_names = ()
+
+    def _restore_status_label(self) -> None:
+        running = self._pipeline is not None and bool(self._pipeline.active_channels())
+        self._status_label.setText("状态：运行中" if running else "状态：空闲")
 
     def _on_status_changed(self, status: str) -> None:
         mapping = {
@@ -3010,11 +4112,39 @@ class MainWindow(QMainWindow):
             self._append_log(f"Dota 教练失败：{payload}")
 
     def _on_latency_reported(self, latency_ms: int) -> None:
-        self._latency_label.setText(f"延迟：{latency_ms} ms")
+        self._set_latency(latency_ms)
+
+    def _on_channel_lost(self, direction_value: str, message: str) -> None:
+        channel: Literal["mic", "game"] = (
+            "mic" if direction_value == Direction.OUTBOUND.value else "game"
+        )
+        self._on_error(message)
+        self._stop_one_channel(channel)
 
     def _on_error(self, message: str) -> None:
         self._append_log(f"错误: {message}")
-        QMessageBox.warning(self, "运行错误", message)
+        self._show_error_once("运行错误", message)
+
+    def _show_error_once(self, title: str, message: str) -> None:
+        """One non-modal box; repeats update it instead of stacking new dialogs."""
+        box = self._error_box
+        if box is not None and box.isVisible():
+            self._error_repeats += 1
+            box.setWindowTitle(title)
+            box.setText(message)
+            box.setInformativeText(f"另有 {self._error_repeats} 条错误，详见运行日志。")
+            return
+        box = QMessageBox(QMessageBox.Icon.Warning, title, message, parent=self)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setModal(False)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.destroyed.connect(self._on_error_box_closed)
+        self._error_box = box
+        self._error_repeats = 0
+        box.show()
+
+    def _on_error_box_closed(self) -> None:
+        self._error_box = None
 
     @staticmethod
     def _fmt_mmss(seconds: float) -> str:
@@ -3322,6 +4452,13 @@ class MainWindow(QMainWindow):
                     event.ignore()
                 return
             # discard: keep self._config as last saved; positions already patched in
+        if self._geometry_save_timer.isActive():
+            self._geometry_save_timer.stop()
+            self._persist_config()
+        for timer in (self._dota_coach_timer, self._download_timer, self._dirty_timer):
+            timer.stop()
+        self._stop_tts_preview()
+        self._typed_panel.shutdown()
         with contextlib.suppress(Exception):
             self._music.stop()
         self._music_load_cancel.set()
@@ -3338,6 +4475,10 @@ class MainWindow(QMainWindow):
             if self._resource_monitor is not None:
                 self._resource_monitor.stop()
         self._hotkeys.stop()
+        self._closing = True
+        # A pending Volc connect can take seconds; don't leave a frozen window on screen.
+        self.hide()
+        self._channel_ops.shutdown(wait=True, cancel_futures=True)
         self._on_stop()
         if self._pipeline is not None:
             with contextlib.suppress(Exception):

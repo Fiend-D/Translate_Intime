@@ -11,9 +11,12 @@
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import ctypes
 import queue
 import subprocess
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -53,6 +56,11 @@ def _is_windows_11() -> bool:
         return False
 
 
+# A windowed (PyInstaller) build would flash a console for every helper process.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_EMITTED_MEMORY = 100
+
+
 def _is_livecaptions_running() -> bool:
     """检查 LiveCaptions 进程是否已在运行."""
     try:
@@ -61,6 +69,7 @@ def _is_livecaptions_running() -> bool:
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=_NO_WINDOW,
         )
         return "LiveCaptions.exe" in result.stdout
     except Exception:
@@ -74,11 +83,14 @@ def _kill_livecaptions() -> None:
             ["taskkill", "/f", "/im", "LiveCaptions.exe"],
             capture_output=True,
             timeout=5,
+            creationflags=_NO_WINDOW,
         )
 
 
 def _hide_window(hwnd: int) -> None:
     """隐藏 LiveCaptions 窗口 (最小化 + 从任务栏移除), 但保持 UIA 可读."""
+    if sys.platform != "win32":
+        return
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         ex_style = user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
@@ -117,6 +129,7 @@ class LiveCaptionsAsr:
         self._last_full_text = ""
         # 按行去重: 已输出过的完整行文本集合 (防止 LiveCaptions 修订导致重复)
         self._emitted_lines: set[str] = set()
+        self._emitted_order: collections.deque[str] = collections.deque()
         # 最后一行 (正在输入的句子) 的缓冲状态
         self._pending_line = ""
         self._pending_since = 0.0
@@ -154,13 +167,23 @@ class LiveCaptionsAsr:
         self._loading = False
         self._last_full_text = ""
         self._emitted_lines.clear()
+        self._emitted_order.clear()
         self._pending_line = ""
         self._pending_since = 0.0
+        # A failed launch (Live Captions slow to open, not enabled yet) may work next time.
+        self._failed = False
 
     def start_loading(self) -> None:
         """异步启动 LiveCaptions + UIA 轮询."""
         if self._ready or self._failed or self._loading:
             return
+        previous = self._poll_thread
+        if previous is not None and previous.is_alive():
+            # stop() already signalled it; clearing the event now would revive it.
+            previous.join(timeout=5.0)
+            if previous.is_alive():
+                logger.warning("上一次 LiveCaptions 轮询仍未退出，稍后再试")
+                return
         if not self._platform_ok:
             logger.warning("Windows Live Captions 仅支持 Windows 11 22H2+")
             self._failed = True
@@ -195,6 +218,17 @@ class LiveCaptionsAsr:
     def _poll_loop(self) -> None:
         """轮询 LiveCaptions 文本的主循环."""
         try:
+            import uiautomation as ua
+
+            init: Any = ua.UIAutomationInitializerInThread()
+        except Exception:
+            init = contextlib.nullcontext()
+        # UIA is COM: this thread needs its own apartment, or reads fail at random.
+        with init:
+            self._poll_loop_body()
+
+    def _poll_loop_body(self) -> None:
+        try:
             if not self._launch_and_find():
                 self._failed = True
                 self._loading = False
@@ -210,7 +244,7 @@ class LiveCaptionsAsr:
                 for line in stale.split("\n"):
                     t = line.strip()
                     if t:
-                        self._emitted_lines.add(t)
+                        self._remember_emitted(t)
                 self._last_full_text = stale
                 logger.info("已跳过 LiveCaptions 残留字幕")
 
@@ -227,7 +261,7 @@ class LiveCaptionsAsr:
                         if _time.time() - self._pending_since > 5.0:
                             if self._pending_line not in self._emitted_lines:
                                 self._text_queue.put(self._pending_line)
-                                self._emitted_lines.add(self._pending_line)
+                                self._remember_emitted(self._pending_line)
                             self._pending_line = ""
                 except Exception as exc:
                     # 元素可能失效 (窗口被关闭), 重新定位
@@ -460,6 +494,15 @@ class LiveCaptionsAsr:
             # 元素失效时返回空, 下次循环会重新定位
             return ""
 
+    def _remember_emitted(self, text: str) -> None:
+        """Bounded memory of emitted lines that forgets the *oldest* first."""
+        if text in self._emitted_lines:
+            return
+        self._emitted_lines.add(text)
+        self._emitted_order.append(text)
+        while len(self._emitted_order) > _EMITTED_MEMORY:
+            self._emitted_lines.discard(self._emitted_order.popleft())
+
     def _process_text_change(self, full_text: str) -> None:
         """处理文本变化, 按行 (句子) 输出.
 
@@ -483,9 +526,7 @@ class LiveCaptionsAsr:
             if not text or text in self._emitted_lines:
                 continue
             self._text_queue.put(text)
-            self._emitted_lines.add(text)
-            if len(self._emitted_lines) > 100:
-                self._emitted_lines = set(list(self._emitted_lines)[-50:])
+            self._remember_emitted(text)
 
         # ---- 最后一行: 仅作为 pending 缓冲, 不直接输出 ----
         last = lines[-1].strip() if lines else ""

@@ -1,19 +1,15 @@
-"""Dialog: type text → translate → play TTS to selected output."""
+"""Embedded page: type text → translate → play TTS."""
 
 from __future__ import annotations
 
 import threading
-from typing import override
 
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QUrl, pyqtSignal
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -35,7 +31,7 @@ class _WorkerBridge(QObject):
     failed = pyqtSignal(str)
 
 
-class TypedTranslateDialog(QDialog):
+class TypedTranslatePanel(QWidget):
     translated = pyqtSignal(str, str)  # original, translated
 
     def __init__(
@@ -46,10 +42,9 @@ class TypedTranslateDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("打字翻译")
-        self.setMinimumSize(480, 360)
         self._audio_bytes: QByteArray | None = None
         self._audio_buffer: QBuffer | None = None
+        self._busy = False
         self._bridge = _WorkerBridge(self)
         self._bridge.succeeded.connect(self._on_ok)
         self._bridge.failed.connect(self._on_fail)
@@ -59,12 +54,14 @@ class TypedTranslateDialog(QDialog):
         self._player.mediaStatusChanged.connect(self._on_media_status)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
         tip = QLabel(
-            "输入文字 → 翻译 → 合成语音播放。\n"
+            "输入文字 → 翻译 → 合成语音播放。"
             "同语言会跳过翻译直接播报。文本翻译使用在线轻量接口（非火山同传）。"
         )
         tip.setWordWrap(True)
-        tip.setObjectName("fieldLabel")
+        tip.setObjectName("appSubtitle")
         root.addWidget(tip)
 
         lang_row = QHBoxLayout()
@@ -73,8 +70,7 @@ class TypedTranslateDialog(QDialog):
         for label, code in _LANGS:
             self._cmb_src.addItem(label, code)
             self._cmb_tgt.addItem(label, code)
-        self._select(self._cmb_src, source)
-        self._select(self._cmb_tgt, target)
+        self.set_languages(source, target)
         lang_row.addWidget(QLabel("原文"))
         lang_row.addWidget(self._cmb_src, 1)
         lang_row.addWidget(QLabel("译文"))
@@ -83,44 +79,51 @@ class TypedTranslateDialog(QDialog):
 
         self._input = QTextEdit()
         self._input.setPlaceholderText("在这里输入要翻译并朗读的内容…")
-        root.addWidget(self._input, 1)
+        self._input.setMinimumHeight(120)
+        root.addWidget(self._input, 2)
 
         self._output = QTextEdit()
         self._output.setReadOnly(True)
         self._output.setPlaceholderText("译文将显示在这里")
-        self._output.setMaximumHeight(100)
-        root.addWidget(self._output)
+        self._output.setMinimumHeight(80)
+        root.addWidget(self._output, 1)
 
         btn_row = QHBoxLayout()
+        self._status = QLabel("")
+        self._status.setObjectName("fieldLabel")
+        self._status.setWordWrap(True)
+        btn_row.addWidget(self._status, 1)
+        self._btn_stop = QPushButton("停止朗读")
+        self._btn_stop.setEnabled(False)
+        self._btn_stop.clicked.connect(self._release_audio)
+        btn_row.addWidget(self._btn_stop)
         self._btn_run = QPushButton("翻译并朗读")
         self._btn_run.setObjectName("primaryButton")
         self._btn_run.clicked.connect(self._on_run)
-        btn_row.addStretch()
         btn_row.addWidget(self._btn_run)
         root.addLayout(btn_row)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-
-        self._status = QLabel("")
-        self._status.setObjectName("fieldLabel")
-        root.addWidget(self._status)
+    def set_languages(self, source: str, target: str) -> None:
+        self._select(self._cmb_src, source)
+        self._select(self._cmb_tgt, target)
 
     @staticmethod
     def _select(combo: QComboBox, code: str) -> None:
-        for i in range(combo.count()):
-            if combo.itemData(i) == code:
-                combo.setCurrentIndex(i)
-                return
+        index = combo.findData(code)
+        if index >= 0:
+            combo.setCurrentIndex(index)
 
     def _on_run(self) -> None:
+        if self._busy:
+            return
         text = self._input.toPlainText().strip()
         if not text:
-            QMessageBox.information(self, "打字翻译", "请先输入文字。")
+            self._status.setText("请先输入文字。")
+            self._input.setFocus()
             return
         src = self._cmb_src.currentData()
         tgt = self._cmb_tgt.currentData()
+        self._busy = True
         self._btn_run.setEnabled(False)
         self._status.setText("处理中…")
 
@@ -135,9 +138,10 @@ class TypedTranslateDialog(QDialog):
             except Exception as exc:
                 bridge.failed.emit(str(exc))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="typed-translate").start()
 
     def _on_ok(self, translated: str, audio: object) -> None:
+        self._busy = False
         self._release_audio()
         self._output.setPlainText(translated)
         self._status.setText("完成")
@@ -152,6 +156,7 @@ class TypedTranslateDialog(QDialog):
             self._player.setSourceDevice(self._audio_buffer, QUrl("memory://typed-tts.mp3"))
             self._audio.setVolume(1.0)
             self._player.play()
+            self._btn_stop.setEnabled(True)
 
     def _on_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
         if status in {
@@ -168,13 +173,13 @@ class TypedTranslateDialog(QDialog):
             self._audio_buffer.deleteLater()
         self._audio_buffer = None
         self._audio_bytes = None
+        self._btn_stop.setEnabled(False)
 
-    @override
-    def done(self, result: int) -> None:
+    def shutdown(self) -> None:
+        """Stop playback before the window closes."""
         self._release_audio()
-        super().done(result)
 
     def _on_fail(self, message: str) -> None:
-        self._status.setText("失败")
+        self._busy = False
+        self._status.setText(f"失败：{message}")
         self._btn_run.setEnabled(True)
-        QMessageBox.warning(self, "打字翻译失败", message)

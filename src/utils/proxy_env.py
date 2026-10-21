@@ -9,6 +9,7 @@ Python HTTP stacks reject).
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from urllib.parse import urlparse, urlunparse
@@ -44,6 +45,20 @@ def normalize_proxy_url(url: str) -> str:
     return raw
 
 
+def redact_proxy_url(url: str) -> str:
+    """Hide ``user:password@`` so proxy credentials never reach the log."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "<proxy>"
+    if not (parsed.username or parsed.password):
+        return url
+    host = parsed.hostname or ""
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return urlunparse(parsed._replace(netloc=f"***@{host}"))
+
+
 def use_proxy_for_downloads() -> bool:
     """True when TRANSLATOR_INTIME_USE_PROXY requests keeping system proxies."""
     val = (os.environ.get(_USE_PROXY_FLAG) or "").strip().lower()
@@ -64,7 +79,7 @@ def prepare_download_proxy_env() -> dict[str, str]:
     if changed:
         logger.info(
             "已规范化代理协议 socks:// → socks5://（"
-            + ", ".join(f"{k}={v}" for k, v in changed.items())
+            + ", ".join(f"{k}={redact_proxy_url(v)}" for k, v in changed.items())
             + "）"
         )
     return changed
@@ -126,6 +141,11 @@ def prepare_model_download_env() -> None:
         logger.info("模型下载将在下载上下文中临时绕过系统代理（直连）")
 
 
+_without_proxy_lock = threading.Lock()
+_without_proxy_depth = 0
+_without_proxy_saved: dict[str, str] = {}
+
+
 @contextmanager
 def without_proxy() -> Iterator[None]:
     """Temporarily clear proxies for a download; restore previous values after.
@@ -138,8 +158,17 @@ def without_proxy() -> Iterator[None]:
         yield
         return
 
-    saved = clear_proxy_env()
+    global _without_proxy_depth, _without_proxy_saved
+    # Downloads overlap on several threads: clear on first entry, restore on last exit.
+    with _without_proxy_lock:
+        if _without_proxy_depth == 0:
+            _without_proxy_saved = clear_proxy_env()
+        _without_proxy_depth += 1
     try:
         yield
     finally:
-        restore_proxy_env(saved)
+        with _without_proxy_lock:
+            _without_proxy_depth -= 1
+            if _without_proxy_depth == 0:
+                restore_proxy_env(_without_proxy_saved)
+                _without_proxy_saved = {}

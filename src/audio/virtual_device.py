@@ -11,6 +11,9 @@ from src.utils.logger import logger
 OS_NAME = platform.system()
 
 
+_PACTL_TIMEOUT_SECONDS = 3
+
+
 class VirtualAudioDevice:
     """
     虚拟音频设备的抽象表示
@@ -44,7 +47,13 @@ class VirtualAudioDevice:
     def _run(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
         """安全运行命令，pactl 不存在时不崩溃"""
         try:
-            return subprocess.run(args, capture_output=True, text=True, check=check)
+            return subprocess.run(
+                args, capture_output=True, text=True, check=check, timeout=_PACTL_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired as e:
+            # A wedged PulseAudio/PipeWire daemon must not hang the caller forever.
+            logger.warning(f"命令超时: {' '.join(args)}")
+            raise subprocess.CalledProcessError(-1, args, stderr="timeout") from e
         except FileNotFoundError:
             logger.warning(f"命令未找到: {args[0]}，请安装 pulseaudio-utils")
             raise

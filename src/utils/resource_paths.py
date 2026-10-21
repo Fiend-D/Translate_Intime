@@ -29,6 +29,19 @@ def model_resource_root() -> Path:
     if portable.is_dir():
         return portable
 
+    return _user_data_root() / "resource"
+
+
+def _user_data_root() -> Path:
     local_app_data = (os.environ.get("LOCALAPPDATA") or "").strip()
     base = Path(local_app_data) if local_app_data else Path.home() / ".cache"
-    return base / "SoundFerry" / "resource"
+    return base / "SoundFerry"
+
+
+def resolve_log_dir(value: str | Path) -> Path:
+    """Anchor a relative ``log_dir`` setting so logs don't follow the launch directory."""
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    root = _user_data_root() if getattr(sys, "frozen", False) else PROJECT_ROOT
+    return root / path
