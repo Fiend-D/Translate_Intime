@@ -8,7 +8,8 @@
 
 * **同声传译**：采集麦克风，实时翻译并通过输出设备（建议虚拟声卡）播放，让队友在游戏或语音软件里听到译文。
 * **游戏字幕**：捕获系统扬声器 / Loopback，把游戏、视频、通话里的外语译成悬浮字幕。
-* **打字翻译**：直接输入文字，轻量在线翻译后用 edge-tts 朗读（独立通道，不走火山同传）。
+* **打字翻译**：主窗口内嵌页面，输入文字后在线翻译并用 edge-tts 朗读（独立通道，不走火山同传）。
+* **翻译记录**：主窗口内嵌页面，按天浏览、刷新与导出历史字幕。
 * **音乐分享**：本地音乐播到虚拟声卡，队友当麦克风听到（CS 音乐盒平替）。
 
 ## 功能特性
@@ -16,8 +17,11 @@
 ### 翻译与字幕
 
 * 麦克风同声传译与系统音频悬浮字幕（双通道可独立开关）
-* 流式字幕：中间结果即时刷新，定稿后柔和确认（豆包式跟打）
-* 字幕浮层可拖拽 / 缩放 / 锁定（点击穿透），支持多行历史与是否显示原文
+* 滚动字幕：识别 / 翻译中的内容显示在底部暗色"进行中"行，不会顶掉已定稿的译文
+* 每句定稿译文按长度保证阅读时间（约 1.2 ~ 4 秒）再滚入历史；说得太快时自动缩短停留、
+  积压过多直接进历史，字幕不会越拖越晚
+* 字幕浮层可拖拽 / 缩放，点「调整字幕」解锁、双击锁定（锁定后点击穿透）；
+  支持多行历史与是否显示原文
 * 多语言互译：中文 / English / 日本語 / 한국어
 * 同传音色可选（复刻原音色或火山公版音色）；语速可调（-50 ~ +100）
 
@@ -38,13 +42,16 @@
 
 * Windows：WASAPI Loopback；Linux：Pulse / PipeWire monitor
 * 麦克风列表默认隐藏虚拟回环，降低自反馈风险
+* 回声消除：译文 TTS 被麦克风或系统 Loopback 回采时自动扣除，只保留其他声音；
+  游戏字幕与译文播放共用默认输出也能正常工作
+* 朗读译文时可压低 / 静音其他应用，或不处理（混听）
 * 启动前设备防呆校验；Windows 未选输出时可优先提示 CABLE Input
 * 「设备引导」说明 VB-Cable / 虚拟 sink 推荐链路
 * **音乐分享**面板：选文件夹作曲库，下拉选曲；播放后右侧透明侧栏一键切歌（上一首/下一首/点击曲目）；支持音量、单曲循环、播完下一首；MP3 等格式需 `ffmpeg`
 
 ### 其它
 
-* 深色 / 浅色主题
+* 多套主题（跟随系统 / 浅色 / 深色 / 薄荷 / 紫罗兰 / 沙色 / 石墨）
 * 一键「检测虚拟声卡」：检查 CABLE Input / Output 是否齐全
 * 主界面「高级」默认关闭：隐藏译文输出 / 游戏声音选择，使用自动推荐
 * 麦克风列表默认排除虚拟回环，降低自反馈
@@ -59,11 +66,15 @@
 当前提供两条翻译路径：火山 AST 2.0 端到端同传，以及经济模式的 ASR → MT → TTS 级联：
 
 * 火山模式支持 S2T（字幕）与 S2S（语音输出）。
-* 经济模式支持 DashScope、Windows Live Captions、faster-whisper/sherpa ASR，NLLB 等 MT，
-  Kokoro/Edge TTS；本地模型首次使用可能需要下载。
+* 经济模式各环节可分别选择：
+  * ASR：DashScope 实时识别、Qwen3-ASR-Flash / 豆包极速版（云端），Windows Live Captions，
+    本地 faster-whisper、sherpa-onnx（SenseVoice / 流式 zipformer）、Qwen3-ASR
+  * MT：NLLB（本地）、Argos、MyMemory、OpenAI 兼容大模型（DeepSeek / Ollama / LM Studio 等）、
+    本地 Hy-MT2
+  * TTS：Kokoro、MeloTTS（中英混读）、Edge TTS、豆包 / CosyVoice / OpenAI 兼容云端 TTS
+* 经济模式按停顿分句：句末标点或说话停顿后提交整句，长句最长等待约 7 秒，避免半句话被拆开翻译。
+* 本地模型首次使用需要下载，支持断点续传、失败重试与代理；云端服务失败时自动熔断回退。
 * 热词、术语、语速、音色在开启通道时生效；改完后需重新开通道。
-
-备选引擎（如通义 Qwen LiveTranslate、腾讯实时语音翻译等）规划中，便于货比三家；尚未接入 UI。
 
 火山引擎控制台：<https://console.volcengine.com/speech/new/overview?projectName=default>
 
@@ -151,10 +162,12 @@ QT_QPA_PLATFORM=offscreen pytest
 ## 项目结构
 
 * `run.py` / `src/main.py`：GUI 入口
-* `src/gui/`：主面板、悬浮字幕、toast、热词对话框、打字翻译、快捷键设置
+* `src/gui/`：主面板、悬浮字幕、toast、热词对话框、打字翻译 / 翻译记录页面、快捷键设置
 * `src/core/pipeline.py`：双通道同传编排
 * `src/core/volc_engine.py`：火山 AST 2.0 客户端
+* `src/core/echo_canceller.py`：译文 TTS 回声消除
 * `src/core/audio_capture.py` / `audio_player.py`：采集与播放
+* `src/engines/pipeline/`：经济模式 ASR / MT / TTS 后端与分句
 * `src/core/music_share.py`：本地音乐分享到虚拟声卡
 * `src/audio/device_guard.py`：设备防呆与 VB-Cable 引导
 * `src/utils/hotkeys.py`：全局 / 窗口内快捷键
@@ -167,6 +180,7 @@ QT_QPA_PLATFORM=offscreen pytest
 
 * 本项目是桌面音频翻译与字幕工具，不注入游戏。
 * 语音服务账号与 Key 需自行准备；云端同传依赖网络与额度。
+
 ## Windows 一键打包
 
 双击项目根目录的 `build_exe.bat`，脚本会创建或复用 `.venv`、安装缺失依赖并生成：
