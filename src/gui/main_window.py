@@ -388,8 +388,8 @@ class MainWindow(QMainWindow):
         self._chk_show_original.toggled.connect(self._on_look_changed)
         self._chk_subtitle_auto_hide.toggled.connect(self._on_look_changed)
         self._chk_subtitle_merged.toggled.connect(self._on_look_changed)
-        self._chk_show_mic.toggled.connect(self._on_show_overlay_toggled)
-        self._chk_show_game.toggled.connect(self._on_show_overlay_toggled)
+        self._chk_show_mic.toggled.connect(self._on_show_mic_toggled)
+        self._chk_show_game.toggled.connect(self._on_show_game_toggled)
         self._chk_enable_mic.toggled.connect(self._on_enable_toggled)
         self._chk_enable_game.toggled.connect(self._on_enable_toggled)
         self._wire_dirty_tracking()
@@ -473,8 +473,8 @@ class MainWindow(QMainWindow):
         add_page("❝   锦囊", _PAGE_PHRASES)
         self._btn_adjust = self._nav_item(
             "▣   调整字幕",
-            "显示字幕浮层并解除锁定，可拖拽 / 缩放 / 右键菜单。\n"
-            "调好后在浮层上双击即可锁定（点击穿透）。",
+            "不开通道也能调出字幕浮层，摆好位置和大小。\n"
+            "锁定后的浮层点击穿透、鼠标点不到，要在这里解锁；调好后在浮层上双击重新锁定。",
         )
         self._btn_adjust.clicked.connect(self._on_preview_overlays)
         layout.addWidget(self._btn_adjust)
@@ -2356,11 +2356,47 @@ class MainWindow(QMainWindow):
         ):
             w.setEnabled((not running_game) and game_on)
 
-        self._chk_show_mic.setEnabled(mic_on or running_mic)
-        self._chk_show_game.setEnabled(game_on or running_game)
+        if self._config.subtitle_merged:
+            # One shared overlay: either page's switch controls it.
+            any_on = mic_on or running_mic or game_on or running_game
+            self._chk_show_mic.setEnabled(any_on)
+            self._chk_show_game.setEnabled(any_on)
+        else:
+            self._chk_show_mic.setEnabled(mic_on or running_mic)
+            self._chk_show_game.setEnabled(game_on or running_game)
         # Channel buttons always clickable (start/stop that channel)
         self._btn_mic.setEnabled(mic_on or running_mic)
         self._btn_game.setEnabled(game_on or running_game)
+
+    def _on_show_mic_toggled(self, checked: bool) -> None:
+        self._link_show_toggle(self._chk_show_game, checked)
+        self._on_show_overlay_toggled()
+
+    def _on_show_game_toggled(self, checked: bool) -> None:
+        self._link_show_toggle(self._chk_show_mic, checked)
+        self._on_show_overlay_toggled()
+
+    def _link_show_toggle(self, other: QCheckBox, checked: bool) -> None:
+        if self._config.subtitle_merged and other.isChecked() != checked:
+            other.blockSignals(True)
+            other.setChecked(checked)
+            other.blockSignals(False)
+
+    def _sync_show_toggles(self) -> None:
+        """Merged mode has one overlay, so the two switches become one."""
+        merged = self._config.subtitle_merged
+        label = "显示字幕浮层" if merged else "显示浮层"
+        tip = (
+            "合并字幕：两路共用一个浮层，这里和另一页的开关同步"
+            if merged
+            else "单独显示这一路的字幕浮层"
+        )
+        for box in (self._chk_show_mic, self._chk_show_game):
+            box.setText(label)
+            box.setToolTip(tip)
+        if merged and self._chk_show_mic.isChecked() != self._chk_show_game.isChecked():
+            self._chk_show_game.setChecked(True)  # links the mic switch too
+        self._on_enable_toggled()
 
     def _on_show_overlay_toggled(self, *_args: Any) -> None:
         # Shown/hidden is runtime state (hotkeys flip it mid-game): save it at once.
@@ -2392,8 +2428,14 @@ class MainWindow(QMainWindow):
 
         self._chk_enable_mic.setChecked(cfg.enable_mic)
         self._chk_enable_game.setChecked(cfg.enable_game)
-        self._chk_show_mic.setChecked(cfg.show_mic_subtitle)
-        self._chk_show_game.setChecked(cfg.show_game_subtitle)
+        for box, value in (
+            (self._chk_show_mic, cfg.show_mic_subtitle),
+            (self._chk_show_game, cfg.show_game_subtitle),
+        ):
+            box.blockSignals(True)
+            box.setChecked(value)
+            box.blockSignals(False)
+        self._sync_show_toggles()
         self._chk_play_mic.setChecked(cfg.play_mic_voice)
         self._chk_play_game.setChecked(cfg.play_game_voice)
         self._spn_font.setValue(cfg.subtitle_font_size)
@@ -2680,6 +2722,7 @@ class MainWindow(QMainWindow):
             self._append_log(msg)
             show_toast(msg)
         if "subtitle_merged" in changed:
+            self._sync_show_toggles()
             self._reopen_overlays()
         elif changed & self._OVERLAY_LOOK_FIELDS:
             self._apply_overlay_look()

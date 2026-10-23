@@ -228,3 +228,18 @@ def test_phrase_hotkey_types_translation_of_nth_phrase(window, monkeypatch) -> N
     window._send_phrase_slot(2)
     window._send_phrase_slot(3)
     assert typed == [("Retreat", False), ("推中", True)]
+
+
+def test_merged_mode_links_the_two_show_switches(window) -> None:
+    assert window._config.subtitle_merged is True
+    assert window._chk_show_mic.text() == window._chk_show_game.text() == "显示字幕浮层"
+    window._chk_show_mic.setChecked(False)
+    assert window._chk_show_game.isChecked() is False
+    window._chk_show_game.setChecked(True)
+    assert window._chk_show_mic.isChecked() is True
+
+    window._chk_subtitle_merged.setChecked(False)
+    window._on_save()
+    assert window._chk_show_mic.text() == "显示浮层"
+    window._chk_show_mic.setChecked(False)
+    assert window._chk_show_game.isChecked() is True
