@@ -79,6 +79,7 @@ from src.core.music_share import (
 from src.core.pipeline import TranslationPipeline
 from src.core.usage_tracker import UsageState, UsageTracker
 from src.core.volc_engine import VOLC_VOICE_OPTIONS
+from src.engines.pipeline.llm_mt import HYMT_MODELS, hymt_model
 from src.engines.pipeline.model_sources import (
     ModelSource,
     asr_source,
@@ -91,6 +92,7 @@ from src.engines.pipeline.model_sources import (
     source_tooltip,
 )
 from src.gui.music_sidebar import MusicSidebarOverlay
+from src.gui.phrase_overlay import PhraseOverlay
 from src.gui.settings_dirty import wire_dirty_tracking
 from src.gui.styles import (
     get_stylesheet,
@@ -100,9 +102,15 @@ from src.gui.styles import (
     resolve_theme,
     theme_choices,
 )
-from src.gui.subtitle_overlay import SubtitleOverlay
+from src.gui.subtitle_overlay import MERGED_KEY, SubtitleOverlay
 from src.gui.toast import show_toast
-from src.models.config import AppConfigModel, ThemeKey, normalize_theme_key
+from src.models.config import (
+    AppConfigModel,
+    HotkeyConfig,
+    QuickPhraseSettings,
+    ThemeKey,
+    normalize_theme_key,
+)
 from src.models.enums import Direction
 from src.models.subtitle import SubtitleEntry
 from src.utils import download_progress
@@ -113,12 +121,14 @@ from src.utils.config_manager import (
     save_config,
 )
 from src.utils.download_progress import format_task
+from src.utils.hold_key import HoldKeyListener
 from src.utils.hotkeys import (
     DEFAULT_HOTKEYS,
     HOTKEY_LABELS,
     AppHotkeys,
     GlobalHotkeys,
     HotkeyBridge,
+    combo_to_display,
 )
 from src.utils.logger import logger
 from src.utils.resource_paths import resolve_log_dir
@@ -190,9 +200,11 @@ _PAGE_TITLES = (
     ("设置", "字幕外观、翻译引擎、推理设备与助手"),
     ("打字翻译", "输入文字 → 翻译 → 朗读（独立通道，不影响同传）"),
     ("翻译记录", "本地翻译留档：按会话查看、搜索并导出字幕"),
+    ("常用语", "点一下就输入到游戏聊天框，可自动翻译成外语"),
 )
 _PAGE_TYPED = 4
 _PAGE_TRANSCRIPTS = 5
+_PAGE_PHRASES = 6
 
 
 class MainWindow(QMainWindow):
@@ -241,6 +253,8 @@ class MainWindow(QMainWindow):
         )
         self._music_tracks: list[Path] = []
         self._music_folder: Path | None = None
+        # Hotkeys edited in the dialog but not saved yet
+        self._hotkeys_draft: HotkeyConfig | None = None
         self._music_sidebar: MusicSidebarOverlay | None = None
         self._music_switching = False
         self._music_load_generation = 0
@@ -359,6 +373,7 @@ class MainWindow(QMainWindow):
         self._pages.addWidget(self._wrap_scroll(self._build_settings_panel()))
         self._pages.addWidget(self._wrap_scroll(self._build_typed_page()))
         self._pages.addWidget(self._build_transcripts_page())
+        self._pages.addWidget(self._build_phrase_page())
         body.addWidget(self._pages, 1)
         self._log_panel = self._build_log_panel()
         body.addWidget(self._log_panel, 0)
@@ -371,6 +386,8 @@ class MainWindow(QMainWindow):
         self._spn_opacity.valueChanged.connect(self._on_look_changed)
         self._spn_history.valueChanged.connect(self._on_look_changed)
         self._chk_show_original.toggled.connect(self._on_look_changed)
+        self._chk_subtitle_auto_hide.toggled.connect(self._on_look_changed)
+        self._chk_subtitle_merged.toggled.connect(self._on_look_changed)
         self._chk_show_mic.toggled.connect(self._on_show_overlay_toggled)
         self._chk_show_game.toggled.connect(self._on_show_overlay_toggled)
         self._chk_enable_mic.toggled.connect(self._on_enable_toggled)
@@ -453,6 +470,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._nav_group("工具"))
         add_page("✎   打字翻译", _PAGE_TYPED)
         add_page("☰   翻译记录", _PAGE_TRANSCRIPTS)
+        add_page("❝   常用语", _PAGE_PHRASES)
         self._btn_adjust = self._nav_item(
             "▣   调整字幕",
             "显示字幕浮层并解除锁定，可拖拽 / 缩放 / 右键菜单。\n"
@@ -477,7 +495,7 @@ class MainWindow(QMainWindow):
         self._cmb_theme = QComboBox()
         for label, key in theme_choices():
             self._cmb_theme.addItem(label, key)
-        self._cmb_theme.setToolTip("界面主题，立即生效；「跟随系统」按系统明暗切换")
+        self._cmb_theme.setToolTip("界面主题，保存后生效；「跟随系统」按系统明暗切换")
         self._cmb_theme.currentIndexChanged.connect(self._on_theme_selected)
         layout.addWidget(self._cmb_theme)
         version = QLabel("v0.4")
@@ -780,6 +798,55 @@ class MainWindow(QMainWindow):
         opts.addWidget(self._chk_music_auto_next)
         opts.addStretch()
         layout.addLayout(opts)
+
+        from src.gui.hotkey_edit import HotkeyEdit
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self._field_label("播放方式"))
+        self._cmb_music_mode = QComboBox()
+        self._prep_combo(self._cmb_music_mode)
+        self._cmb_music_mode.addItem("自由播放（播放后直到暂停/停止）", "free")
+        self._cmb_music_mode.addItem("按住按键播放（松开即停）", "hold")
+        self._cmb_music_mode.setToolTip(
+            "按住按键播放：按住设定的按键开始播放当前曲目（没选则第一首），松开立即停止；"
+            "游戏在前台时也有效，按键照常传给游戏"
+        )
+        mode_row.addWidget(self._cmb_music_mode, 1)
+        layout.addLayout(mode_row)
+
+        hold_row = QHBoxLayout()
+        self._lbl_music_hold = self._field_label("按键")
+        hold_row.addWidget(self._lbl_music_hold)
+        self._edt_music_hold = HotkeyEdit(allow_single_key=True, allow_mouse=True)
+        self._edt_music_hold.setToolTip(
+            "点击后按下要按住的键：单键（如 F8、`）、组合键，或鼠标侧键/中键"
+        )
+        hold_row.addWidget(self._edt_music_hold, 1)
+        self._lbl_music_delay = self._field_label("延迟")
+        hold_row.addWidget(self._lbl_music_delay)
+        self._spn_music_delay = QSpinBox()
+        self._spn_music_delay.setRange(0, 2000)
+        self._spn_music_delay.setSingleStep(50)
+        self._spn_music_delay.setSuffix(" ms")
+        self._spn_music_delay.setValue(300)
+        self._spn_music_delay.setToolTip("按住超过这个时间才开始播放，轻点按键不会出声")
+        hold_row.addWidget(self._spn_music_delay)
+        layout.addLayout(hold_row)
+
+        self._music_hold = HoldKeyListener(self)
+        self._music_hold.pressed.connect(self._on_music_hold_pressed)
+        self._music_hold.released.connect(self._on_music_hold_released)
+        self._music_hold_timer = QTimer(self)
+        self._music_hold_timer.setSingleShot(True)
+        self._music_hold_timer.timeout.connect(self._on_music_hold_elapsed)
+        self._music_hold_playing = False
+        self._music_hold_load_gen = -1
+        self._edt_music_hold.capturing_changed.connect(
+            lambda capturing: self._music_hold.set_enabled(not capturing)
+        )
+        self._cmb_music_mode.currentIndexChanged.connect(self._on_music_hold_settings_changed)
+        self._edt_music_hold.combo_changed.connect(self._on_music_hold_settings_changed)
+        self._spn_music_delay.valueChanged.connect(self._on_music_hold_settings_changed)
 
         note = QLabel(
             "输出设备与麦克风同传共用「译文播放到」。播音乐时建议关掉麦克风语音输出，避免抢声道。"
@@ -1140,7 +1207,6 @@ class MainWindow(QMainWindow):
             "火山同传：一个云端服务完成识别、翻译与配音；\n"
             "经济模式：下面三项可分别选本地或云端。"
         )
-        self._cmb_translation_mode.currentIndexChanged.connect(self._on_translation_mode_changed)
         self._cmb_translation_mode.currentIndexChanged.connect(self._refresh_settings_usage)
         self._form_row(layout, "引擎", self._cmb_translation_mode)
 
@@ -1166,20 +1232,19 @@ class MainWindow(QMainWindow):
             "Fun-ASR / Qwen3-ASR-Flash：需 DashScope API Key；\n"
             "豆包极速识别：复用火山 API Key，中文与热词效果最好。"
         )
-        self._cmb_asr_backend.currentIndexChanged.connect(self._on_asr_backend_changed)
         self._cmb_asr_backend.currentIndexChanged.connect(self._refresh_settings_usage)
         self._form_row(eco, "语音识别", self._cmb_asr_backend)
 
         self._cmb_mt_backend = QComboBox()
         self._prep_combo(self._cmb_mt_backend)
         self._cmb_mt_backend.addItem("本地 · NLLB（离线）", "nllb")
-        self._cmb_mt_backend.addItem("本地 · Hy-MT2 1.8B（llama.cpp）", "hymt")
+        self._cmb_mt_backend.addItem("本地 · Hy-MT2 混元翻译（llama.cpp）", "hymt")
         self._cmb_mt_backend.addItem("云端 · 大模型 LLM（OpenAI 兼容，推荐）", "llm")
         self._cmb_mt_backend.addItem("云端 · MyMemory（免费）", "mymemory")
         self._cmb_mt_backend.addItem("自动（NLLB → Argos → MyMemory）", "auto")
         self._cmb_mt_backend.setToolTip(
             "LLM：DeepSeek / 通义 / Ollama / LM Studio 等，带上下文与术语表，失败回退 NLLB；\n"
-            "Hy-MT2：腾讯混元翻译 GGUF（约 1.1GB），需 pip install llama-cpp-python。\n"
+            "Hy-MT2：腾讯混元翻译 GGUF，型号（1.8B / 7B）在「本地模型」页选，需 pip install llama-cpp-python。\n"
             "保存后重新开启通道生效。"
         )
         self._cmb_mt_backend.currentIndexChanged.connect(self._refresh_settings_usage)
@@ -1267,7 +1332,22 @@ class MainWindow(QMainWindow):
         self._refresh_color_buttons()
         self._chk_show_original = QCheckBox("浮层显示原文")
         self._chk_show_original.setChecked(True)
-        layout.addWidget(self._chk_show_original)
+        self._chk_subtitle_merged = QCheckBox("麦克风和游戏合并为一个浮层")
+        self._chk_subtitle_merged.setChecked(True)
+        self._chk_subtitle_merged.setToolTip(
+            "合并后每句字幕前标出「我」/「对方」；取消则分成两个浮层"
+        )
+        self._chk_subtitle_auto_hide = QCheckBox("锁定后无人说话时自动隐藏")
+        self._chk_subtitle_auto_hide.setChecked(True)
+        self._chk_subtitle_auto_hide.setToolTip(
+            "浮层锁定（点击穿透）时，约 10 秒没有新字幕就淡出，有人说话立即出现"
+        )
+        overlay_row = QHBoxLayout()
+        overlay_row.addWidget(self._chk_show_original)
+        overlay_row.addWidget(self._chk_subtitle_merged)
+        overlay_row.addWidget(self._chk_subtitle_auto_hide)
+        overlay_row.addStretch(1)
+        layout.addLayout(overlay_row)
 
         layout = self._settings_card(page, "声音处理", desc="更改后需重新开启通道")
         self._cmb_quality = QComboBox()
@@ -1608,9 +1688,6 @@ class MainWindow(QMainWindow):
                 if opt.id != "windows-live-captions":
                     combo.addItem(format_option_label(opt), opt.id)
             combo.setToolTip(tip_text)
-            combo.currentIndexChanged.connect(
-                lambda _i, f=field, c=combo: self._on_channel_asr_model_changed(f, c)
-            )
             self._form_row(layout, label_text, combo)
             self._model_source_row(layout, functools.partial(self._asr_combo_source, combo))
             combo.currentIndexChanged.connect(self._refresh_model_sources)
@@ -1625,22 +1702,34 @@ class MainWindow(QMainWindow):
             "翻译模型",
             kind="local",
             usage_key="local_mt",
-            desc="用于：翻译 = NLLB / 自动，以及大模型翻译失败时的回退。"
-            "Hy-MT2 模型（约 1.1GB）在首次使用时单独下载。",
+            desc="用于：翻译 = NLLB / 自动，以及大模型翻译失败时的回退；"
+            "翻译 = Hy-MT2 时使用下方所选型号，首次使用时下载。",
         )
         self._cmb_nllb_model = QComboBox()
         self._prep_combo(self._cmb_nllb_model)
         for opt in NLLB_OPTIONS:
             self._cmb_nllb_model.addItem(format_option_label(opt), opt.id)
         self._cmb_nllb_model.setToolTip("本地 NLLB CTranslate2 模型，缓存至 resource/nllb/")
-        self._cmb_nllb_model.currentIndexChanged.connect(self._on_nllb_model_changed)
         self._form_row(layout, "NLLB", self._cmb_nllb_model)
         self._model_source_row(
             layout, lambda: nllb_source(str(self._cmb_nllb_model.currentData() or ""))
         )
         self._cmb_nllb_model.currentIndexChanged.connect(self._refresh_model_sources)
-        self._field_hint(layout, "Hy-MT2 大模型翻译（翻译选 Hy-MT2 时使用）")
-        self._model_source_row(layout, hymt_source)
+        self._cmb_hymt_model = QComboBox()
+        self._prep_combo(self._cmb_hymt_model)
+        for hy in HYMT_MODELS:
+            self._cmb_hymt_model.addItem(f"{hy.label} · {hy.size_mb / 1024:.1f} GB", hy.id)
+            self._cmb_hymt_model.setItemData(
+                self._cmb_hymt_model.count() - 1, hy.note, Qt.ItemDataRole.ToolTipRole
+            )
+        self._cmb_hymt_model.setToolTip(
+            "翻译选 Hy-MT2 时使用；需 pip install llama-cpp-python，首次使用时下载"
+        )
+        self._form_row(layout, "Hy-MT2", self._cmb_hymt_model)
+        self._model_source_row(
+            layout, lambda: hymt_source(str(self._cmb_hymt_model.currentData() or ""))
+        )
+        self._cmb_hymt_model.currentIndexChanged.connect(self._refresh_model_sources)
 
         layout = self._settings_card(
             page,
@@ -1694,7 +1783,6 @@ class MainWindow(QMainWindow):
                 "当前未检测到 NVIDIA GPU 或 CUDA onnxruntime。\n"
                 "安装 onnxruntime-gpu 和 NVIDIA 驱动后可选择 GPU。"
             )
-        self._cmb_device_pref.currentIndexChanged.connect(self._on_device_pref_changed)
         self._form_row(layout, "默认设备", self._cmb_device_pref)
         task_row = QHBoxLayout()
         self._task_device_combos: dict[str, QComboBox] = {}
@@ -1911,19 +1999,12 @@ class MainWindow(QMainWindow):
         self._cmb_theme.blockSignals(False)
         if getattr(self, "_btn_text_color", None) is not None:
             self._refresh_color_buttons()
-            for overlay in self._overlays.values():
-                overlay.set_appearance(**self._overlay_appearance())
+            for overlay in self._overlay_windows():
+                overlay.set_appearance(**self._saved_overlay_appearance())
                 overlay.set_menu_style(menu_stylesheet(self._active_theme))
 
     def _on_theme_selected(self, _index: int) -> None:
-        key = normalize_theme_key(self._cmb_theme.currentData())
-        if key == self._theme:
-            return
-        self._theme = key
-        self._apply_theme()
-        self._config = self._config.model_copy(update={"theme_mode": key})
-        self._persist_config()
-        self._append_log(f"主题已切换为「{self._cmb_theme.currentText()}」")
+        self._update_save_button()
 
     def _on_system_scheme_changed(self, *_args: object) -> None:
         if self._theme == "system":
@@ -2284,6 +2365,14 @@ class MainWindow(QMainWindow):
         self._btn_game.setEnabled(game_on or running_game)
 
     def _on_show_overlay_toggled(self, *_args: Any) -> None:
+        # Shown/hidden is runtime state (hotkeys flip it mid-game): save it at once.
+        shown = {
+            "show_mic_subtitle": self._chk_show_mic.isChecked(),
+            "show_game_subtitle": self._chk_show_game.isChecked(),
+        }
+        if any(getattr(self._config, k) != v for k, v in shown.items()):
+            self._config = self._config.model_copy(update=shown)
+            self._persist_config()
         if self._pipeline is None:
             # Preview overlays only if already visible
             if self._overlays:
@@ -2293,6 +2382,7 @@ class MainWindow(QMainWindow):
 
     def _load_config_into_ui(self) -> None:
         cfg = self._config
+        self._hotkeys_draft = None
         self._theme = cfg.theme_mode
         self._btn_status_panel.setChecked(cfg.status_panel_visible)
         self._log_panel.setVisible(cfg.status_panel_visible)
@@ -2355,6 +2445,12 @@ class MainWindow(QMainWindow):
                 or "JustFrederik/nllb-200-distilled-600M-ct2-int8",
             )
             self._cmb_nllb_model.blockSignals(False)
+        if hasattr(self, "_cmb_hymt_model"):
+            self._cmb_hymt_model.blockSignals(True)
+            self._select_combo_data(
+                self._cmb_hymt_model, hymt_model(getattr(cfg, "economy_hymt_model", None)).id
+            )
+            self._cmb_hymt_model.blockSignals(False)
         if hasattr(self, "_cmb_mt_backend"):
             self._select_combo_data(
                 self._cmb_mt_backend, getattr(cfg, "economy_mt_backend", "nllb") or "nllb"
@@ -2411,6 +2507,10 @@ class MainWindow(QMainWindow):
         self._chk_transcript_logging.setChecked(cfg.transcript_logging_enabled)
         self._spn_transcript_retention.setValue(cfg.transcript_retention_days)
         self._chk_show_original.setChecked(bool(getattr(cfg, "show_original_in_overlay", True)))
+        self._chk_subtitle_auto_hide.setChecked(bool(cfg.subtitle_auto_hide))
+        self._chk_subtitle_merged.blockSignals(True)
+        self._chk_subtitle_merged.setChecked(bool(cfg.subtitle_merged))
+        self._chk_subtitle_merged.blockSignals(False)
         self._chk_advanced.blockSignals(True)
         self._chk_advanced.setChecked(bool(getattr(cfg, "show_advanced_devices", False)))
         self._chk_advanced.blockSignals(False)
@@ -2426,8 +2526,17 @@ class MainWindow(QMainWindow):
         self._corpus_glossary = dict(getattr(cfg, "glossary", None) or {})
         self._refresh_corpus_label()
         self._chk_music_auto_next.setChecked(bool(getattr(cfg, "music_auto_next", True)))
+        for widget in (self._cmb_music_mode, self._edt_music_hold, self._spn_music_delay):
+            widget.blockSignals(True)
+        self._select_combo_data(self._cmb_music_mode, cfg.music_play_mode)
+        self._edt_music_hold.set_combo(cfg.music_hold_key)
+        self._spn_music_delay.setValue(cfg.music_hold_delay_ms)
+        for widget in (self._cmb_music_mode, self._edt_music_hold, self._spn_music_delay):
+            widget.blockSignals(False)
+        self._update_music_hold_rows()
+        self._apply_music_hold()
         folder = (getattr(cfg, "music_folder", "") or "").strip()
-        if folder:
+        if folder and Path(folder).expanduser() != self._music_folder:
             self._load_music_folder(Path(folder).expanduser(), select_first=True, quiet=True)
 
         # Keep language pairs linked both ways (wire once)
@@ -2438,6 +2547,9 @@ class MainWindow(QMainWindow):
             self._cmb_game_source.currentIndexChanged.connect(self._sync_lang_pairs_from_game)
             self._cmb_game_target.currentIndexChanged.connect(self._sync_lang_pairs_from_game)
             self._lang_signals_wired = True
+        self._phrase_panel.set_settings(cfg.quick_phrases)
+        self._refresh_phrase_target()
+        self._sync_phrase_overlay()
         self._on_enable_toggled()
         self._refresh_settings_usage()
         self._refresh_model_sources()
@@ -2489,18 +2601,18 @@ class MainWindow(QMainWindow):
         btn.setText("保存*" if dirty else "保存")
         if dirty:
             btn.setToolTip(
-                "有未保存的修改。\n"
-                "需保存后生效：语言、设备、语音输出、VAD/质量档位、原文闪避、"
-                "捕获方式、会话轮转、火山密钥/音色/语速、Dota 助手、曲库等。\n"
-                "立即生效（仍建议保存以持久化）：字幕外观、浮层显隐。"
+                "有未保存的修改，点击保存后生效。\n"
+                "浮层上的拖动、锁定、滚轮调整和字幕显隐开关是即时的，不需要保存。"
             )
         else:
             btn.setToolTip(
                 "设置已与本地配置同步。\n通道相关项保存后，需重新开启通道才会应用到正在运行的会话。"
             )
 
-    def _commit_from_ui(self, *, persist: bool = True) -> bool:
-        """UI draft → self._config (+ disk)."""
+    def _commit_from_ui(self, *, persist: bool = True, apply: bool = True) -> bool:
+        """UI draft → self._config (+ disk); ``apply`` puts the saved settings into effect."""
+        if apply:
+            self._confirm_mode_switch()
         previous = self._config
         try:
             updated = self._collect_config_from_ui()
@@ -2513,12 +2625,75 @@ class MainWindow(QMainWindow):
                 }
                 save_config(updated, clear_secret_fields=cleared)
             self._config = updated
+            self._hotkeys_draft = None
+            if apply:
+                self._apply_saved_changes(previous)
             self._update_save_button()
             return True
         except Exception as exc:
             self._config = previous
             QMessageBox.critical(self, "保存失败", str(exc))
             return False
+
+    _ENGINE_RELOAD_FIELDS = frozenset(
+        {
+            "economy_nllb_model",
+            "economy_hymt_model",
+            "economy_asr_backend",
+            "economy_asr_mic_model",
+            "economy_asr_game_model",
+            "device_preference",
+        }
+    )
+    _OVERLAY_LOOK_FIELDS = frozenset(
+        {
+            "subtitle_font_size",
+            "subtitle_opacity",
+            "subtitle_text_color",
+            "subtitle_bg_color",
+            "subtitle_follow_theme",
+            "subtitle_font_family",
+            "subtitle_history_lines",
+            "show_original_in_overlay",
+            "subtitle_auto_hide",
+        }
+    )
+
+    def _apply_saved_changes(self, previous: AppConfigModel) -> None:
+        """Put every setting that changed on save into effect."""
+        cfg = self._config
+        changed = {
+            name for name in type(cfg).model_fields if getattr(previous, name) != getattr(cfg, name)
+        }
+        if "theme_mode" in changed:
+            self._theme = cfg.theme_mode
+            self._apply_theme()
+            self._append_log(f"主题已切换为「{self._cmb_theme.currentText()}」")
+        engine = {name: getattr(cfg, name) for name in changed & self._ENGINE_RELOAD_FIELDS}
+        if "translation_mode" in changed:
+            self._apply_translation_mode({**engine, "translation_mode": cfg.translation_mode})
+        elif engine:
+            stopped = self._reset_economy_engine(engine)
+            msg = (
+                "引擎/模型设置已保存，通道已停止；重新开启后生效"
+                if stopped
+                else "引擎/模型设置已保存，将在下次启动通道时生效"
+            )
+            self._append_log(msg)
+            show_toast(msg)
+        if "subtitle_merged" in changed:
+            self._reopen_overlays()
+        elif changed & self._OVERLAY_LOOK_FIELDS:
+            self._apply_overlay_look()
+        if "hotkeys" in changed:
+            self._apply_hotkeys()
+            if self._phrase_overlay is not None:
+                self._phrase_overlay.set_hotkeys(self._phrase_hotkey_labels())
+        if changed & {"music_play_mode", "music_hold_key", "music_hold_delay_ms"}:
+            self._apply_music_hold()
+        if changed & {"quick_phrases", "source_language", "target_language"}:
+            self._sync_phrase_overlay()
+            self._refresh_phrase_target()
 
     def _persist_config(self) -> None:
         """Write current self._config to disk without pulling dirty UI fields."""
@@ -2636,8 +2811,14 @@ class MainWindow(QMainWindow):
                 )
                 or "JustFrederik/nllb-200-distilled-600M-ct2-int8"
             ),
+            # Picking an NLLB model in settings counts as finishing the first-run choice.
             economy_offline_setup_done=bool(
                 getattr(self._config, "economy_offline_setup_done", False)
+                or (
+                    hasattr(self, "_cmb_nllb_model")
+                    and self._cmb_nllb_model.currentData()
+                    and self._cmb_nllb_model.currentData() != self._config.economy_nllb_model
+                )
             ),
             economy_sentence_min_chars=int(
                 getattr(self._config, "economy_sentence_min_chars", 4) or 4
@@ -2680,11 +2861,19 @@ class MainWindow(QMainWindow):
             transcript_logging_enabled=self._chk_transcript_logging.isChecked(),
             transcript_retention_days=self._spn_transcript_retention.value(),
             show_original_in_overlay=self._chk_show_original.isChecked(),
+            subtitle_merged=self._chk_subtitle_merged.isChecked(),
+            subtitle_auto_hide=self._chk_subtitle_auto_hide.isChecked(),
             overlay_locked=self._config.overlay_locked,
-            theme_mode=self._theme,
-            hotkeys=self._config.hotkeys,
+            theme_mode=normalize_theme_key(self._cmb_theme.currentData()),
+            hotkeys=self._hotkeys_draft or self._config.hotkeys,
+            quick_phrases=(
+                self._phrase_panel.settings.model_copy(deep=True)
+                if hasattr(self, "_phrase_panel")
+                else self._config.quick_phrases
+            ),
             music_folder=str(self._music_folder) if self._music_folder else "",
             music_auto_next=self._chk_music_auto_next.isChecked(),
+            **self._music_hold_fields(),
             show_advanced_devices=self._chk_advanced.isChecked(),
             vad_enabled=self._chk_vad.isChecked(),
             vad_game_enabled=self._chk_vad_game.isChecked(),
@@ -2723,26 +2912,22 @@ class MainWindow(QMainWindow):
             f"(open={params.vad_open_ms}ms hangover={params.vad_hangover_ms}ms)"
         )
 
-    def _on_translation_mode_changed(self) -> None:
-        """Immediate engine swap: stop channels, update config, persist mode field."""
+    def _confirm_mode_switch(self) -> None:
+        """First switch to economy mode needs the offline model choice; cancel keeps the engine."""
         mode = self._cmb_translation_mode.currentData() or "volc"
-        if mode not in ("volc", "economy"):
-            mode = "volc"
-        prev = getattr(self._config, "translation_mode", "volc") or "volc"
-        if mode == prev and (
-            self._pipeline is None or getattr(self._pipeline, "mode", prev) == mode
-        ):
+        if mode != "economy" or self._config.translation_mode == "economy":
             return
-
-        if mode == "economy" and not self._ensure_economy_offline_setup():
-            self._cmb_translation_mode.blockSignals(True)
-            self._select_combo_data(self._cmb_translation_mode, prev)
-            self._cmb_translation_mode.blockSignals(False)
+        if self._ensure_economy_offline_setup():
             return
+        self._cmb_translation_mode.blockSignals(True)
+        self._select_combo_data(self._cmb_translation_mode, self._config.translation_mode)
+        self._cmb_translation_mode.blockSignals(False)
+        self._append_log("未完成本地模型设置，翻译引擎保持不变")
 
-        stopped = self._reset_engine_for_setting({"translation_mode": mode})
-        self._config = self._config.model_copy(update={"translation_mode": mode})
-        self._persist_config()
+    def _apply_translation_mode(self, update: dict[str, Any]) -> None:
+        """Saved a new engine: stop channels so the next start builds it."""
+        mode = self._config.translation_mode
+        stopped = self._reset_engine_for_setting(update)
 
         label = "火山同传" if mode == "volc" else "经济模式"
         msg = f"已切换引擎 → {label}"
@@ -2852,72 +3037,6 @@ class MainWindow(QMainWindow):
         self._persist_config()
         self._append_log(f"已选择本地翻译模型：{model_id}")
         return True
-
-    def _on_nllb_model_changed(self) -> None:
-        """Immediate apply NLLB model id; reload engine on next channel start."""
-        if not hasattr(self, "_cmb_nllb_model"):
-            return
-        model_id = self._cmb_nllb_model.currentData()
-        if not model_id:
-            return
-        current = getattr(self._config, "economy_nllb_model", "") or ""
-        if model_id == current and bool(getattr(self._config, "economy_offline_setup_done", False)):
-            return
-
-        stopped = self._reset_economy_engine({"economy_nllb_model": model_id})
-        self._config = self._config.model_copy(
-            update={
-                "economy_nllb_model": model_id,
-                "economy_offline_setup_done": True,
-            }
-        )
-        self._persist_config()
-
-        msg = "已切换本地翻译模型，将在下次启动通道时生效"
-        if stopped:
-            msg = "已切换本地翻译模型，通道已停止；重新开启后生效"
-        self._append_log(msg)
-        show_toast(msg)
-
-    def _on_asr_backend_changed(self) -> None:
-        """切换经济模式 ASR 后端 (云端/本地)，运行中会停止通道。"""
-        if not hasattr(self, "_cmb_asr_backend"):
-            return
-        backend = self._cmb_asr_backend.currentData()
-        if not backend:
-            return
-        if backend == self._config.economy_asr_backend:
-            return
-
-        stopped = self._reset_economy_engine({"economy_asr_backend": backend})
-
-        self._config = self._config.model_copy(update={"economy_asr_backend": backend})
-        self._persist_config()
-
-        label = self._cmb_asr_backend.currentText()
-        msg = f"已切换 ASR 后端为 {label}，将在下次启动通道时生效"
-        if stopped:
-            msg = f"已切换 ASR 后端为 {label}，通道已停止；重新开启后生效"
-        self._append_log(msg)
-        show_toast(msg)
-
-    def _on_channel_asr_model_changed(self, field: str, combo: QComboBox) -> None:
-        """切换某一通道的本地 ASR 模型，运行中会停止通道。"""
-        model_id = combo.currentData()
-        if not model_id or model_id == getattr(self._config, field):
-            return
-
-        stopped = self._reset_economy_engine({field: model_id})
-
-        self._config = self._config.model_copy(update={field: model_id})
-        self._persist_config()
-
-        channel = "麦克风" if field == "economy_asr_mic_model" else "游戏"
-        msg = f"已切换{channel}识别模型，将在下次启动通道时生效"
-        if stopped:
-            msg = f"已切换{channel}识别模型，通道已停止；重新开启后生效"
-        self._append_log(msg)
-        show_toast(msg)
 
     _PREVIEW_LINES: tuple[tuple[str, str], ...] = (
         ("zh", "你好，这是语音试听，欢迎使用实时同传。"),
@@ -3037,33 +3156,13 @@ class MainWindow(QMainWindow):
             fields["economy_llm_base_url"] = self._txt_llm_url.text().strip()
             fields["economy_llm_model"] = self._txt_llm_model.text().strip()
             fields["economy_llm_api_key"] = self._txt_llm_key.text().strip()
+        if hasattr(self, "_cmb_hymt_model"):
+            fields["economy_hymt_model"] = (
+                self._cmb_hymt_model.currentData() or cfg.economy_hymt_model
+            )
         for task, combo in getattr(self, "_task_device_combos", {}).items():
             fields[f"economy_{task}_device"] = combo.currentData() or ""
         return fields
-
-    def _on_device_pref_changed(self) -> None:
-        """切换推理设备 (CPU/GPU/auto)，运行中会停止通道。"""
-        if not hasattr(self, "_cmb_device_pref"):
-            return
-        pref = self._cmb_device_pref.currentData()
-        if not pref:
-            return
-        current = getattr(self._config, "device_preference", "auto") or "auto"
-        if pref == current:
-            return
-
-        stopped = self._reset_economy_engine({"device_preference": pref})
-
-        self._config = self._config.model_copy(update={"device_preference": pref})
-        self._persist_config()
-
-        label_map = {"auto": "自动", "cpu": "CPU", "cuda": "GPU (CUDA)"}
-        label = label_map.get(pref, pref)
-        msg = f"已切换推理设备为 {label}，将在下次启动通道时生效"
-        if stopped:
-            msg = f"已切换推理设备为 {label}，通道已停止；重新开启后生效"
-        self._append_log(msg)
-        show_toast(msg)
 
     def _resolve_output_device_name(self) -> str:
         """根据当前 output_device 配置返回可读的设备名 (而非索引数字)."""
@@ -3113,16 +3212,10 @@ class MainWindow(QMainWindow):
             return
         self._corpus_hotwords, self._corpus_glossary = dlg.result_corpus()
         self._refresh_corpus_label()
-        self._config = self._config.model_copy(
-            update={
-                "hotwords": list(self._corpus_hotwords),
-                "glossary": dict(self._corpus_glossary),
-            }
-        )
-        self._persist_config()
+        self._update_save_button()
         self._append_log(
-            f"热词/术语已更新：热词 {len(self._corpus_hotwords)} / 术语 {len(self._corpus_glossary)}"
-            "（已保存；重新开启通道后生效）"
+            f"热词/术语已修改：热词 {len(self._corpus_hotwords)} / 术语 {len(self._corpus_glossary)}"
+            "（点「保存」后生效，运行中的通道需重新开启）"
         )
 
     def _build_typed_page(self) -> QFrame:
@@ -3145,6 +3238,158 @@ class MainWindow(QMainWindow):
         self._transcript_panel = TranscriptPanel(resolve_log_dir(self._config.log_dir))
         layout.addWidget(self._transcript_panel)
         return card
+
+    def _build_phrase_page(self) -> QFrame:
+        from src.core.phrase_input import PhraseInserter
+        from src.core.phrase_translate import PhraseTranslator
+        from src.gui.phrase_panel import PhrasePanel, PhraseResultBridge
+
+        card = self._card()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        self._phrase_overlay: PhraseOverlay | None = None
+        self._phrase_panel = PhrasePanel(self._config.quick_phrases)
+        self._phrase_panel.settings_changed.connect(self._on_phrase_settings_changed)
+        self._phrase_panel.overlay_toggled.connect(
+            lambda checked: self._update_phrase_settings(show_overlay=bool(checked))
+        )
+        self._phrase_panel.retranslate_requested.connect(
+            lambda ids: self._ensure_phrase_translations(ids, force=True)
+        )
+        layout.addWidget(self._phrase_panel)
+        self._phrase_bridge = PhraseResultBridge(self)
+        self._phrase_bridge.translated.connect(self._on_phrase_translated)
+        self._phrase_translator = PhraseTranslator(
+            lambda: self._config, self._phrase_bridge.translated.emit
+        )
+        self._phrase_inserter = PhraseInserter(self)
+        return card
+
+    def _phrase_langs(self) -> tuple[str, str]:
+        return self._config.source_language, self._config.target_language
+
+    def _refresh_phrase_target(self) -> None:
+        _source, target = self._phrase_langs()
+        label = next((text.split()[0] for text, code in _LANG_LABELS if code == target), target)
+        self._phrase_panel.set_target(target, label)
+        self._ensure_phrase_translations()
+
+    def _apply_phrase_settings(self, settings: QuickPhraseSettings) -> None:
+        self._config = self._config.model_copy(update={"quick_phrases": settings})
+        self._persist_config()
+        self._sync_phrase_overlay()
+
+    def _on_phrase_settings_changed(self, _settings: QuickPhraseSettings) -> None:
+        self._update_save_button()
+
+    def _update_phrase_settings(self, **changes: Any) -> None:
+        """Overlay state (position, lock, size, shown): applies at once, keeps the panel draft."""
+        draft = self._phrase_panel.settings.model_copy(update=changes)
+        self._phrase_panel.set_settings(draft)
+        self._apply_phrase_settings(self._config.quick_phrases.model_copy(update=changes))
+
+    def _toggle_phrase_overlay(self) -> None:
+        self._update_phrase_settings(show_overlay=not self._config.quick_phrases.show_overlay)
+
+    def _ensure_phrase_translations(
+        self, ids: list[str] | None = None, *, force: bool = False
+    ) -> None:
+        from src.core.phrase_translate import PhraseRequest
+
+        settings = self._config.quick_phrases
+        if not settings.translate:
+            return
+        source, target = self._phrase_langs()
+        wanted = set(ids) if ids is not None else None
+        for group in settings.groups:
+            for phrase in group.phrases:
+                if wanted is not None and phrase.id not in wanted:
+                    continue
+                if not force and phrase.translation and phrase.translated_to == target:
+                    continue
+                request = PhraseRequest(phrase.id, phrase.text, source, target)
+                if self._phrase_translator.request(request):
+                    self._phrase_panel.set_phrase_status(phrase.id, "翻译中…")
+
+    def _on_phrase_translated(self, request: object, translation: object) -> None:
+        from src.core.phrase_translate import PhraseRequest
+
+        if not isinstance(request, PhraseRequest):
+            return
+        settings = self._config.quick_phrases.model_copy(deep=True)
+        phrase = settings.find(request.phrase_id)
+        if phrase is None or phrase.text != request.text:
+            self._phrase_panel.set_phrase_status(request.phrase_id, "")
+            return
+        if not translation:
+            self._phrase_panel.set_phrase_status(request.phrase_id, "翻译失败，可点「重新翻译」")
+            return
+        phrase.translation = str(translation)
+        phrase.translated_to = request.target_lang
+        draft = self._phrase_panel.settings.model_copy(deep=True)
+        pending = draft.find(request.phrase_id)
+        if pending is not None and pending.text == request.text:
+            pending.translation, pending.translated_to = phrase.translation, phrase.translated_to
+            self._phrase_panel.set_settings(draft)
+        self._phrase_panel.set_phrase_status(request.phrase_id, "")
+        self._apply_phrase_settings(settings)
+
+    def _sync_phrase_overlay(self) -> None:
+        settings = self._config.quick_phrases
+        overlay = self._phrase_overlay
+        if not settings.show_overlay:
+            if overlay is not None:
+                overlay.close()
+                overlay.deleteLater()
+                self._phrase_overlay = None
+            return
+        if overlay is None:
+            overlay = PhraseOverlay(settings)
+            overlay.phrase_clicked.connect(self._on_phrase_clicked)
+            overlay.group_changed.connect(
+                lambda name: self._update_phrase_settings(current_group=name)
+            )
+            overlay.geometry_changed.connect(
+                lambda geom: self._update_phrase_settings(overlay_geometry=tuple(geom))
+            )
+            overlay.lock_changed.connect(
+                lambda locked: self._update_phrase_settings(overlay_locked=bool(locked))
+            )
+            overlay.font_size_requested.connect(
+                lambda size: self._update_phrase_settings(font_size=int(size))
+            )
+            overlay.opacity_requested.connect(
+                lambda value: self._update_phrase_settings(chip_opacity=float(value))
+            )
+            overlay.hide_requested.connect(lambda: self._update_phrase_settings(show_overlay=False))
+            self._phrase_overlay = overlay
+            overlay.show()
+        else:
+            overlay.set_settings(settings)
+        overlay.set_hotkeys(self._phrase_hotkey_labels())
+
+    def _phrase_hotkey_labels(self) -> list[str]:
+        hk = self._config.hotkeys
+        if not hk.enabled:
+            return []
+        return [combo_to_display(getattr(hk, f"phrase_{n}", "")) for n in range(1, 10)]
+
+    def _on_phrase_clicked(self, phrase_id: str) -> None:
+        settings = self._config.quick_phrases
+        phrase = settings.find(phrase_id)
+        if phrase is None:
+            return
+        text = phrase.output(translate=settings.translate, bilingual=settings.bilingual)
+        if self._phrase_inserter.insert(text, press_enter=phrase.auto_enter):
+            return
+        show_toast("已复制到剪贴板，按 Ctrl+V 粘贴（当前系统不支持自动输入）", ms=2500)
+
+    def _send_phrase_slot(self, number: int) -> None:
+        phrases = self._config.quick_phrases.active_group().phrases
+        if 0 < number <= len(phrases):
+            self._on_phrase_clicked(phrases[number - 1].id)
+        else:
+            show_toast(f"当前分组没有第 {number} 条常用语")
 
     def _persist_typed_translation(self, original: str, translated: str) -> None:
         from src.utils.logger import SubtitleLogger
@@ -3281,8 +3526,6 @@ class MainWindow(QMainWindow):
     def _on_advanced_toggled(self, checked: bool) -> None:
         self._apply_advanced_visibility()
         self._repopulate_devices_keeping_selection()
-        self._config = self._config.model_copy(update={"show_advanced_devices": bool(checked)})
-        self._persist_config()
         self._append_log(
             "游戏声音列表已显示虚拟线缆捕获源" if checked else "游戏声音列表已隐藏虚拟线缆捕获源"
         )
@@ -3422,17 +3665,17 @@ class MainWindow(QMainWindow):
         if self._app_hotkeys is not None:
             self._app_hotkeys.set_active(False)
         try:
-            dlg = HotkeyDialog(self._config.hotkeys, self)
+            dlg = HotkeyDialog(self._hotkeys_draft or self._config.hotkeys, self)
             accepted = dlg.exec() == dlg.DialogCode.Accepted
             if accepted:
                 result = dlg.result_config()
                 if result is not None:
-                    self._config = self._config.model_copy(update={"hotkeys": result})
-                    self._persist_config()
-                    self._append_log("快捷键已更新并保存")
+                    self._hotkeys_draft = result
+                    self._append_log("快捷键已修改，点「保存」后生效")
         finally:
             self._hotkeys_capturing = False
             self._apply_hotkeys()
+            self._update_save_button()
 
     def _on_hotkey(self, action: str) -> None:
         if getattr(self, "_hotkeys_capturing", False):
@@ -3444,7 +3687,7 @@ class MainWindow(QMainWindow):
             return
         self._hotkey_guard[action] = now
 
-        handlers = {
+        handlers: dict[str, Callable[[], None]] = {
             "toggle_mic": lambda: self._on_channel_toggle("mic"),
             "toggle_game": lambda: self._on_channel_toggle("game"),
             "stop_all": self._on_stop,
@@ -3457,14 +3700,16 @@ class MainWindow(QMainWindow):
             "music_next": lambda: self._music_step(1),
             "music_toggle_sidebar": self._toggle_music_sidebar,
             "dota_coach_ask": self._on_dota_coach_hotkey,
+            "toggle_phrase_overlay": self._toggle_phrase_overlay,
+            **{f"phrase_{n}": functools.partial(self._send_phrase_slot, n) for n in range(1, 10)},
         }
         handler = handlers.get(action)
         if handler is None:
             return
         label = HOTKEY_LABELS.get(action, action)
         self._append_log(f"快捷键触发：{label}")
-        # Dota 教练有自己的待命/结果 toast，避免叠两层
-        if action != "dota_coach_ask":
+        # Dota 教练有自己的待命/结果 toast；常用语直接输入，不弹提示
+        if action != "dota_coach_ask" and not action.startswith("phrase_"):
             show_toast(label)
         handler()
 
@@ -3513,49 +3758,79 @@ class MainWindow(QMainWindow):
         self._append_log(msg)
 
     # ------------------------------------------------------------ overlays
-    def _on_geometry_changed(self, direction: Direction, geom: tuple[int, int, int, int]) -> None:
-        self._config.subtitle_window_positions[direction.value] = geom
+    def _on_geometry_changed(self, key: str, geom: tuple[int, int, int, int]) -> None:
+        self._config.subtitle_window_positions[key] = geom
         self._geometry_save_timer.start()
 
-    def _on_lock_changed(self, direction: Direction, locked: bool) -> None:
-        self._config.overlay_locked[direction.value] = locked
-        label = "麦克风" if direction == Direction.OUTBOUND else "游戏"
+    def _on_lock_changed(self, key: str, locked: bool) -> None:
+        self._config.overlay_locked[key] = locked
+        label = {"outbound": "麦克风", "inbound": "游戏"}.get(key, "")
         self._append_log(f"{label}字幕已{'锁定（点击穿透）' if locked else '解锁'}")
         self._persist_config()
+
+    def _overlay_windows(self) -> list[SubtitleOverlay]:
+        """Open overlay windows; a merged window serves both directions."""
+        return list({id(o): o for o in self._overlays.values()}.values())
 
     def _ensure_overlay(self, direction: Direction) -> SubtitleOverlay:
         overlay = self._overlays.get(direction)
         if overlay is not None:
             return overlay
-        locked = bool(self._config.overlay_locked.get(direction.value, False))
-        text_color, background_color = self._overlay_colors()
+        cfg = self._config
+        merged = cfg.subtitle_merged
+        if merged and self._overlays:
+            overlay = next(iter(self._overlays.values()))
+            self._overlays[direction] = overlay
+            return overlay
+        key = MERGED_KEY if merged else direction.value
+        locked = bool(self._config.overlay_locked.get(key, False))
+        look = self._saved_overlay_appearance()
         overlay = SubtitleOverlay(
-            direction,
-            font_size=self._spn_font.value(),
-            opacity=self._overlay_opacity(),
+            None if merged else direction,
+            font_size=cfg.subtitle_font_size,
+            opacity=cfg.subtitle_opacity,
             locked=locked,
-            history_lines=self._spn_history.value(),
-            show_original=self._chk_show_original.isChecked(),
-            text_color=text_color,
-            background_color=background_color,
-            font_family=self._cmb_subtitle_font.currentData() or "",
+            history_lines=cfg.subtitle_history_lines,
+            show_original=cfg.show_original_in_overlay,
+            text_color=look["text_color"],
+            background_color=look["background_color"],
+            font_family=look["font_family"],
+            auto_hide=cfg.subtitle_auto_hide,
             on_geometry_changed=self._on_geometry_changed,
             on_lock_changed=self._on_lock_changed,
-            on_font_size_requested=self._spn_font.setValue,
+            on_font_size_requested=self._on_overlay_font_requested,
             on_opacity_requested=self._on_overlay_opacity_requested,
         )
         overlay.set_menu_style(menu_stylesheet(self._active_theme))
-        pos = self._config.subtitle_window_positions.get(direction.value)
+        pos = self._config.subtitle_window_positions.get(key)
         if pos:
             overlay.restore_geometry_tuple(pos)
         overlay.show()
         self._overlays[direction] = overlay
         return overlay
 
+    def _drop_overlay(self, direction: Direction) -> None:
+        overlay = self._overlays.pop(direction, None)
+        if overlay is None:
+            return
+        if overlay in self._overlays.values():
+            overlay.clear_speaker(direction)
+        else:
+            overlay.close()
+
     def _close_overlays(self) -> None:
-        for overlay in self._overlays.values():
+        for overlay in self._overlay_windows():
             overlay.close()
         self._overlays.clear()
+
+    def _reopen_overlays(self) -> None:
+        was_open = bool(self._overlays)
+        self._close_overlays()
+        if was_open:
+            self._sync_overlays_visibility(preview=not self._pipeline_running())
+
+    def _pipeline_running(self) -> bool:
+        return self._pipeline is not None and bool(self._pipeline.active_channels())
 
     def _on_preview_overlays(self) -> None:
         # Ensure at least one overlay checkbox is on for preview
@@ -3564,25 +3839,62 @@ class MainWindow(QMainWindow):
             self._chk_show_mic.setChecked(True)
         self._sync_overlays_visibility(preview=True)
         # Unlock so user can drag/resize after a previous lock
-        for overlay in self._overlays.values():
+        for overlay in self._overlay_windows():
             if overlay.is_locked():
                 overlay.set_locked(False)
         self._append_log("已打开字幕浮层，可拖拽 / 缩放；双击锁定，要再调整就再点「调整字幕」")
 
     def _on_look_changed(self, *_args: Any) -> None:
-        for overlay in self._overlays.values():
-            overlay.set_font_size(self._spn_font.value())
-            overlay.set_opacity(self._overlay_opacity())
-            overlay.set_history_lines(self._spn_history.value())
-            overlay.set_show_original(self._chk_show_original.isChecked())
-            overlay.set_appearance(**self._overlay_appearance())
         self._update_save_button()
+
+    def _apply_overlay_look(self) -> None:
+        cfg = self._config
+        for overlay in self._overlay_windows():
+            overlay.set_auto_hide(cfg.subtitle_auto_hide)
+            overlay.set_font_size(cfg.subtitle_font_size)
+            overlay.set_opacity(cfg.subtitle_opacity)
+            overlay.set_history_lines(cfg.subtitle_history_lines)
+            overlay.set_show_original(cfg.show_original_in_overlay)
+            overlay.set_appearance(**self._saved_overlay_appearance())
 
     def _overlay_opacity(self) -> float:
         return self._spn_opacity.value() / 100.0
 
+    def _set_overlay_state(self, **changes: Any) -> None:
+        """Wheel/menu tweaks on the overlay itself apply and save at once, like dragging it."""
+        self._config = self._config.model_copy(update=changes)
+        for spin, value in (
+            (self._spn_font, changes.get("subtitle_font_size")),
+            (self._spn_opacity, changes.get("subtitle_opacity")),
+        ):
+            if value is None:
+                continue
+            spin.blockSignals(True)
+            spin.setValue(round(value * 100) if spin is self._spn_opacity else int(value))
+            spin.blockSignals(False)
+        self._persist_config()
+        self._apply_overlay_look()
+
+    def _on_overlay_font_requested(self, size: int) -> None:
+        self._set_overlay_state(subtitle_font_size=int(size))
+
     def _on_overlay_opacity_requested(self, opacity: float) -> None:
-        self._spn_opacity.setValue(round(opacity * 100))
+        self._set_overlay_state(subtitle_opacity=float(opacity))
+
+    def _saved_overlay_appearance(self) -> dict[str, str]:
+        cfg = self._config
+        if cfg.subtitle_follow_theme:
+            text_color, background_color = (
+                self._active_theme.overlay_text,
+                self._active_theme.overlay_bg,
+            )
+        else:
+            text_color, background_color = cfg.subtitle_text_color, cfg.subtitle_bg_color
+        return {
+            "text_color": text_color,
+            "background_color": background_color,
+            "font_family": cfg.subtitle_font_family,
+        }
 
     def _overlay_colors(self) -> tuple[str, str]:
         if self._chk_subtitle_follow_theme.isChecked():
@@ -3821,9 +4133,7 @@ class MainWindow(QMainWindow):
             self._refresh_channel_buttons()
             return
 
-        overlay = self._overlays.pop(direction, None)
-        if overlay is not None:
-            overlay.close()
+        self._drop_overlay(direction)
         pipeline = self._pipeline
 
         def work() -> Callable[[], None]:
@@ -3953,20 +4263,19 @@ class MainWindow(QMainWindow):
 
         for direction in list(self._overlays):
             if direction not in wanted:
-                self._overlays[direction].close()
-                del self._overlays[direction]
+                self._drop_overlay(direction)
 
         for direction in wanted:
-            overlay = self._ensure_overlay(direction)
-            overlay.set_font_size(self._spn_font.value())
-            overlay.set_opacity(self._overlay_opacity())
-            overlay.set_history_lines(self._spn_history.value())
-            overlay.set_show_original(self._chk_show_original.isChecked())
-            if preview:
-                if direction == Direction.OUTBOUND:
-                    overlay.set_text("你好，能听到吗？", "Hello, can you hear me?")
-                else:
-                    overlay.set_text("Enemy spotted mid.", "中路发现敌人。")
+            self._ensure_overlay(direction)
+        self._apply_overlay_look()
+        if not preview:
+            return
+        for direction in wanted:
+            if direction == Direction.OUTBOUND:
+                sample = ("你好，能听到吗？", "Hello, can you hear me?")
+            else:
+                sample = ("Enemy spotted mid.", "中路发现敌人。")
+            self._overlays[direction].set_text(*sample, speaker=direction)
 
     def _start_channels(self, *, mic: bool, game: bool) -> None:
         """Compatibility helper used by older call paths."""
@@ -4044,15 +4353,14 @@ class MainWindow(QMainWindow):
 
         if not show:
             # Hide overlay for this direction if present
-            overlay = self._overlays.pop(entry.direction, None)
-            if overlay is not None:
-                overlay.close()
+            self._drop_overlay(entry.direction)
             return
         overlay = self._ensure_overlay(entry.direction)
         overlay.set_text(
             entry.original_text,
             entry.translated_text,
             is_final=entry.is_final,
+            speaker=entry.direction,
         )
 
     def _on_dota_coach_hotkey(self) -> None:
@@ -4157,14 +4465,8 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         self._load_music_folder(Path(folder), select_first=True, quiet=False)
-        self._config = self._config.model_copy(
-            update={
-                "music_folder": str(self._music_folder) if self._music_folder else "",
-                "music_auto_next": self._chk_music_auto_next.isChecked(),
-            }
-        )
-        self._persist_config()
-        self._append_log("曲库文件夹已保存")
+        self._update_save_button()
+        self._append_log("已打开曲库文件夹，点「保存」后下次启动也会记住")
 
     def _load_music_folder(
         self,
@@ -4278,8 +4580,10 @@ class MainWindow(QMainWindow):
 
         should_play = autoplay or self._music_pending_autoplay
         self._music_pending_autoplay = False
+        if generation == self._music_hold_load_gen and not self._music_hold_playing:
+            should_play = False  # the hold key was released while this track loaded
         if should_play:
-            self._start_music_playback(show_conflict_warn=False)
+            self._start_music_playback(show_conflict_warn=False, quiet=self._music_hold_playing)
 
     def _on_music_load_failed(self, generation: int, path: object, message: str) -> None:
         if generation != self._music_load_generation:
@@ -4339,7 +4643,9 @@ class MainWindow(QMainWindow):
     def _on_music_volume(self, value: int) -> None:
         self._music.set_volume(value / 100.0)
 
-    def _start_music_playback(self, *, show_conflict_warn: bool = True) -> bool:
+    def _start_music_playback(
+        self, *, show_conflict_warn: bool = True, quiet: bool = False
+    ) -> bool:
         if self._music_switching:
             self._music_pending_autoplay = True
             return True
@@ -4396,6 +4702,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "播放失败", str(exc))
             return False
 
+        if quiet:
+            # Hold-to-play: no sidebar or toast flashing on every key press.
+            return True
         self._show_music_sidebar()
         self._append_log(f"音乐分享播放中 → {out_name}")
         show_toast("音乐分享中")
@@ -4403,6 +4712,73 @@ class MainWindow(QMainWindow):
 
     def _on_music_play(self) -> None:
         self._start_music_playback(show_conflict_warn=True)
+
+    # ------------------------------------------------------- hold-to-play
+    def _music_hold_fields(self) -> dict[str, Any]:
+        return {
+            "music_play_mode": self._cmb_music_mode.currentData() or "free",
+            "music_hold_key": self._edt_music_hold.combo(),
+            "music_hold_delay_ms": self._spn_music_delay.value(),
+        }
+
+    def _music_hold_mode(self) -> bool:
+        return self._config.music_play_mode == "hold"
+
+    def _update_music_hold_rows(self) -> None:
+        hold = self._cmb_music_mode.currentData() == "hold"
+        for widget in (
+            self._lbl_music_hold,
+            self._edt_music_hold,
+            self._lbl_music_delay,
+            self._spn_music_delay,
+        ):
+            widget.setVisible(hold)
+        if hold and not self._edt_music_hold.combo():
+            self._edt_music_hold.setPlaceholderText("点击这里，按下要按住的键")
+
+    def _apply_music_hold(self) -> None:
+        """Listen for the saved hold key."""
+        hold = self._music_hold_mode()
+        combo = self._config.music_hold_key if hold else ""
+        if combo != getattr(self, "_music_hold_combo", None):
+            self._music_hold_combo = combo
+            self._music_hold.set_combo(combo)
+        if not hold:
+            self._on_music_hold_released()
+
+    def _on_music_hold_settings_changed(self, *_args: Any) -> None:
+        self._update_music_hold_rows()
+        self._update_save_button()
+
+    def _on_music_hold_pressed(self) -> None:
+        if not self._music_hold_mode() or not self._music_tracks:
+            return
+        self._music_hold_timer.start(self._config.music_hold_delay_ms)
+
+    def _on_music_hold_elapsed(self) -> None:
+        index = self._cmb_music_track.currentIndex()
+        if not 0 <= index < len(self._music_tracks):
+            index = 0
+            self._cmb_music_track.blockSignals(True)
+            self._cmb_music_track.setCurrentIndex(0)
+            self._cmb_music_track.blockSignals(False)
+        self._music_hold_playing = True
+        # Every hold starts the track over; release stops it.
+        self._music.stop()
+        if self._music.is_loaded and self._music.path == self._music_tracks[index]:
+            self._start_music_playback(show_conflict_warn=False, quiet=True)
+        elif self._load_music_index(index, autoplay=True):
+            self._music_hold_load_gen = self._music_load_generation
+
+    def _on_music_hold_released(self) -> None:
+        self._music_hold_timer.stop()
+        if not self._music_hold_playing:
+            return
+        self._music_hold_playing = False
+        self._music_pending_autoplay = False
+        self._music.stop()
+        dur = self._music.duration_sec
+        self._lbl_music_time.setText(f"00:00 / {self._fmt_mmss(dur)}")
 
     def _on_music_pause(self) -> None:
         if self._music.is_playing:
@@ -4459,6 +4835,11 @@ class MainWindow(QMainWindow):
             timer.stop()
         self._stop_tts_preview()
         self._typed_panel.shutdown()
+        self._phrase_translator.close()
+        if self._phrase_overlay is not None:
+            self._phrase_overlay.close()
+        self._music_hold_timer.stop()
+        self._music_hold.stop()
         with contextlib.suppress(Exception):
             self._music.stop()
         self._music_load_cancel.set()

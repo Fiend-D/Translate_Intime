@@ -21,6 +21,7 @@ def test_silence_flush_after_gap():
     chunk = buf.poll()
     assert chunk is not None
     assert len(chunk) == len(_pcm_ms(80))
+    assert buf.cut_mid_speech is False
     assert buf.poll() is None
 
 
@@ -48,6 +49,11 @@ def test_max_ms_force_flush():
     chunk = buf.poll()
     assert chunk is not None
     assert len(chunk) == len(_pcm_ms(250))
+    assert buf.cut_mid_speech is True
+
+    buf.push(_pcm_ms(50))
+    buf.flush()
+    assert buf.cut_mid_speech is False
 
 
 def test_flush_manual():

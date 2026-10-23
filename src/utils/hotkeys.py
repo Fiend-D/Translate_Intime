@@ -30,6 +30,8 @@ DEFAULT_HOTKEYS: dict[str, str] = {
     # Avoid Ctrl+Alt+C: Windows terminals may still treat it as Ctrl+C and
     # interrupt a development launch even while the global hook receives it.
     "dota_coach_ask": "<ctrl>+<alt>+k",
+    "toggle_phrase_overlay": "<ctrl>+<alt>+q",
+    **{f"phrase_{n}": f"<ctrl>+<shift>+<f{n}>" for n in range(1, 10)},
 }
 
 HOTKEY_LABELS: dict[str, str] = {
@@ -45,9 +47,17 @@ HOTKEY_LABELS: dict[str, str] = {
     "music_next": "音乐：下一首",
     "music_toggle_sidebar": "音乐：显示/隐藏侧栏",
     "dota_coach_ask": "Dota教练：待命/取消（说完发建议）",
+    "toggle_phrase_overlay": "显示/隐藏常用语悬浮窗",
+    **{f"phrase_{n}": f"发送常用语第 {n} 条" for n in range(1, 10)},
 }
 
 _MOD_ORDER = ("ctrl", "alt", "shift", "cmd", "win")
+# Mouse buttons usable for hold-to-play (never for GlobalHotKeys, which is keyboard-only)
+MOUSE_TOKENS = {
+    "mouse_back": "鼠标侧键(后)",
+    "mouse_forward": "鼠标侧键(前)",
+    "mouse_middle": "鼠标中键",
+}
 _MOD_ALIASES = {
     "control": "ctrl",
     "ctl": "ctrl",
@@ -108,6 +118,7 @@ def normalize_combo(raw: str) -> str:
         "page_up",
         "page_down",
         "insert",
+        *MOUSE_TOKENS,
     }:
         if key == "return":
             key = "enter"
@@ -148,6 +159,7 @@ def combo_to_display(combo: str) -> str:
             "home": "Home",
             "end": "End",
             "insert": "Ins",
+            **MOUSE_TOKENS,
         }.get(token, token.upper() if len(token) == 1 else token.title())
         parts.append(label)
     return "+".join(parts)

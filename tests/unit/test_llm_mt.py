@@ -221,3 +221,23 @@ def test_factory_cache_can_be_disabled(tmp_path) -> None:
     )
     _asr, mt, _tts = build_economy_backends(config)
     assert not isinstance(mt, CachedMt)
+
+
+def test_hymt_model_choice_drives_primary_and_source(tmp_path) -> None:
+    from src.engines.pipeline.llm_mt import HYMT_MODELS, hymt_model
+    from src.engines.pipeline.model_sources import hymt_source
+
+    assert hymt_model("missing") is HYMT_MODELS[0]
+    config = AppConfigModel(
+        log_dir=str(tmp_path), economy_mt_backend="hymt", economy_hymt_model="hy-mt2-7b"
+    )
+    _, mt, _ = build_economy_backends(config)
+    fallback = mt.inner if isinstance(mt, CachedMt) else mt
+    assert isinstance(fallback, FallbackMt)
+    primary = fallback._primary
+    assert isinstance(primary, HyMtLocal)
+    assert primary.model_path.name == "Hy-MT2-7B-Q4_K_M.gguf"
+    assert primary._download_mb == 4625
+    source = hymt_source("hy-mt2-7b")
+    assert "Hy-MT2-7B-GGUF" in source.origin
+    assert source.size_mb == 4625

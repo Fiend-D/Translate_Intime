@@ -88,3 +88,12 @@ def test_streaming_decode_pads_silence_before_finishing_input() -> None:
     tail = stream.chunks[-1]
     assert tail.size >= int(0.5 * 16000)
     assert not np.any(tail)
+
+
+def test_short_noise_words_are_dropped_but_standalone_questions_kept() -> None:
+    from src.engines.pipeline.sherpa_asr import _is_meaningless_output
+
+    for noise in (".", "F.", "No.", "The.", "Yeah."):
+        assert _is_meaningless_output(noise), noise
+    for real in ("Why?", "Why.", "What?", "Wait!", "gg", "She can't.", "你好"):
+        assert not _is_meaningless_output(real), real

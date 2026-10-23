@@ -16,7 +16,13 @@ from src.engines.pipeline.cloud_asr import DoubaoFlashAsr, QwenFlashAsr
 from src.engines.pipeline.cloud_tts import CosyVoiceTts, DoubaoTts, FallbackTts, OpenAICompatTts
 from src.engines.pipeline.kokoro_tts import KokoroOnnxTts
 from src.engines.pipeline.live_captions_asr import LiveCaptionsAsr
-from src.engines.pipeline.llm_mt import CachedMt, ChatCompletionMt, FallbackMt, HyMtLocal
+from src.engines.pipeline.llm_mt import (
+    CachedMt,
+    ChatCompletionMt,
+    FallbackMt,
+    HyMtLocal,
+    hymt_model,
+)
 from src.engines.pipeline.mt import ArgosMt, AutoMt, MtBackend, MyMemoryMt, UnconfiguredMt
 from src.engines.pipeline.qwen_asr import QwenLocalAsr, is_qwen_asr_model
 from src.engines.pipeline.sentence_split import (
@@ -75,6 +81,108 @@ _MT_LOADING_STATUS = "本地翻译模型加载中"
 _ASR_OVERLAP_BYTES = 16000 * 2  # 1 second of PCM16 mono at 16 kHz
 _FINAL_ASR_SILENCE = b"\x00\x00" * int(16000 * 0.4)
 _FINAL_ASR_MAX_BYTES = 30 * 16000 * 2
+_TERMINAL_PUNCT = ("。", "！", "？", ".", "!", "?")
+# Offline ASR closes every chunk with a period, even one cut mid-sentence at a
+# pause. A chunk ending on one of these words is a sentence still in progress.
+_DANGLING_EN = frozenset(
+    [
+        "a",
+        "an",
+        "the",
+        "to",
+        "of",
+        "for",
+        "with",
+        "from",
+        "by",
+        "at",
+        "in",
+        "on",
+        "into",
+        "onto",
+        "about",
+        "as",
+        "than",
+        "and",
+        "or",
+        "but",
+        "nor",
+        "so",
+        "because",
+        "if",
+        "when",
+        "while",
+        "although",
+        "though",
+        "since",
+        "until",
+        "unless",
+        "whether",
+        "that",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "where",
+        "my",
+        "your",
+        "his",
+        "her",
+        "its",
+        "our",
+        "their",
+        "this",
+        "these",
+        "those",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "can",
+        "could",
+        "may",
+        "might",
+        "must",
+        "do",
+        "does",
+        "did",
+        "have",
+        "has",
+        "had",
+        "not",
+        "very",
+        "just",
+        "even",
+        "more",
+        "most",
+        "such",
+        "no",
+        "every",
+        "each",
+        "some",
+        "any",
+    ]
+)
+_DANGLING_ZH = (
+    "的", "地", "得", "在", "和", "与", "跟", "把", "被", "给", "对", "从", "向", "让",
+    "因为", "但是", "所以", "而且", "如果", "虽然", "就是", "还有", "然后", "可是", "或者",
+)  # fmt: skip
+# Live preview: re-recognize the utterance still being captured, then translate it.
+_PREVIEW_TICK_S = 0.15
+_PREVIEW_MIN_BYTES = int(0.8 * 16000) * 2
+_PREVIEW_STEP_BYTES = int(0.5 * 16000) * 2
+_PREVIEW_MIN_INTERVAL_S = 0.8
+_PREVIEW_MAX_INTERVAL_S = 3.0
+# Preview runs MT about once a second, so only for backends without per-call cost.
+_LOCAL_MT_BACKENDS = frozenset({"auto", "nllb", "argos", "hymt"})
 
 # Local / offline ASR backends never require a DashScope API key.
 LOCAL_ASR_BACKENDS = frozenset({"local", "live_captions", "sherpa", "whisper"})
@@ -103,6 +211,8 @@ class _Job:
     source_lang: str
     target_lang: str
     play_voice: bool
+    # Cut at the length cap mid-speech: the next chunk needs this one's tail as context.
+    mid_speech: bool = False
 
 
 @dataclass
@@ -115,6 +225,16 @@ class _PendingText:
     created_at: float
     pcm: bytes
     chunk_count: int
+
+
+@dataclass
+class _PreviewState:
+    generation: int = -1
+    chunk_seq: int = -1
+    at: float = 0.0
+    audio_len: int = 0
+    interval: float = _PREVIEW_MIN_INTERVAL_S
+    translated_for: str = ""
 
 
 @dataclass
@@ -329,12 +449,19 @@ def build_economy_backends(
     config: AppConfigModel,
 ) -> tuple[ChannelAsr, MtBackend, TtsBackend]:
     """Factory helpers used by EconomyPipelineEngine and tests."""
-    mt_device = task_device(config, "mt")
     raw_pref = (getattr(config, "economy_asr_backend", None) or "").strip()
     if raw_pref == "live_captions" and resolve_economy_asr_backend(config) == "local":
         logger.warning(_WARN_LC_FALLBACK)
     asrs = build_channel_asr(config)
+    mt = build_economy_mt(config)
+    tts = build_tts(config)
 
+    return asrs, mt, tts
+
+
+def build_economy_mt(config: AppConfigModel) -> MtBackend:
+    """Translation backend chosen in the economy settings (also used for quick phrases)."""
+    mt_device = task_device(config, "mt")
     nllb_model = (
         getattr(config, "economy_nllb_model", None)
         or "JustFrederik/nllb-200-distilled-600M-ct2-int8"
@@ -367,10 +494,16 @@ def build_economy_backends(
         )
     elif mt_pref == "hymt":
         # Local first: a failed Hy-MT2 load falls back to NLLB, not straight to the cloud.
+        model = hymt_model(getattr(config, "economy_hymt_model", None))
         mt = FallbackMt(
-            HyMtLocal(device_preference=mt_device),
+            HyMtLocal(
+                repo_id=model.repo_id,
+                filename=model.filename,
+                download_mb=model.size_mb,
+                device_preference=mt_device,
+            ),
             AutoMt(prefer="auto", nllb_model=nllb_model, device_preference=mt_device),
-            name="Hy-MT2",
+            name=model.label,
         )
     else:
         # auto → NLLB first, then Argos / MyMemory
@@ -382,15 +515,58 @@ def build_economy_backends(
     cache_size = int(getattr(config, "economy_mt_cache_size", 512) or 0)
     if cache_size > 0:
         mt = CachedMt(mt, max_entries=cache_size)
-
-    tts = build_tts(config)
-
-    return asrs, mt, tts
+    return mt
 
 
 _PENDING_TEXT_MAX_CHARS = 600
 _COMMIT_DEDUP_WINDOW_SEC = 6.0
 _HEAD_TRIM_MIN_CHARS = 4
+
+
+def _ends_mid_sentence(text: str) -> bool:
+    """Whether ``text`` stops on a word that cannot end a sentence ("ability to.")."""
+    stripped = text.rstrip().rstrip("。！？.!?，,、…").rstrip()
+    if not stripped:
+        return False
+    if not stripped[-1].isascii():
+        return stripped.endswith(_DANGLING_ZH)
+    last = stripped.split()[-1].strip("\"'()").casefold()
+    return last in _DANGLING_EN
+
+
+def _continue_text(previous: str, current: str) -> tuple[str, str]:
+    """Drop the false period of a chunk cut mid-sentence before the next chunk joins it."""
+    if not previous or not current or not _ends_mid_sentence(previous):
+        return previous, current
+    previous = previous.rstrip().rstrip("。！？.!?")
+    first = current.split(maxsplit=1)[0]
+    is_pronoun_i = first == "I" or first.startswith(("I'", "I’"))
+    if previous[-1:].isascii() and first[:1].isupper() and not is_pronoun_i:
+        current = current[0].lower() + current[1:]
+    return previous, current
+
+
+_TTS_CLAUSE_MIN_CHARS = 8
+_TTS_SPLIT_MIN_CHARS = 18
+
+
+def _tts_clauses(text: str) -> list[str]:
+    """Split a long sentence at commas so the first clause can play while the rest renders."""
+    if len(text) < _TTS_SPLIT_MIN_CHARS:
+        return [text]
+    clauses: list[str] = []
+    current = ""
+    for ch in text:
+        current += ch
+        if ch in "，,；;：:" and len(current.strip()) >= _TTS_CLAUSE_MIN_CHARS:
+            clauses.append(current.strip())
+            current = ""
+    if current.strip():
+        if clauses and len(current.strip()) < _TTS_CLAUSE_MIN_CHARS:
+            clauses[-1] += current.strip()
+        else:
+            clauses.append(current.strip())
+    return clauses
 
 
 def _dedup_key(text: str) -> str:
@@ -523,7 +699,7 @@ class EconomyPipelineEngine:
         }
         # Bound work-in-flight so slow local inference cannot grow latency/memory forever.
         self._queue: queue.Queue[_Job | None] = queue.Queue(maxsize=8)
-        self._tts_queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=8)
+        self._tts_queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=16)
         self._tts_generation: dict[Direction, int] = {
             Direction.OUTBOUND: 0,
             Direction.INBOUND: 0,
@@ -537,6 +713,23 @@ class EconomyPipelineEngine:
             Direction.OUTBOUND: b"",
             Direction.INBOUND: b"",
         }
+        asr_pref = resolve_economy_asr_backend(config)
+        mt_pref = (getattr(config, "economy_mt_backend", "auto") or "auto").strip()
+        # Cloud ASR bills per request and Live Captions already streams, so they skip preview.
+        self._preview_enabled = bool(getattr(config, "economy_live_preview", True)) and (
+            asr_pref in LOCAL_ASR_BACKENDS and asr_pref != "live_captions"
+        )
+        # A 7B model needs seconds per sentence; previews would hold up the final pass.
+        self._preview_mt = mt_pref in _LOCAL_MT_BACKENDS and not (
+            mt_pref == "hymt" and getattr(config, "economy_hymt_model", "") == "hy-mt2-7b"
+        )
+        # Bumped on every commit; a preview started before it must not overwrite the result.
+        self._preview_lock = threading.Lock()
+        self._preview_gen: dict[Direction, int] = dict.fromkeys(Direction, 0)
+        self._chunk_seq: dict[Direction, int] = dict.fromkeys(Direction, 0)
+        self._preview_state: dict[Direction, _PreviewState] = {}
+        self._worker_busy = threading.Event()
+        self._preview_worker: threading.Thread | None = None
         self._worker: threading.Thread | None = None
         self._tts_worker: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -587,6 +780,15 @@ class EconomyPipelineEngine:
             daemon=True,
         )
         self._worker.start()
+        if self._preview_enabled and (
+            self._preview_worker is None or not self._preview_worker.is_alive()
+        ):
+            self._preview_worker = threading.Thread(
+                target=self._preview_loop,
+                name="economy-preview-worker",
+                daemon=True,
+            )
+            self._preview_worker.start()
 
     def _ensure_tts_worker(self) -> None:
         if self._tts_worker is not None and self._tts_worker.is_alive():
@@ -736,7 +938,7 @@ class EconomyPipelineEngine:
         chunk = buf.poll()
         if chunk:
             self._log_flush(direction, chunk)
-            self._enqueue(direction, chunk)
+            self._enqueue(direction, chunk, mid_speech=buf.cut_mid_speech)
 
     def notify_pcm_pending(self, direction: Direction) -> None:
         """Prevent TTS feedback buffering from looking like an end-of-speech gap."""
@@ -745,7 +947,7 @@ class EconomyPipelineEngine:
         self._last_pcm_at[direction] = time.monotonic()
         self._buffers[direction].mark_capture_active()
 
-    def _enqueue(self, direction: Direction, pcm: bytes) -> None:
+    def _enqueue(self, direction: Direction, pcm: bytes, *, mid_speech: bool = False) -> None:
         source_lang, target_lang = self._langs_for(direction)
         job = _Job(
             direction=direction,
@@ -753,7 +955,10 @@ class EconomyPipelineEngine:
             source_lang=source_lang,
             target_lang=target_lang,
             play_voice=bool(self._play_voice.get(direction, False)),
+            mid_speech=mid_speech,
         )
+        with self._preview_lock:
+            self._chunk_seq[direction] += 1
         try:
             self._queue.put_nowait(job)
         except queue.Full:
@@ -780,7 +985,7 @@ class EconomyPipelineEngine:
             chunk = buf.poll()
             if chunk:
                 self._log_flush(direction, chunk)
-                self._enqueue(direction, chunk)
+                self._enqueue(direction, chunk, mid_speech=buf.cut_mid_speech)
 
     def _defer_asr_job(self, job: _Job) -> None:
         """Retain captured audio until a warming local ASR becomes ready."""
@@ -827,6 +1032,7 @@ class EconomyPipelineEngine:
             if job is None:
                 self._queue.task_done()
                 break
+            self._worker_busy.set()
             try:
                 self._process_job(job)
             except Exception as exc:
@@ -835,6 +1041,7 @@ class EconomyPipelineEngine:
                 self._rate_limited_error(f"经济模式处理失败: {exc}")
                 logger.exception("Economy job failed")
             finally:
+                self._worker_busy.clear()
                 self._queue.task_done()
 
     def _enqueue_tts(self, direction: Direction, text: str, language: str) -> None:
@@ -878,10 +1085,15 @@ class EconomyPipelineEngine:
                     pass
                 if self._tts_stop_event.is_set() or self._tts_job_stale(job):
                     continue
+                t_tts = time.perf_counter()
                 pcm = self._tts.synthesize(job.text, language=job.language)
                 if self._tts_stop_event.is_set() or self._tts_job_stale(job):
                     continue
                 if pcm:
+                    logger.info(
+                        f"[TTS] 耗时={(time.perf_counter() - t_tts) * 1000:.0f}ms "
+                        f"音频={len(pcm) / 32000:.1f}s"
+                    )
                     self._callbacks.on_audio(job.direction, pcm)
                 elif getattr(self._tts, "warming_up", False):
                     self._callbacks.on_status("正在下载 Kokoro…")
@@ -893,6 +1105,95 @@ class EconomyPipelineEngine:
                 logger.exception("Economy TTS job failed")
             finally:
                 self._tts_queue.task_done()
+
+    def _preview_loop(self) -> None:
+        while not self._stop_event.wait(_PREVIEW_TICK_S):
+            for direction in list(self._active):
+                try:
+                    self._preview_once(direction)
+                except Exception:
+                    logger.debug("Economy live preview failed", exc_info=True)
+
+    def _preview_once(self, direction: Direction) -> None:
+        """Show a provisional recognition + translation of the speech being captured.
+
+        It never commits anything: the regular chunk/commit path still produces the
+        final subtitle and TTS, and any newer chunk or commit discards this result.
+        """
+        # Committed work has priority; skip a round rather than compete for the CPU.
+        if self._worker_busy.is_set() or not self._queue.empty():
+            return
+        asr = self._asr_for(direction)
+        if not getattr(asr, "configured", False):
+            return
+        with self._preview_lock:
+            generation = self._preview_gen[direction]
+            chunk_seq = self._chunk_seq[direction]
+        state = self._preview_state.setdefault(direction, _PreviewState())
+        if state.generation != generation or state.chunk_seq != chunk_seq:
+            state = _PreviewState(generation=generation, chunk_seq=chunk_seq)
+            self._preview_state[direction] = state
+        audio = self._buffers[direction].snapshot()
+        now = time.monotonic()
+        if (
+            len(audio) < _PREVIEW_MIN_BYTES
+            or now - state.at < state.interval
+            or len(audio) - state.audio_len < _PREVIEW_STEP_BYTES
+        ):
+            return
+        source_lang, target_lang = self._langs_for(direction)
+        started = time.perf_counter()
+        text = asr.recognize(self._asr_audio_tail[direction] + audio, language=source_lang)
+        took = time.perf_counter() - started
+        state.at = time.monotonic()
+        state.audio_len = len(audio)
+        # Slow decoders (long audio, CPU Whisper) preview less often instead of lagging.
+        state.interval = min(_PREVIEW_MAX_INTERVAL_S, max(_PREVIEW_MIN_INTERVAL_S, 2.0 * took))
+        text = (text or "").strip()
+        if not text:
+            return
+        pending = self._pending_text.get(direction)
+        combined = self._join_recognized_text(
+            *_continue_text(pending.text if pending else "", text)
+        )
+        if not self._emit_preview(direction, generation, chunk_seq, source=combined):
+            return
+        if (
+            not self._preview_mt
+            or combined == state.translated_for
+            or self._worker_busy.is_set()
+            or getattr(self._mt, "warming_up", False)
+        ):
+            return
+        state.translated_for = combined
+        translated = self._translate_sentence(
+            combined, source_lang=source_lang, target_lang=target_lang
+        )
+        if translated:
+            self._emit_preview(direction, generation, chunk_seq, translated=translated)
+
+    def _emit_preview(
+        self,
+        direction: Direction,
+        generation: int,
+        chunk_seq: int,
+        *,
+        source: str | None = None,
+        translated: str | None = None,
+    ) -> bool:
+        with self._preview_lock:
+            if (
+                self._stop_event.is_set()
+                or direction not in self._active
+                or generation != self._preview_gen[direction]
+                or chunk_seq != self._chunk_seq[direction]
+            ):
+                return False
+            if source is not None:
+                self._callbacks.on_source_text(direction, source, False)
+            if translated is not None:
+                self._callbacks.on_translated_text(direction, translated, False)
+        return True
 
     @staticmethod
     def _join_recognized_text(previous: str, current: str) -> str:
@@ -955,7 +1256,7 @@ class EconomyPipelineEngine:
     def _buffer_recognized_text(self, job: _Job, text: str) -> None:
         pending = self._pending_text.get(job.direction)
         previous = pending.text if pending is not None else ""
-        combined = self._join_recognized_text(previous, text)
+        combined = self._join_recognized_text(*_continue_text(previous, text))
         if len(combined) > _PENDING_TEXT_MAX_CHARS:
             # Only reachable while MT is still loading: keep the newest speech bounded.
             combined = combined[-_PENDING_TEXT_MAX_CHARS:]
@@ -978,13 +1279,43 @@ class EconomyPipelineEngine:
         for direction, pending in list(self._pending_text.items()):
             if getattr(self._mt, "warming_up", False):
                 continue
-            if not force and not self._sentence_complete(direction, pending, now, base_pause_s):
+            if force or self._sentence_complete(direction, pending, now, base_pause_s):
+                self._pending_text.pop(direction, None)
+                # The overlap tail only belongs to the pending utterance. Keeping
+                # it after commit makes the next sentence start with old speech.
+                self._asr_audio_tail[direction] = b""
+                self._commit(direction, pending)
                 continue
-            self._pending_text.pop(direction, None)
-            # The overlap tail only belongs to the pending utterance. Keeping
-            # it after commit makes the next sentence start with old speech.
-            self._asr_audio_tail[direction] = b""
+            prefix = self._finished_prefix(pending.text)
+            if prefix is None:
+                continue
+            done, rest = prefix
+            # Sentences already followed by more speech are final; only the last may grow.
+            self._pending_text[direction] = replace(
+                pending, text=rest, pcm=b"", chunk_count=1, created_at=now
+            )
+            self._commit(direction, replace(pending, text=done, pcm=b"", chunk_count=1))
+
+    def _commit(self, direction: Direction, pending: _PendingText) -> None:
+        with self._preview_lock:
+            self._preview_gen[direction] += 1
+        self._worker_busy.set()
+        try:
             self._translate_stable_text(direction, pending)
+        finally:
+            self._worker_busy.clear()
+
+    def _finished_prefix(self, text: str) -> tuple[str, str] | None:
+        """Split ``text`` into its finished sentences and the trailing unfinished one."""
+        sentences = split_sentences(text, min_chars=self._sentence_min_chars)
+        if (
+            len(sentences) < 2
+            or not sentences[-2].rstrip().endswith(_TERMINAL_PUNCT)
+            or _ends_mid_sentence(sentences[-2])
+        ):
+            return None
+        joiner = " " if all(s.isascii() for s in sentences) else ""
+        return joiner.join(s.strip() for s in sentences[:-1]), sentences[-1].strip()
 
     def _sentence_complete(
         self, direction: Direction, pending: _PendingText, now: float, pause_s: float
@@ -996,7 +1327,8 @@ class EconomyPipelineEngine:
         that still waits for recognition. The time since the last ASR update is
         not a pause; it also grows while the next phrase is being spoken.
         """
-        if pending.text.rstrip().endswith(("。", "！", "？", ".", "!", "?")):
+        dangling = _ends_mid_sentence(pending.text)
+        if pending.text.rstrip().endswith(_TERMINAL_PUNCT) and not dangling:
             return now - pending.updated_at >= min(pause_s, 0.35)
         elapsed = now - pending.created_at
         max_wait_s = self._sentence_max_wait_ms / 1000.0
@@ -1015,8 +1347,9 @@ class EconomyPipelineEngine:
         quiet = now - last_pcm
         if elapsed >= max_wait_s:
             # Long sentence: settle for the next short breath between phrases.
-            return quiet >= 0.25
-        return quiet >= pause_s / 2
+            return quiet >= (pause_s if dangling else 0.25)
+        # A dramatic pause after "her ability to" is not the end of the sentence.
+        return quiet >= (pause_s * 1.5 if dangling else pause_s / 2)
 
     def _dedupe_committed(self, direction: Direction, text: str) -> str | None:
         """Drop a repeat of the last committed sentence; trim a re-heard leading tail.
@@ -1093,10 +1426,14 @@ class EconomyPipelineEngine:
         any_ok = False
         for index, sentence in enumerate(sentences):
             self._callbacks.on_source_text(direction, sentence, False)
+            t_mt = time.perf_counter()
             translated = self._translate_sentence(
                 sentence,
                 source_lang=pending.source_lang,
                 target_lang=pending.target_lang,
+            )
+            logger.info(
+                f"[MT] 耗时={(time.perf_counter() - t_mt) * 1000:.0f}ms 字数={len(sentence)}"
             )
             if self._stop_event.is_set():
                 return
@@ -1115,8 +1452,8 @@ class EconomyPipelineEngine:
             any_ok = True
             self._callbacks.on_translated_text(direction, translated, True)
             if pending.play_voice:
-                tts_text = ensure_terminal_punct(translated)
-                self._enqueue_tts(direction, tts_text, pending.target_lang)
+                for clause in _tts_clauses(ensure_terminal_punct(translated)):
+                    self._enqueue_tts(direction, clause, pending.target_lang)
 
         if not any_ok:
             self._rate_limited_warning("经济模式翻译失败（MT 无结果）")
@@ -1169,7 +1506,11 @@ class EconomyPipelineEngine:
         t_asr_s = time.perf_counter()
         overlap = self._asr_audio_tail[job.direction]
         asr_pcm = overlap + job.pcm
-        self._asr_audio_tail[job.direction] = asr_pcm[-_ASR_OVERLAP_BYTES:]
+        # After a real pause the next chunk starts a new phrase; re-hearing this one
+        # would glue an isolated "Why?" onto whatever is said a second later.
+        self._asr_audio_tail[job.direction] = (
+            asr_pcm[-_ASR_OVERLAP_BYTES:] if job.mid_speech else b""
+        )
         text = asr.recognize(asr_pcm, language=job.source_lang)
         if self._stop_event.is_set():
             return
@@ -1241,6 +1582,12 @@ class EconomyPipelineEngine:
             worker.join(timeout=2.0)
         if worker is None or not worker.is_alive():
             self._worker = None
+        preview = self._preview_worker
+        if preview is not None and preview.is_alive():
+            preview.join(timeout=2.0)
+        if preview is None or not preview.is_alive():
+            self._preview_worker = None
+        self._preview_state.clear()
         self._drain_queue()
 
     def _stop_tts_worker(self) -> None:

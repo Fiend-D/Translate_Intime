@@ -249,9 +249,18 @@ class AudioPlayer:
 
     def _playback_loop(self) -> None:
         while self._running:
+            # With echo cancellation listening, keep the device fed between segments:
+            # a drained buffer changes the output latency, and every new segment would
+            # make the canceller re-align (muting the capture) before it can cancel.
+            keep_alive = self.on_reference is not None and self._stream is not None
             try:
-                generation, data = self._queue.get(timeout=0.1)
+                if keep_alive:
+                    generation, data = self._queue.get_nowait()
+                else:
+                    generation, data = self._queue.get(timeout=0.1)
             except Empty:
+                if keep_alive:
+                    self._write_silence()
                 continue
             with self._state_lock:
                 self._queued_bytes = max(0, self._queued_bytes - len(data))
@@ -335,6 +344,29 @@ class AudioPlayer:
                     # the previous one, so the reference must re-anchor on its timestamp.
                     on_reference(reference[r0:r1], time.monotonic() + latency, underflowed)
         return True
+
+    def _write_silence(self) -> None:
+        """Write one chunk of silence (blocks at the device rate) and report it as reference."""
+        frames = np.zeros(
+            (max(1, int(self._device_sr * _WRITE_CHUNK_MS / 1000)), max(1, self._device_ch)),
+            dtype=np.float32,
+        )
+        with self._stream_lock:
+            stream = self._stream
+            if stream is None:
+                return
+            try:
+                underflowed = bool(stream.write(frames))
+                latency = _stream_latency(stream)
+            except Exception as exc:
+                logger.debug(f"Idle playback write failed: {exc}")
+                self._close_stream_locked()
+                return
+        on_reference = self.on_reference
+        if on_reference is not None:
+            with contextlib.suppress(Exception):
+                silence = np.zeros(_TTS_SR * _WRITE_CHUNK_MS // 1000, dtype=np.float32)
+                on_reference(silence, time.monotonic() + latency, underflowed)
 
     def _resolve_device(self) -> int | None:
         device = self.device_id

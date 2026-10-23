@@ -101,6 +101,99 @@ class HotkeyConfig(BaseModel):
     music_next: str = "<ctrl>+<alt>+<page_down>"
     music_toggle_sidebar: str = "<ctrl>+<alt>+b"
     dota_coach_ask: str = "<ctrl>+<alt>+k"
+    toggle_phrase_overlay: str = "<ctrl>+<alt>+q"
+    # Ctrl+Alt+F1..F7 switch virtual terminals on Linux, so phrases use Ctrl+Shift.
+    phrase_1: str = "<ctrl>+<shift>+<f1>"
+    phrase_2: str = "<ctrl>+<shift>+<f2>"
+    phrase_3: str = "<ctrl>+<shift>+<f3>"
+    phrase_4: str = "<ctrl>+<shift>+<f4>"
+    phrase_5: str = "<ctrl>+<shift>+<f5>"
+    phrase_6: str = "<ctrl>+<shift>+<f6>"
+    phrase_7: str = "<ctrl>+<shift>+<f7>"
+    phrase_8: str = "<ctrl>+<shift>+<f8>"
+    phrase_9: str = "<ctrl>+<shift>+<f9>"
+
+
+PHRASE_MAX_CHARS = 128
+DEFAULT_PHRASE_GROUP = "常用"
+
+
+def _new_phrase_id() -> str:
+    import uuid
+
+    return uuid.uuid4().hex[:12]
+
+
+class QuickPhrase(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(default_factory=_new_phrase_id)
+    text: str
+    translation: str = ""
+    # Language ``translation`` is in; a different target language re-translates.
+    translated_to: str = ""
+    auto_enter: bool = False
+
+    @field_validator("text", "translation", mode="before")
+    @classmethod
+    def _one_line(cls, value: Any) -> str:
+        return " ".join(str(value or "").split())
+
+    @field_validator("text")
+    @classmethod
+    def _clip_text(cls, value: str) -> str:
+        # Clip instead of rejecting so a hand-edited config still loads.
+        return value[:PHRASE_MAX_CHARS]
+
+    def output(self, *, translate: bool, bilingual: bool = False) -> str:
+        """Text typed into the target input box; bilingual is ``原文\n译文``."""
+        if not (translate and self.translation):
+            return self.text
+        return f"{self.text}\n{self.translation}" if bilingual else self.translation
+
+
+class QuickPhraseGroup(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = DEFAULT_PHRASE_GROUP
+    phrases: list[QuickPhrase] = Field(default_factory=list)
+
+
+class QuickPhraseSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    groups: list[QuickPhraseGroup] = Field(default_factory=lambda: [QuickPhraseGroup()])
+    # Translate new phrases into the mic target language and type the translation.
+    translate: bool = True
+    # With ``translate``: send the original and the translation on two lines.
+    bilingual: bool = False
+    current_group: str = DEFAULT_PHRASE_GROUP
+    show_overlay: bool = False
+    overlay_geometry: tuple[int, int, int, int] | None = None
+    overlay_locked: bool = False
+    font_size: int = Field(default=15, ge=10, le=40)
+    chip_opacity: float = Field(default=0.55, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _ensure_group(self) -> QuickPhraseSettings:
+        if not self.groups:
+            self.groups = [QuickPhraseGroup()]
+        if self.group(self.current_group) is None:
+            self.current_group = self.groups[0].name
+        return self
+
+    def group(self, name: str) -> QuickPhraseGroup | None:
+        return next((g for g in self.groups if g.name == name), None)
+
+    def active_group(self) -> QuickPhraseGroup:
+        return self.group(self.current_group) or self.groups[0]
+
+    def find(self, phrase_id: str) -> QuickPhrase | None:
+        for group in self.groups:
+            for phrase in group.phrases:
+                if phrase.id == phrase_id:
+                    return phrase
+        return None
 
 
 class AppConfigModel(BaseModel):
@@ -155,6 +248,7 @@ class AppConfigModel(BaseModel):
     economy_asr_mic_model: str = DEFAULT_MIC_ASR_MODEL
     economy_asr_game_model: str = DEFAULT_GAME_ASR_MODEL
     economy_mt_backend: Literal["auto", "nllb", "argos", "mymemory", "llm", "hymt"] = "nllb"
+    economy_hymt_model: Literal["hy-mt2-1.8b", "hy-mt2-7b"] = "hy-mt2-1.8b"
     # OpenAI-compatible chat endpoint for economy_mt_backend="llm"
     economy_llm_base_url: str = ""
     economy_llm_model: str = ""
@@ -191,6 +285,8 @@ class AppConfigModel(BaseModel):
     economy_sentence_pause_ms: int = Field(default=900, ge=300, le=3000)
     # Longest an unfinished sentence waits for a pause before it is translated anyway.
     economy_sentence_max_wait_ms: int = Field(default=7000, ge=1200, le=15000)
+    # Re-recognize and translate speech in progress about once a second (local backends only).
+    economy_live_preview: bool = True
     # 设备偏好: auto (自动检测) / cpu / cuda
     device_preference: Literal["auto", "cpu", "cuda"] = "auto"
     economy_utterance_silence_ms: int = Field(default=300, ge=50, le=5000)
@@ -205,13 +301,23 @@ class AppConfigModel(BaseModel):
     glossary: dict[str, str] = Field(default_factory=dict)
     subtitle_history_lines: int = Field(default=2, ge=0, le=40)
     show_original_in_overlay: bool = True
+    # One window for both channels, each caption tagged with its speaker
+    subtitle_merged: bool = True
+    # Locked overlays fade out after a few seconds without speech
+    subtitle_auto_hide: bool = True
     overlay_locked: dict[str, bool] = Field(default_factory=dict)
     theme_mode: ThemeKey = "system"
     status_panel_visible: bool = True
     hotkeys: HotkeyConfig = Field(default_factory=HotkeyConfig)
+    quick_phrases: QuickPhraseSettings = Field(default_factory=QuickPhraseSettings)
 
     music_folder: str = ""
     music_auto_next: bool = True
+    # "free": play until paused/stopped; "hold": play only while ``music_hold_key`` is held
+    music_play_mode: Literal["free", "hold"] = "free"
+    music_hold_key: str = ""
+    # Hold this long before playing so a tap of the key stays silent
+    music_hold_delay_ms: int = Field(default=300, ge=0, le=2000)
     show_advanced_devices: bool = False
     capture_backend: str = "auto"
     original_audio: Literal["duck", "mute", "mix"] = "duck"
@@ -325,7 +431,7 @@ class AppConfigModel(BaseModel):
             return {}
         if not isinstance(value, dict):
             raise ValueError("subtitle_window_positions must be a dict")
-        allowed = {"outbound", "inbound"}
+        allowed = {"outbound", "inbound", "merged"}
         invalid = set(value) - allowed
         if invalid:
             raise ValueError(f"Invalid window position keys: {', '.join(sorted(invalid))}")

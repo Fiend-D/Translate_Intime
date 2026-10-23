@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.engines.pipeline import kokoro_tts, sherpa_asr, sherpa_tts, whisper_asr
-from src.engines.pipeline.llm_mt import HYMT_DEFAULT_FILE, HYMT_DEFAULT_REPO, default_hymt_dir
+from src.engines.pipeline.llm_mt import default_hymt_dir, hymt_model
 from src.engines.pipeline.model_catalog import asr_option_by_id, nllb_option_by_id
 from src.engines.pipeline.nllb_mt import nllb_cache_dir
 from src.engines.pipeline.qwen_asr import QWEN_ASR_MODELS
@@ -64,8 +64,11 @@ def nllb_source(model_id: str) -> ModelSource:
     return _hf(title, model_id, nllb_cache_dir(model_id), option.download_mb if option else 0)
 
 
-def hymt_source() -> ModelSource:
-    return _hf(f"Hy-MT2 · {HYMT_DEFAULT_FILE}", HYMT_DEFAULT_REPO, default_hymt_dir(), 1133)
+def hymt_source(model_id: str | None = None) -> ModelSource:
+    model = hymt_model(model_id)
+    return _hf(
+        f"{model.label} · {model.filename}", model.repo_id, default_hymt_dir(), model.size_mb
+    )
 
 
 def kokoro_source() -> ModelSource:

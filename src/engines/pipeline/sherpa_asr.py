@@ -320,9 +320,16 @@ def _trim_trailing_silence(samples: np.ndarray, sample_rate: int) -> np.ndarray:
 #   - 实质字符 < 2 → 过滤 (如 "F." "啊.")
 #   - 单个英文单词 (无空格) 且 ≤4 字符 → 过滤 (如 "The." "No." "Yeah.")
 #     游戏噪点常是这种孤立短词; 真实语音至少是一个短语
+#     例外: _SHORT_UTTERANCES 里的疑问词/应答/口令单独成句也有意义 (如 "Why?")
 #   - 中文 ≥2 字 → 保留 (中文信息密度高, "你好" "谢谢" 都是有效输出)
 _PUNCT_ONLY_PATTERN = re.compile(r"^[\s。！？.!?，,、；;：:~～…—\-]+$")
 _CJK_PATTERN = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_SHORT_UTTERANCES = frozenset(
+    {
+        "why", "what", "who", "how", "when", "yes", "okay", "ok", "hi", "hey",
+        "help", "wait", "stop", "go", "run", "push", "back", "nice", "gg",
+    }
+)  # fmt: skip
 
 
 def _is_meaningless_output(text: str) -> bool:
@@ -348,6 +355,8 @@ def _is_meaningless_output(text: str) -> bool:
         return False
     # 纯英文/拉丁字符: 单个单词 (无空格) 且 ≤4 字符 → 噪点
     # 真实语音至少是短语 (含空格) 或较长单词
+    if letters.lower() in _SHORT_UTTERANCES:
+        return False
     return bool(" " not in stripped and len(letters) <= 4)
 
 

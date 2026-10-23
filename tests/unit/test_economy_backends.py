@@ -853,7 +853,7 @@ def test_committing_sentence_clears_asr_overlap_before_next_sentence(tmp_path, m
     now = 100.0
     monkeypatch.setattr("src.engines.pipeline.engine.time.monotonic", lambda: now)
     first_pcm = _pcm_ms(100)
-    job = _Job(Direction.OUTBOUND, first_pcm, "en", "zh", False)
+    job = _Job(Direction.OUTBOUND, first_pcm, "en", "zh", False, mid_speech=True)
     engine._process_job(job)
     assert engine._asr_audio_tail[Direction.OUTBOUND] == first_pcm
 
@@ -861,6 +861,21 @@ def test_committing_sentence_clears_asr_overlap_before_next_sentence(tmp_path, m
     engine._flush_stable_text()
 
     assert engine._asr_audio_tail[Direction.OUTBOUND] == b""
+
+
+def test_chunk_cut_at_a_pause_is_not_reheard_by_the_next_one(tmp_path):
+    from src.engines.pipeline.engine import _Job
+
+    asr = _MockAsr("")
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=asr,
+        mt=_MockMt("__echo__"),
+        tts=_MockTts(),
+    )
+    engine._process_job(_Job(Direction.INBOUND, _pcm_ms(600), "en", "zh", False))
+    assert engine._asr_audio_tail[Direction.INBOUND] == b""
 
 
 def test_stopping_last_direction_keeps_models_loaded_until_close(tmp_path):
@@ -1058,3 +1073,164 @@ def test_worker_survives_housekeeping_failure(tmp_path, monkeypatch):
     engine.close()
 
     assert calls >= 3
+
+
+def test_finished_sentences_commit_before_trailing_phrase(tmp_path, monkeypatch):
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=_MockAsr(),
+        mt=_MockMt("__echo__"),
+        tts=_MockTts(),
+    )
+    from src.engines.pipeline.engine import _Job
+
+    now = 100.0
+    monkeypatch.setattr("src.engines.pipeline.engine.time.monotonic", lambda: now)
+    job = _Job(Direction.INBOUND, _pcm_ms(100), "en", "zh", False)
+    engine._buffer_recognized_text(job, "First we check the settings. Then we push mid before")
+    # The speaker is still talking: the trailing phrase must keep waiting.
+    engine._last_pcm_at[Direction.INBOUND] = now
+    engine._flush_stable_text()
+
+    assert engine._mt.calls == ["First we check the settings."]
+    assert engine._pending_text[Direction.INBOUND].text == "Then we push mid before"
+
+
+def _preview_engine(tmp_path, asr, mt=None, **config):
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(
+            log_dir=str(tmp_path), translation_mode="economy", economy_asr_backend="local", **config
+        ),
+        callbacks=_callbacks(),
+        asr=asr,
+        mt=mt or _MockMt("__echo__"),
+        tts=_MockTts(),
+    )
+    engine._active.add(Direction.INBOUND)
+    engine._buffers[Direction.INBOUND].push(_pcm_ms(1200))
+    return engine
+
+
+def test_live_preview_shows_partial_without_committing(tmp_path):
+    engine = _preview_engine(tmp_path, _MockAsr("we push mid"))
+    from src.engines.pipeline.engine import _Job
+
+    job = _Job(Direction.INBOUND, _pcm_ms(100), "en", "zh", False)
+    engine._buffer_recognized_text(job, "Okay so")
+    engine._callbacks.on_source_text.reset_mock()
+
+    engine._preview_once(Direction.INBOUND)
+
+    engine._callbacks.on_source_text.assert_called_once_with(
+        Direction.INBOUND, "Okay so we push mid", False
+    )
+    engine._callbacks.on_translated_text.assert_called_once_with(
+        Direction.INBOUND, "T(Okay so we push mid)", False
+    )
+    assert engine._pending_text[Direction.INBOUND].text == "Okay so"
+    assert engine._buffers[Direction.INBOUND].has_audio
+    assert not engine._tts.calls
+
+
+def test_live_preview_waits_for_new_audio(tmp_path):
+    engine = _preview_engine(tmp_path, _MockAsr("hello there"))
+    engine._preview_once(Direction.INBOUND)
+    engine._preview_state[Direction.INBOUND].at = 0.0
+    engine._preview_once(Direction.INBOUND)
+
+    assert len(engine._asr_for(Direction.INBOUND).calls) == 1
+
+
+def test_live_preview_is_dropped_after_commit(tmp_path):
+    class _CommitDuringAsr(_MockAsr):
+        def recognize(self, pcm, *, language):
+            engine._preview_gen[Direction.INBOUND] += 1
+            return super().recognize(pcm, language=language)
+
+    engine = _preview_engine(tmp_path, _CommitDuringAsr("stale text"))
+    engine._preview_once(Direction.INBOUND)
+
+    engine._callbacks.on_source_text.assert_not_called()
+    engine._callbacks.on_translated_text.assert_not_called()
+
+
+def test_live_preview_yields_to_busy_worker(tmp_path):
+    engine = _preview_engine(tmp_path, _MockAsr("hello"))
+    engine._worker_busy.set()
+    engine._preview_once(Direction.INBOUND)
+
+    assert not engine._asr_for(Direction.INBOUND).calls
+
+
+def test_live_preview_skips_cloud_asr_and_cloud_mt(tmp_path):
+    def build(**config):
+        return EconomyPipelineEngine(
+            config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy", **config),
+            callbacks=_callbacks(),
+            asr=_MockAsr(),
+            mt=_MockMt(),
+            tts=_MockTts(),
+        )
+
+    assert not build(economy_asr_backend="qwen_flash")._preview_enabled
+    assert not build(economy_asr_backend="local", economy_live_preview=False)._preview_enabled
+    llm = build(economy_asr_backend="local", economy_mt_backend="llm")
+    assert llm._preview_enabled and not llm._preview_mt
+
+
+def test_chunk_cut_mid_sentence_is_not_a_sentence_end() -> None:
+    from src.engines.pipeline.engine import _continue_text, _ends_mid_sentence
+
+    assert _ends_mid_sentence("Despite her ability to.")
+    assert _ends_mid_sentence("She's first tied down when.")
+    assert _ends_mid_sentence("我们先去检查一下他的。")
+    assert not _ends_mid_sentence("She doesn't even try.")
+    assert not _ends_mid_sentence("我们先去检查一下。")
+
+    assert _continue_text("Despite her ability to.", "Break free, she doesn't try.") == (
+        "Despite her ability to",
+        "break free, she doesn't try.",
+    )
+    assert _continue_text("And when.", "I was young.") == ("And when", "I was young.")
+    assert _continue_text("She can't.", "Try.") == ("She can't.", "Try.")
+
+
+def test_dangling_chunk_joins_next_chunk_instead_of_committing(tmp_path, monkeypatch):
+    engine = EconomyPipelineEngine(
+        config=AppConfigModel(log_dir=str(tmp_path), translation_mode="economy"),
+        callbacks=_callbacks(),
+        asr=_MockAsr(),
+        mt=_MockMt("__echo__"),
+        tts=_MockTts(),
+    )
+    from src.engines.pipeline.engine import _Job
+
+    now = 100.0
+    monkeypatch.setattr("src.engines.pipeline.engine.time.monotonic", lambda: now)
+    job = _Job(Direction.INBOUND, _pcm_ms(100), "en", "zh", False)
+    engine._buffer_recognized_text(job, "Despite her ability to.")
+    engine._last_pcm_at[Direction.INBOUND] = 100.0
+    # A punctuated sentence would commit after 0.35 s and an unpunctuated one after
+    # a 0.45 s pause; a dangling one waits for the speaker to continue.
+    now = 100.8
+    engine._flush_stable_text()
+    assert not engine._mt.calls
+
+    engine._buffer_recognized_text(job, "Break free, she doesn't even try.")
+    now = 101.3
+    engine._flush_stable_text()
+    assert engine._mt.calls == ["Despite her ability to break free, she doesn't even try."]
+
+
+def test_long_translation_is_spoken_clause_by_clause() -> None:
+    from src.engines.pipeline.engine import _tts_clauses
+
+    assert _tts_clauses("她甚至没有尝试。") == ["她甚至没有尝试。"]
+    assert _tts_clauses("尽管她有能力挣脱绳子，她却连试都不试，因为她从小就被拴着。") == [
+        "尽管她有能力挣脱绳子，",
+        "她却连试都不试，",
+        "因为她从小就被拴着。",
+    ]
+    # A short tail is not spoken on its own.
+    assert _tts_clauses("我们现在必须马上去推中路，好吗？") == ["我们现在必须马上去推中路，好吗？"]

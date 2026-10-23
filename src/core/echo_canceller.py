@@ -360,6 +360,7 @@ class LoopbackEchoCanceller:
         self._anchors = reference.anchors
         self._unaligned = 0
         self._patience = int(1.5 * self._sr)
+        self._realign_muted = 0
 
     @property
     def converged(self) -> bool:
@@ -369,6 +370,11 @@ class LoopbackEchoCanceller:
     @property
     def lag_samples(self) -> int | None:
         return self._lag
+
+    def take_realign_muted_seconds(self) -> float:
+        """Capture muted while (re-)aligning since the last call; game speech there is lost."""
+        muted, self._realign_muted = self._realign_muted, 0
+        return muted / self._sr
 
     def process(self, pcm: bytes, end_time: float) -> AecResult:
         """Cancel our playback in a capture chunk; output may lag by up to ``hold``.
@@ -430,6 +436,7 @@ class LoopbackEchoCanceller:
             self._refit(end, recent=self._recent, strict=self._unaligned < self._patience)
             if not self._converged:
                 # Dropping our own speech beats feeding it to ASR.
+                self._realign_muted += n
                 silent = np.zeros(n, dtype=np.int16).tobytes()
                 return AecResult(silent, True, in_e, 0.0, False)
             self._since_fit = 0
@@ -456,6 +463,7 @@ class LoopbackEchoCanceller:
                 # a timeline anchor. Mute and re-align.
                 self._converged = False
                 self._unaligned = 0
+                self._realign_muted += n
                 return AecResult(silent, True, echo_e, resid_e, False)
             if resid_e < 0.01 * echo_e or self._explained(end, e) > 0.4:
                 # Leftover of our own speech: either faint, or still a filtered copy of

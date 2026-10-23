@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,40 @@ _SYSTEM_PROMPT = (
 HYMT_DEFAULT_REPO = "tencent/Hy-MT2-1.8B-GGUF"
 HYMT_DEFAULT_FILE = "Hy-MT2-1.8B-Q4_K_M.gguf"
 HYMT_DOWNLOAD_MB = 1133
+
+
+@dataclass(frozen=True)
+class HyMtModel:
+    id: str
+    repo_id: str
+    filename: str
+    size_mb: int
+    label: str
+    note: str
+
+
+HYMT_MODELS: tuple[HyMtModel, ...] = (
+    HyMtModel(
+        "hy-mt2-1.8b",
+        HYMT_DEFAULT_REPO,
+        HYMT_DEFAULT_FILE,
+        HYMT_DOWNLOAD_MB,
+        "Hy-MT2 1.8B（推荐）",
+        "约 1.1 GB；CPU 上每句约 1 秒，质量远好于 NLLB",
+    ),
+    HyMtModel(
+        "hy-mt2-7b",
+        "tencent/Hy-MT2-7B-GGUF",
+        "Hy-MT2-7B-Q4_K_M.gguf",
+        4625,
+        "Hy-MT2 7B（质量最好）",
+        "约 4.6 GB；需 8 GB 以上空闲内存，纯 CPU 每句 2–9 秒，建议有独显时用",
+    ),
+)
+
+
+def hymt_model(model_id: str | None) -> HyMtModel:
+    return next((m for m in HYMT_MODELS if m.id == model_id), HYMT_MODELS[0])
 
 
 def _lang(code: str) -> str:
@@ -318,6 +353,7 @@ class HyMtLocal:
         *,
         repo_id: str = HYMT_DEFAULT_REPO,
         filename: str = HYMT_DEFAULT_FILE,
+        download_mb: int = HYMT_DOWNLOAD_MB,
         model_dir: Path | None = None,
         device_preference: str = "auto",
         n_ctx: int = 2048,
@@ -325,6 +361,7 @@ class HyMtLocal:
     ) -> None:
         self._repo_id = repo_id
         self._filename = filename
+        self._download_mb = int(download_mb)
         self._model_dir = model_dir or default_hymt_dir()
         self._device_preference = (device_preference or "auto").lower()
         self._n_ctx = int(n_ctx)
@@ -412,7 +449,7 @@ class HyMtLocal:
                 self._model_dir,
                 label=f"Hy-MT2 翻译 · {self._filename}",
                 key=f"mt:{self._repo_id}/{self._filename}",
-                total_mb=HYMT_DOWNLOAD_MB,
+                total_mb=self._download_mb,
             )
         except Exception as exc:
             logger.warning(f"Hy-MT2 下载失败: {exc}")

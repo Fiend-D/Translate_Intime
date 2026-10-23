@@ -119,3 +119,45 @@ def test_audio_queued_after_stop_is_dropped(monkeypatch) -> None:  # noqa: ANN00
 
     assert player.queue_size == 0
     assert player.is_playing is False
+
+
+def test_idle_player_keeps_echo_reference_continuous(monkeypatch) -> None:  # noqa: ANN001
+    import time
+
+    import numpy as np
+
+    from src.core.echo_canceller import PlaybackReference
+
+    player = _player_without_device_query(monkeypatch)
+    player._device_sr = 16000
+    player._device_ch = 2
+    reference = PlaybackReference(sample_rate=16000)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    writes: list[tuple[int, ...]] = []
+
+    class _Stream:
+        active = True
+        latency = 0.05
+
+        def write(self, frames) -> bool:  # noqa: ANN001
+            writes.append(frames.shape)
+            clock["now"] += len(frames) / 16000
+            return False
+
+    player._stream = _Stream()
+    player.on_reference = reference.push
+    player.on_reference(np.ones(960, dtype=np.float32) * 0.1, 100.05, False)
+    anchors = reference.anchors
+
+    for _ in range(20):
+        player._write_silence()
+    player.on_reference(np.ones(960, dtype=np.float32) * 0.1, clock["now"] + 0.05, False)
+
+    assert writes[0] == (960, 2)
+    assert reference.anchors == anchors
+
+    # Without the idle writes the next segment lands after a gap and re-anchors.
+    clock["now"] += 1.2
+    player.on_reference(np.ones(960, dtype=np.float32) * 0.1, clock["now"] + 0.05, False)
+    assert reference.anchors == anchors + 1

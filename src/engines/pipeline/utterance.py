@@ -41,12 +41,19 @@ class UtteranceBuffer:
         self._buf = bytearray()
         self._lock = threading.RLock()
         self.last_push_at: float = 0.0
+        # The last flushed utterance hit ``max_ms`` while speech was still going.
+        self.cut_mid_speech = False
 
     @property
     def has_audio(self) -> bool:
         """Captured speech is waiting to be cut into an utterance."""
         with self._lock:
             return bool(self._buf)
+
+    def snapshot(self) -> bytes:
+        """Copy of the speech captured so far, without consuming it."""
+        with self._lock:
+            return bytes(self._buf)
 
     def _duration_ms(self) -> float:
         samples = len(self._buf) // 2
@@ -83,7 +90,9 @@ class UtteranceBuffer:
             duration = self._duration_ms()
             # Hard cap — always flush when we hit the absolute ceiling.
             if duration >= self._max_ms:
-                return self.flush()
+                out = self.flush()
+                self.cut_mid_speech = True
+                return out
             if self.last_push_at <= 0:
                 return None
             gap_ms = (time.monotonic() - self.last_push_at) * 1000.0
@@ -108,6 +117,7 @@ class UtteranceBuffer:
             out = bytes(self._buf)
             self._buf.clear()
             self.last_push_at = 0.0
+            self.cut_mid_speech = False
             return out
 
     def clear(self) -> None:

@@ -180,3 +180,51 @@ def test_typed_translate_and_transcripts_are_embedded_pages(window) -> None:
     assert window._pages.currentIndex() == mw._PAGE_TRANSCRIPTS
     assert window._transcript_panel.isVisibleTo(window)
     assert not hasattr(window, "_btn_unlock")
+
+
+def test_merged_overlay_serves_both_channels(window) -> None:
+    window._chk_subtitle_merged.setChecked(True)
+    game = window._ensure_overlay(Direction.INBOUND)
+    mic = window._ensure_overlay(Direction.OUTBOUND)
+    assert game is mic
+    assert game.key == "merged"
+    assert window._overlay_windows() == [game]
+
+    window._drop_overlay(Direction.INBOUND)
+    assert window._overlays == {Direction.OUTBOUND: game}
+    window._drop_overlay(Direction.OUTBOUND)
+    assert window._overlays == {}
+
+    window._chk_subtitle_merged.setChecked(False)
+    assert window._config.subtitle_merged is True  # waits for 保存
+    window._on_save()
+    assert window._ensure_overlay(Direction.INBOUND) is not window._ensure_overlay(
+        Direction.OUTBOUND
+    )
+    window._close_overlays()
+
+
+def test_phrase_hotkey_types_translation_of_nth_phrase(window, monkeypatch) -> None:
+    from src.models.config import QuickPhrase, QuickPhraseGroup, QuickPhraseSettings
+
+    settings = QuickPhraseSettings(
+        groups=[
+            QuickPhraseGroup(
+                phrases=[
+                    QuickPhrase(text="撤退", translation="Retreat", translated_to="en"),
+                    QuickPhrase(text="推中", auto_enter=True),
+                ]
+            )
+        ]
+    )
+    window._config = window._config.model_copy(update={"quick_phrases": settings})
+    typed: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        window._phrase_inserter,
+        "insert",
+        lambda text, *, press_enter=False: typed.append((text, press_enter)) or True,
+    )
+    window._send_phrase_slot(1)
+    window._send_phrase_slot(2)
+    window._send_phrase_slot(3)
+    assert typed == [("Retreat", False), ("推中", True)]

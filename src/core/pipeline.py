@@ -1135,6 +1135,11 @@ class TranslationPipeline(QObject):
         )
         if st.backend == "silero":
             msg += f" prob={st.speech_prob:.2f}"
+        if isinstance(self._aec_inbound, LoopbackEchoCanceller):
+            muted = self._aec_inbound.take_realign_muted_seconds()
+            if muted >= 0.05:
+                msg += f" · 回声消除对齐中静音 {muted:.1f}s"
+                logger.info(f"[AEC] 近5秒对齐中静音 {muted:.1f}s")
         if st.rms < 0.002:
             msg += " · 几乎无声，请确认「游戏声音」选的是正在播放视频的扬声器 Loopback"
         elif self._vad_pass_chunks == 0:

@@ -24,6 +24,7 @@ PINNED_REVISIONS: dict[str, str] = {
     "Qwen/Qwen3-ASR-0.6B-hf": "7f1569a48a89f3e3f4dc3a5c9d28bddd903bc76c",
     "Qwen/Qwen3-ASR-1.7B-hf": "bcd2b5b7f32b480ab5790554cfa8347f246a14f3",
     "tencent/Hy-MT2-1.8B-GGUF": "a0c709d9fac510f2c807aa3af52872340dc37a4a",
+    "tencent/Hy-MT2-7B-GGUF": "ab8472660ac61fac25f1af43fac2599d52a8a775",
 }
 
 

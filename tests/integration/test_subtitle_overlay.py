@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.gui.subtitle_overlay import SubtitleOverlay
+from src.gui.subtitle_overlay import Caption, SubtitleOverlay
 from src.models.enums import Direction
 
 
@@ -41,7 +41,9 @@ def test_next_caption_waits_for_reading_time(overlay, qtbot):
     assert overlay._live.isHidden()
 
     qtbot.waitUntil(lambda: overlay._translated.text() == "第二句", timeout=4000)
-    assert list(overlay._history) == [("a", "第一句话比较长需要时间读完")]
+    assert list(overlay._history) == [
+        Caption("a", "第一句话比较长需要时间读完", Direction.OUTBOUND)
+    ]
 
 
 def test_caption_shows_immediately_after_reading_time(overlay):
@@ -58,8 +60,8 @@ def test_backlog_overflow_skips_to_history(overlay):
         overlay.set_text("", f"line-{i}", is_final=True)
 
     assert overlay._translated.text() == "line-0"
-    assert list(overlay._queue) == [("", "line-5"), ("", "line-6"), ("", "line-7")]
-    assert [t for _o, t in overlay._history] == [f"line-{i}" for i in range(1, 5)]
+    assert [c.translated for c in overlay._queue] == ["line-5", "line-6", "line-7"]
+    assert [c.translated for c in overlay._history] == [f"line-{i}" for i in range(1, 5)]
 
 
 def test_reading_time_bounds():
@@ -96,13 +98,11 @@ def test_taller_window_shows_more_history(overlay, qtbot):
 
     overlay.setGeometry(50, 60, 480, 120)
     qtbot.wait(20)
-    short_text = overlay._history_label.text()
-    short_count = len([ln for ln in short_text.split("\n") if ln.strip()]) if short_text else 0
+    short_count = len(overlay._visible_history_entries())
 
     overlay.setGeometry(50, 60, 480, 420)
     qtbot.wait(20)
-    tall_text = overlay._history_label.text()
-    tall_count = len([ln for ln in tall_text.split("\n") if ln.strip()]) if tall_text else 0
+    tall_count = len(overlay._visible_history_entries())
 
     assert tall_count > short_count
     assert overlay._translated.text() == "line-11"
@@ -163,3 +163,54 @@ def test_menu_requests_route_through_callbacks(qtbot):
     w._request_opacity(0.15)
     assert fonts == [72]
     assert opacities == [0.15]
+
+
+def test_single_channel_overlay_has_no_speaker_tags(overlay):
+    overlay.set_text("a<b", "x & y", speaker=Direction.OUTBOUND)
+    assert overlay._translated.text() == "x &amp; y"
+    assert "我" not in overlay._translated.text()
+
+
+def test_merged_overlay_tags_each_speaker(qtbot):
+    w = SubtitleOverlay(None, history_lines=5)
+    qtbot.addWidget(w)
+    assert w.key == "merged"
+    w.set_text("Enemy mid", "中路有敌人", speaker=Direction.INBOUND)
+    assert "对方" in w._translated.text()
+    w._dwell_timer.stop()
+    w.set_text("收到", "Copy that", speaker=Direction.OUTBOUND)
+    assert "我" in w._translated.text()
+    assert "对方" in w._history_label.text()
+
+    w.set_text("push", "推", is_final=False, speaker=Direction.INBOUND)
+    w.set_text("wait", "等等", is_final=False, speaker=Direction.OUTBOUND)
+    live = w._live.text()
+    assert "推" in live and "等等" in live
+    w.clear_speaker(Direction.INBOUND)
+    assert "推" not in w._live.text()
+    assert "等等" in w._live.text()
+
+
+def test_locked_overlay_fades_when_idle_and_wakes_on_speech(qtbot):
+    w = SubtitleOverlay(None, locked=True)
+    qtbot.addWidget(w)
+    w.show()
+    w._idle_timer.setInterval(20)
+    w._fade.setDuration(10)
+    w.set_text("a", "第一句")
+    w._dwell_timer.stop()
+    w._wake()
+    qtbot.waitUntil(lambda: w.windowOpacity() < 0.05, timeout=2000)
+
+    w.set_text("b", "第二句")
+    assert w.windowOpacity() == 1.0
+
+
+def test_unlocked_overlay_never_fades(qtbot):
+    w = SubtitleOverlay(None, locked=False)
+    qtbot.addWidget(w)
+    w.set_text("a", "第一句")
+    assert not w._idle_timer.isActive()
+    w.set_locked(True)
+    w.set_auto_hide(False)
+    assert not w._idle_timer.isActive()

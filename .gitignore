@@ -8,6 +8,7 @@ checkpoints/
 *.bin
 *.onnx
 *.safetensors
+*.gguf
 *.part
 *.incomplete
 *.sha256
@@ -93,6 +94,8 @@ usage_data.json
 subtitles_*.txt
 archive_*.txt
 transcript_*.txt
+# Quick-phrase exports (bundled presets live in assets/phrases/)
+常用语-*.txt
 *.srt
 *.vtt
 # Device-specific user config copied into the repo
