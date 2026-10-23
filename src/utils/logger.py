@@ -122,7 +122,7 @@ class SubtitleLogger:
         if path.exists() and path.stat().st_size > 0:
             return
         header = (
-            f"# Translator InTime 翻译记录\n"
+            f"# 声渡 SoundFerry 翻译记录\n"
             f"# started: {datetime.now().isoformat(timespec='seconds')}\n"
             f"# format: [ISO8601] DIRECTION | ORIGINAL: … | TRANSLATED: …\n"
         )

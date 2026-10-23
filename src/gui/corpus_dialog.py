@@ -55,12 +55,14 @@ class CorpusDialog(QDialog):
 
         root.addWidget(QLabel("热词"))
         self._txt_hot = QTextEdit()
+        self._txt_hot.setAcceptRichText(False)
         self._txt_hot.setPlaceholderText("每行一个热词，例如：\n回防\nA点\nSmoke")
         self._txt_hot.setPlainText("\n".join(hotwords or []))
         root.addWidget(self._txt_hot, 1)
 
         root.addWidget(QLabel("术语 glossary"))
         self._txt_gloss = QTextEdit()
+        self._txt_gloss.setAcceptRichText(False)
         self._txt_gloss.setPlaceholderText("原文=译文\n回防=rotate\n中路=mid")
         lines = [f"{k}={v}" for k, v in (glossary or {}).items()]
         self._txt_gloss.setPlainText("\n".join(lines))

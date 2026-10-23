@@ -1,4 +1,4 @@
-# Translator InTime 后续功能补充设计文档
+# 声渡 SoundFerry 后续功能补充设计文档
 
 ## 1. 背景
 

@@ -1,4 +1,4 @@
-"""Application entry point for Translator InTime."""
+"""Application entry point for SoundFerry (声渡)."""
 
 import sys
 from pathlib import Path

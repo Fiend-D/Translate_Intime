@@ -262,7 +262,7 @@ class PhraseOverlay(QWidget):
         self._list.setContentsMargins(0, 0, 4, 0)
         self._list.setSpacing(4)
         self._list.addStretch(1)
-        self._empty = QLabel("还没有常用语\n在主面板「常用语」页添加")
+        self._empty = QLabel("还没有常用语\n在主面板「锦囊」页添加")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty.setStyleSheet("color: rgba(255,255,255,150); background: transparent;")
         self._list.insertWidget(0, self._empty)

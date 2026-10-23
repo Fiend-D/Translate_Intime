@@ -1,4 +1,4 @@
-# Translator InTime - Copilot Instructions
+# SoundFerry (声渡) - Copilot Instructions
 
 Cross-platform real-time bidirectional game voice translation desktop application.
 

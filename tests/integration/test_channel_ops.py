@@ -174,7 +174,7 @@ def test_typed_translate_and_transcripts_are_embedded_pages(window) -> None:
 
     window._nav_group_buttons.button(mw._PAGE_TYPED).click()
     assert window._pages.currentIndex() == mw._PAGE_TYPED
-    assert window._page_title.text() == "打字翻译"
+    assert window._page_title.text() == "书信"
 
     window._nav_group_buttons.button(mw._PAGE_TRANSCRIPTS).click()
     assert window._pages.currentIndex() == mw._PAGE_TRANSCRIPTS

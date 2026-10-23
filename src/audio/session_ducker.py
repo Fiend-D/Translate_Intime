@@ -41,7 +41,7 @@ _PACTL_TIMEOUT_SEC = 2.0
 # PipeWire's ALSA plugin sets no application.process.id, so our own TTS stream looks
 # like any other app; tag it to keep it out of ducking.
 SELF_STREAM_PROP = "translator_intime.self"
-_SELF_APP_NAME = "Translator InTime"
+_SELF_APP_NAME = "SoundFerry"
 
 
 def tag_own_audio_streams() -> None:

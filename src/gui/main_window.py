@@ -194,13 +194,13 @@ _LANG_LABELS = [
 ]
 
 _PAGE_TITLES = (
-    ("游戏字幕", "听游戏里的外语，实时显示中文字幕浮层"),
-    ("麦克风", "对着麦克风说话，实时译成外语，可播放到虚拟声卡进游戏"),
-    ("音乐分享", "选一个文件夹作曲库，把音乐播到虚拟声卡给队友听"),
+    ("渡入·听", "游戏字幕：听游戏里的外语，实时显示中文字幕浮层"),
+    ("渡出·说", "麦克风同传：对着麦克风说话，实时译成外语，可播放到虚拟声卡进游戏"),
+    ("点歌台", "音乐分享：选一个文件夹作曲库，把音乐播到虚拟声卡给队友听"),
     ("设置", "字幕外观、翻译引擎、推理设备与助手"),
-    ("打字翻译", "输入文字 → 翻译 → 朗读（独立通道，不影响同传）"),
-    ("翻译记录", "本地翻译留档：按会话查看、搜索并导出字幕"),
-    ("常用语", "点一下就输入到游戏聊天框，可自动翻译成外语"),
+    ("书信", "打字翻译：输入文字 → 翻译 → 朗读（独立通道，不影响同传）"),
+    ("航海日志", "翻译记录：按会话查看、搜索并导出字幕"),
+    ("锦囊", "常用语：点一下就输入到游戏聊天框，可自动翻译成外语"),
 )
 _PAGE_TYPED = 4
 _PAGE_TRANSCRIPTS = 5
@@ -337,7 +337,7 @@ class MainWindow(QMainWindow):
             message = f"配置文件无法读取，已使用默认设置：{self._config_load_error}"
             self._append_log(message)
             show_toast("配置文件损坏，已使用默认设置（原文件已备份）", ms=6000)
-        self._append_log("提示：语言/设备/VAD/密钥等需点「保存」后生效；字幕外观立即预览")
+        self._append_log("提示：设置修改后点右上角「保存」生效")
 
     # ------------------------------------------------------------------ UI
     def _setup_ui(self) -> None:
@@ -433,17 +433,17 @@ class MainWindow(QMainWindow):
 
         brand = QHBoxLayout()
         brand.setSpacing(10)
-        mark = QLabel("T")
+        mark = QLabel("渡")
         mark.setObjectName("logoMark")
         mark.setFixedSize(34, 34)
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand.addWidget(mark)
         names = QVBoxLayout()
         names.setSpacing(0)
-        title = QLabel("Translator")
+        title = QLabel("声渡")
         title.setObjectName("appTitle")
         names.addWidget(title)
-        subtitle = QLabel("InTime · 实时同传")
+        subtitle = QLabel("SoundFerry · 实时同传")
         subtitle.setObjectName("appSubtitle")
         names.addWidget(subtitle)
         brand.addLayout(names)
@@ -463,14 +463,14 @@ class MainWindow(QMainWindow):
             layout.addWidget(button)
 
         layout.addWidget(self._nav_group("同传"))
-        add_page("◉   游戏字幕", 0)
-        add_page("◎   麦克风", 1)
-        add_page("♪   音乐分享", 2)
+        add_page("◉   渡入·听", 0)
+        add_page("◎   渡出·说", 1)
+        add_page("♪   点歌台", 2)
 
         layout.addWidget(self._nav_group("工具"))
-        add_page("✎   打字翻译", _PAGE_TYPED)
-        add_page("☰   翻译记录", _PAGE_TRANSCRIPTS)
-        add_page("❝   常用语", _PAGE_PHRASES)
+        add_page("✎   书信", _PAGE_TYPED)
+        add_page("☰   航海日志", _PAGE_TRANSCRIPTS)
+        add_page("❝   锦囊", _PAGE_PHRASES)
         self._btn_adjust = self._nav_item(
             "▣   调整字幕",
             "显示字幕浮层并解除锁定，可拖拽 / 缩放 / 右键菜单。\n"
@@ -561,10 +561,8 @@ class MainWindow(QMainWindow):
         self._btn_save = QPushButton("保存")
         self._btn_save.setObjectName("accentButton")
         self._btn_save.setToolTip(
-            "保存设置到本地。\n"
-            "需保存后生效：语言、设备、语音输出、VAD/质量档位、原文闪避、"
-            "捕获方式、会话轮转、火山密钥/音色/语速、Dota 助手、曲库等。\n"
-            "立即生效：字幕字号/透明度/历史上限/显示原文、浮层显隐、主题。"
+            "保存设置到本地，所有设置保存后生效。\n"
+            "浮层上的拖动、锁定、滚轮调整和字幕显隐开关是即时的，不需要保存。"
         )
         self._btn_save.clicked.connect(self._on_save)
         layout.addWidget(self._btn_save)
@@ -1186,8 +1184,8 @@ class MainWindow(QMainWindow):
     # ── 常规 ────────────────────────────────────────────────────────────
     def _build_settings_general(self, page: QVBoxLayout) -> None:
         save_tip = QLabel(
-            "立即生效：字幕外观、浮层显隐、主题、识别/翻译模型。"
-            "其余设置点右上角「保存」后生效，未保存时切换页面或关闭窗口会提醒。"
+            "所有设置点右上角「保存」后生效，未保存时切换页面或关闭窗口会提醒。"
+            "浮层上的拖动、锁定、滚轮调整和字幕显隐开关是即时的。"
         )
         save_tip.setObjectName("fieldLabel")
         save_tip.setWordWrap(True)
@@ -1281,7 +1279,7 @@ class MainWindow(QMainWindow):
         eco.addWidget(self._lbl_engine_hint)
         layout.addWidget(self._economy_rows)
 
-        layout = self._settings_card(page, "字幕外观", desc="立即生效")
+        layout = self._settings_card(page, "字幕外观", desc="保存后生效")
         self._spn_font = QSpinBox()
         self._spn_font.setRange(12, 72)
         self._spn_font.setToolTip("默认窗口大小下的字号；拖大字幕窗口时文字按比例放大")
@@ -1315,7 +1313,7 @@ class MainWindow(QMainWindow):
         self._cmb_subtitle_font.addItem("默认字体", "")
         for family in QFontDatabase.families():
             self._cmb_subtitle_font.addItem(family, family)
-        self._cmb_subtitle_font.setToolTip("字幕浮层字体，立即生效")
+        self._cmb_subtitle_font.setToolTip("字幕浮层字体，保存后生效")
         self._cmb_subtitle_font.currentIndexChanged.connect(self._on_look_changed)
         self._chk_subtitle_follow_theme = QCheckBox("跟随主题")
         self._chk_subtitle_follow_theme.setChecked(True)
@@ -1642,7 +1640,7 @@ class MainWindow(QMainWindow):
 
         tip = QLabel(
             f"离线运行，首次使用时自动下载到 {model_resource_root()}。"
-            "识别和翻译模型更改后立即生效（运行中会停止通道）。"
+            "识别和翻译模型更改后点「保存」生效（运行中会停止通道）。"
         )
         tip.setObjectName("fieldLabel")
         tip.setWordWrap(True)

@@ -78,6 +78,8 @@ class TypedTranslatePanel(QWidget):
         root.addLayout(lang_row)
 
         self._input = QTextEdit()
+        # Pasted rich text keeps its source colour (often black on a dark theme).
+        self._input.setAcceptRichText(False)
         self._input.setPlaceholderText("在这里输入要翻译并朗读的内容…")
         self._input.setMinimumHeight(120)
         root.addWidget(self._input, 2)
