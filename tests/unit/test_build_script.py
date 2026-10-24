@@ -100,3 +100,37 @@ def test_install_dependencies_requires_lock(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="uv.lock"):
         build.install_dependencies()
+
+
+@pytest.mark.parametrize(
+    ("windows", "name", "present", "absent"),
+    [
+        (True, "SoundFerry.exe", "pynput.keyboard._win32", "pynput.keyboard._xorg"),
+        (False, "SoundFerry", "pynput.keyboard._xorg", "pynput.keyboard._win32"),
+    ],
+)
+def test_platform_specific_output_and_hidden_imports(
+    monkeypatch, windows: bool, name: str, present: str, absent: str
+) -> None:
+    monkeypatch.setattr(build, "_is_windows", lambda: windows)
+    monkeypatch.setattr(build, "module_available", lambda _name: True)
+    monkeypatch.setattr(build, "distribution_available", lambda _name: False)
+
+    command = build.build_command(debug=False, clean=False)
+    hidden = [command[i + 1] for i, arg in enumerate(command) if arg == "--hidden-import"]
+
+    assert build.executable_path().name == name
+    assert present in hidden and absent not in hidden
+    assert ("--icon" in command) is (windows and (build.ROOT / "assets/app_icon.ico").is_file())
+
+
+def test_windows_build_bundles_vc_runtime_next_to_the_exe(monkeypatch, tmp_path) -> None:
+    dll = tmp_path / "msvcp140.dll"
+    dll.write_bytes(b"dll")
+    monkeypatch.setattr(build, "_is_windows", lambda: True)
+    monkeypatch.setattr(build, "module_available", lambda _name: False)
+    monkeypatch.setattr(build, "msvc_runtime_dlls", lambda: [dll])
+
+    command = build.build_command(debug=False, clean=False)
+
+    assert f"{dll}{build.os.pathsep}." in command

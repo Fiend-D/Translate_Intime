@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the Windows SoundFerry executable with PyInstaller.
+"""Build the SoundFerry one-file executable (Windows .exe or Linux binary) with PyInstaller.
 
 Typical usage:
     python build.py --clean
@@ -50,18 +50,27 @@ HIDDEN_IMPORTS = (
     "dashscope.audio.tts_v2",
     "edge_tts",
     "google.protobuf",
-    "keyring.backends.Windows",
     "pyaudio",
-    "pycaw.pycaw",
-    "pynput.keyboard._win32",
-    "pynput.mouse._win32",
     "scipy.signal",
     "sentencepiece",
     "sounddevice",
     "soundfile",
     "tokenizers",
     "transformers.models.nllb.tokenization_nllb",
+)
+# pynput and keyring pick their backend at runtime, so PyInstaller cannot see it.
+WINDOWS_HIDDEN_IMPORTS = (
+    "keyring.backends.Windows",
+    "pycaw.pycaw",
+    "pynput.keyboard._win32",
+    "pynput.mouse._win32",
     "uiautomation",
+)
+LINUX_HIDDEN_IMPORTS = (
+    "keyring.backends.SecretService",
+    "pynput.keyboard._xorg",
+    "pynput.mouse._xorg",
+    "pynput.keyboard._uinput",
 )
 EXCLUDED_MODULES = ("jax", "matplotlib", "tensorflow", "torch")
 
@@ -79,6 +88,15 @@ def _venv_python() -> Path:
 
 def _is_windows() -> bool:
     return os.name == "nt"
+
+
+def executable_path() -> Path:
+    return DIST_DIR / (f"{APP_NAME}.exe" if _is_windows() else APP_NAME)
+
+
+def hidden_imports() -> tuple[str, ...]:
+    platform = WINDOWS_HIDDEN_IMPORTS if _is_windows() else LINUX_HIDDEN_IMPORTS
+    return HIDDEN_IMPORTS + platform
 
 
 def reexec_with_project_venv() -> None:
@@ -130,8 +148,8 @@ def install_dependencies() -> None:
 
 
 def validate_environment(*, allow_missing_pyinstaller: bool = False) -> None:
-    if os.name != "nt":
-        raise RuntimeError("EXE builds must run on Windows")
+    if not (_is_windows() or sys.platform.startswith("linux")):
+        raise RuntimeError("Builds run on Windows (SoundFerry.exe) or Linux (SoundFerry)")
     if not ENTRYPOINT.is_file():
         raise RuntimeError(f"Missing entry point: {ENTRYPOINT}")
     if not allow_missing_pyinstaller and not module_available("PyInstaller"):
@@ -151,6 +169,21 @@ def clean_outputs() -> None:
 def _add_data(command: list[str], source: Path, destination: str) -> None:
     if source.exists():
         command.extend(["--add-data", f"{source}{os.pathsep}{destination}"])
+
+
+def msvc_runtime_dlls() -> list[Path]:
+    """The VC++ runtime shipped inside the PyQt6 wheel.
+
+    onnxruntime, ctranslate2 and sherpa-onnx need msvcp140.dll next to them; PyInstaller
+    normally copies it from System32, but a Wine build only finds Wine's stand-ins there
+    and skips them, leaving the exe to depend on an installed VC++ redistributable.
+    """
+    spec = importlib.util.find_spec("PyQt6")
+    if spec is None or not spec.submodule_search_locations:
+        return []
+    qt_bin = Path(next(iter(spec.submodule_search_locations))) / "Qt6" / "bin"
+    patterns = ("msvcp140*.dll", "vcruntime140*.dll", "concrt140.dll")
+    return sorted({dll for pattern in patterns for dll in qt_bin.glob(pattern)})
 
 
 def build_command(*, debug: bool, clean: bool) -> list[str]:
@@ -176,8 +209,11 @@ def build_command(*, debug: bool, clean: bool) -> list[str]:
         command.append("--clean")
 
     icon = ROOT / "assets" / "app_icon.ico"
-    if icon.is_file():
+    if _is_windows() and icon.is_file():
         command.extend(["--icon", str(icon)])
+    if _is_windows():
+        for dll in msvc_runtime_dlls():
+            command.extend(["--add-binary", f"{dll}{os.pathsep}."])
 
     for name in DATA_DIRS:
         _add_data(command, ROOT / name, name)
@@ -199,7 +235,7 @@ def build_command(*, debug: bool, clean: bool) -> list[str]:
         # PyInstaller aborts the whole build on metadata of an uninstalled package.
         if distribution_available(distribution):
             command.extend(["--copy-metadata", distribution])
-    for module in HIDDEN_IMPORTS:
+    for module in hidden_imports():
         if module_available(module.split(".", 1)[0]):
             command.extend(["--hidden-import", module])
     for module in EXCLUDED_MODULES:
@@ -220,7 +256,7 @@ def write_checksum(executable: Path) -> Path:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build SoundFerry.exe with PyInstaller")
+    parser = argparse.ArgumentParser(description="Build the SoundFerry executable with PyInstaller")
     parser.add_argument("--clean", action="store_true", help="remove old build outputs first")
     parser.add_argument("--debug", action="store_true", help="keep a console window for logs")
     parser.add_argument(
@@ -254,7 +290,7 @@ def main() -> int:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     run(command)
 
-    executable = DIST_DIR / f"{APP_NAME}.exe"
+    executable = executable_path()
     if not executable.is_file():
         raise RuntimeError(f"PyInstaller completed but did not create {executable}")
     checksum = write_checksum(executable)
