@@ -50,7 +50,7 @@ def test_download_with_wrong_hash_is_rejected(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setattr(silero_vad, "_fetch", tampered)
 
     assert SileroVadEngine(model)._load() is False
-    assert len(fetched) == len(silero_vad.SILERO_VAD_URLS)
+    assert len(fetched) == len(silero_vad.silero_vad_urls())
     assert not model.exists()
     assert not model.with_name("silero_vad.onnx.part").exists()
 

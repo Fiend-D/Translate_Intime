@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 
 from src.engines.pipeline.model_catalog import asr_option_by_id
-from src.utils import hf_download
+from src.engines.pipeline.model_manifests import QWEN_ASR
 from src.utils.logger import logger
 
 _LOG_INTERVAL_SEC = 30.0
@@ -174,28 +174,20 @@ class QwenLocalAsr:
         return True
 
     def _ensure_files(self) -> bool:
-        if (self._cache_dir / "config.json").is_file() and any(
-            self._cache_dir.glob("*.safetensors")
-        ):
+        manifest = QWEN_ASR[self._repo_id]
+        if manifest.ready(self._cache_dir):
             return True
-        try:
-            import huggingface_hub  # noqa: F401
-        except ImportError:
-            logger.warning("缺少 huggingface_hub，无法下载 Qwen3-ASR")
-            return False
         option = asr_option_by_id(self._model_id)
         try:
-            hf_download.snapshot(
-                self._repo_id,
+            manifest.fetch(
                 self._cache_dir,
                 label=option.title if option else self._repo_id,
                 key=f"asr:{self._model_id}",
-                total_mb=option.download_mb if option else 0,
             )
         except Exception as exc:
             logger.warning(f"Qwen3-ASR 下载失败: {exc}")
             return False
-        return (self._cache_dir / "config.json").is_file()
+        return True
 
     def recognize(self, pcm: bytes, *, language: str) -> str | None:
         if not pcm or not self._started:

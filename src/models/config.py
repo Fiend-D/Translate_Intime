@@ -50,6 +50,7 @@ _CHOICE_FIELDS: dict[str, tuple[frozenset[str], str]] = {
     "capture_backend": (frozenset({"auto", "loopback"}), "auto"),
     "dota_coach_mode": (frozenset({"normal", "turbo"}), "normal"),
     "economy_tts_backend": (frozenset(TTS_BACKENDS), "kokoro"),
+    "model_mirror": (frozenset({"china", "global"}), "china"),
 }
 
 
@@ -262,6 +263,10 @@ class AppConfigModel(BaseModel):
     economy_tts_backend: TtsEngineId = "kokoro"
     economy_nllb_model: str = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
     economy_offline_setup_done: bool = False  # first-run offline model dialog completed
+    # Where local models are stored; empty uses the default per-user location.
+    model_dir: str = ""
+    # china: ModelScope / domestic mirrors first; global: Hugging Face / GitHub first.
+    model_mirror: Literal["china", "global"] = "china"
     economy_kokoro_voice_en: str = "af_bella"
     economy_kokoro_voice_zh: str = "zf_001"
     # Speech speed for every economy TTS engine (name kept for existing configs).
@@ -416,6 +421,7 @@ class AppConfigModel(BaseModel):
         "capture_backend",
         "dota_coach_mode",
         "economy_tts_backend",
+        "model_mirror",
         mode="before",
     )
     @classmethod

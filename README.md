@@ -97,6 +97,7 @@
 * 经济模式按停顿分句：句末标点或说话停顿后提交整句，长句最长等待约 7 秒，避免半句话被拆开翻译；
   停顿后的下一句不会和上一句拼在一起，单独一个词（如 "Why?"）也会单独翻译。
 * 本地模型首次使用需要下载，支持断点续传、失败重试与代理；云端服务失败时自动熔断回退。
+  安装版不需要额外配置环境，下载细节见下文「模型下载与存放」。
 * 热词、术语、语速、音色在开启通道时生效；改完后需重新开通道。
 
 火山引擎控制台：<https://console.volcengine.com/speech/new/overview?projectName=default>
@@ -222,8 +223,30 @@ python build.py --clean --debug  # 保留控制台窗口，便于排查启动错
 python build.py --dry-run        # 只查看 PyInstaller 命令
 ```
 
-ASR/NLLB 大模型不会打进单文件 EXE。打包版首次下载后会持久化到
-`%LOCALAPPDATA%\SoundFerry\resource`。也可以在 EXE 同级创建 `resource` 目录，作为便携模型目录。
+ASR/NLLB 大模型不会打进单文件 EXE，首次使用时下载，规则见下一节。
+
+## 模型下载与存放
+
+* **下载源**：「设置 → 本地模型 → 模型存储与下载」可选「国内优先」（默认）或「海外优先」，
+  其余下载源作为备用自动尝试，任何一个连不上或内容不符都会换下一个，断点在不同源之间续传。
+
+  | 模型 | 国内源 | 海外源 |
+  |---|---|---|
+  | SenseVoice、中英双语 Zipformer、Whisper、Qwen3-ASR、Hy-MT2 | ModelScope 魔搭 | Hugging Face |
+  | Kokoro 英文、Kokoro 中文词表 | ModelScope 魔搭 | GitHub / Hugging Face |
+  | Kokoro 中文模型、MeloTTS、Silero VAD | gh-proxy / ghfast 加速 | GitHub |
+  | NLLB 翻译、英文流式 Zipformer | 无（hf-mirror 目前会跳转回官方站） | Hugging Face |
+
+  每个文件都在 `src/engines/pipeline/model_manifests.py` 里记录了固定的大小和 SHA-256，
+  镜像返回的文件被篡改或不完整会被丢弃。设置了环境变量 `HF_ENDPOINT` 时，它总是第一个被尝试。
+* **存放目录**：同一处可以改「模型目录」，留空使用默认位置：
+  * 开发环境：项目内 `resource/`
+  * 安装版：`%LOCALAPPDATA%\SoundFerry\resource`（Linux 为 `~/.cache/SoundFerry/resource`）；
+    若 EXE 同级存在 `resource` 目录，则作为便携模型目录优先使用
+  * 环境变量 `SOUNDFERRY_RESOURCE_DIR` 优先级最高，主要用于测试
+* 改目录后已下载的模型不会自动搬迁，可把旧目录中的 `asr`、`nllb`、`mt`、`tts` 文件夹复制过去。
+* 安装版不包含 llama.cpp 和 PyTorch，因此 Hy-MT2 与 Qwen3-ASR 选项会显示为不可用；
+  在源码环境安装 `llama-cpp-python` / `torch` 后可用。
 
 ## License
 

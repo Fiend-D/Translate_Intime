@@ -19,8 +19,8 @@ from typing import Any
 
 import httpx
 
+from src.engines.pipeline.model_manifests import HYMT
 from src.engines.pipeline.mt import MtBackend
-from src.utils import hf_download
 from src.utils.circuit_breaker import CircuitBreaker
 from src.utils.logger import logger
 
@@ -437,19 +437,15 @@ class HyMtLocal:
         if not self._auto_download:
             logger.warning(f"Hy-MT2 模型不存在且禁用下载: {self.model_path}")
             return False
-        try:
-            import huggingface_hub  # noqa: F401
-        except ImportError:
-            logger.warning("缺少 huggingface_hub，无法下载 Hy-MT2")
+        manifest = HYMT.get(self._repo_id)
+        if manifest is None:
+            logger.warning(f"未知的 Hy-MT2 仓库 {self._repo_id}，无法下载")
             return False
         try:
-            hf_download.single_file(
-                self._repo_id,
-                self._filename,
+            manifest.fetch(
                 self._model_dir,
                 label=f"Hy-MT2 翻译 · {self._filename}",
                 key=f"mt:{self._repo_id}/{self._filename}",
-                total_mb=self._download_mb,
             )
         except Exception as exc:
             logger.warning(f"Hy-MT2 下载失败: {exc}")

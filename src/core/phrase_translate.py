@@ -27,6 +27,7 @@ _MT_FIELDS = (
     "economy_llm_api_key",
     "economy_mt_device",
     "device_preference",
+    "model_dir",
 )
 
 

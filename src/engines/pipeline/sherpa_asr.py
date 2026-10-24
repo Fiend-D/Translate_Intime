@@ -15,114 +15,23 @@ from __future__ import annotations
 import re
 import threading
 import time
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
 
 import numpy as np
 
-from src.utils import download_progress
-from src.utils.file_integrity import matches_sha256
-from src.utils.http_download import fetch_resumable
+from src.engines.pipeline.model_manifests import SHERPA_ASR
 from src.utils.logger import logger
+from src.utils.model_fetch import RepoManifest
 from src.utils.resource_paths import model_resource_root
 
-_CACHE_ROOT = model_resource_root() / "asr"
 _LOG_INTERVAL_SEC = 30.0
 # Silence fed after each streaming utterance (sherpa-onnx examples use 0.66 s).
 _STREAMING_TAIL_PADDING = np.zeros(int(0.66 * 16000), dtype=np.float32)
-_CHUNK = 1024 * 256
-
-# HuggingFace 镜像源, 与 nllb_mt.py 保持一致 (优先 hf-mirror.com)
-_HF_HOSTS = (
-    "https://hf-mirror.com",
-    "https://huggingface.co",
-)
-
-# 各模型文件的最低体积 (字节)。小于该值视为未下完/损坏。
-# 数值取自官方 HF Content-Length 的约 95%, 允许镜像轻微差异。
-_MIN_FILE_BYTES: dict[str, dict[str, int]] = {
-    "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20": {
-        "encoder-epoch-99-avg-1.int8.onnx": 170_000_000,
-        "decoder-epoch-99-avg-1.int8.onnx": 12_000_000,
-        "joiner-epoch-99-avg-1.int8.onnx": 3_000_000,
-        "tokens.txt": 40_000,
-    },
-    "sherpa-onnx-streaming-zipformer-en-2023-06-26": {
-        "encoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx": 65_000_000,
-        "decoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx": 1_200_000,
-        "joiner-epoch-99-avg-1-chunk-16-left-64.int8.onnx": 200_000,
-        "tokens.txt": 4_000,
-    },
-    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17": {
-        "model.int8.onnx": 200_000_000,
-        "tokens.txt": 100_000,
-    },
-}
-
-_FILE_SHA256: dict[str, dict[str, str]] = {
-    "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20": {
-        "encoder-epoch-99-avg-1.int8.onnx": "8fa764187a261844f859d7143ebaa563af5d10adfece4c18a8f414c88cba2a9b",
-        "decoder-epoch-99-avg-1.int8.onnx": "1a70c593d71e53f023f5f55b0b4cfff5055abb786ee3992e5f63dc2e273cc4fa",
-        "joiner-epoch-99-avg-1.int8.onnx": "1ed689c5ed19dbaa725d9d191bb4822b5f4855a39e1ffd28cbc1f340d25b2ee0",
-        "tokens.txt": "a8e0e4ec53810e433789b54a5c0134a7eaa2ffca595a6334d54c00da858841d3",
-    },
-    "sherpa-onnx-streaming-zipformer-en-2023-06-26": {
-        "encoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx": "0d072fd4ef956294ba9db9e9a71a541ac70659095ec4934c8453d8b2fe740187",
-        "decoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx": "98da299f471e38bb4e1a8df579b8cc9122d6039576a77e357b3c60f17dd83b02",
-        "joiner-epoch-99-avg-1-chunk-16-left-64.int8.onnx": "d944208d660d67c8d72cd2acaeac971fa5ceb8c80e76c1968148846fedd6e297",
-        "tokens.txt": "49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb",
-    },
-    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17": {
-        "model.int8.onnx": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51",
-        "tokens.txt": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
-    },
-}
 
 
-def _hf_urls(repo: str, fname: str) -> list[str]:
-    """生成 HF resolve URL 列表, 镜像优先."""
-    return [f"{h.rstrip('/')}/{repo}/resolve/main/{fname}" for h in _HF_HOSTS]
-
-
-def _looks_like_onnx(path: Path) -> bool:
-    """粗检 ONNX protobuf 头 (含量化模型的 onnx.quantize 标记)."""
-    try:
-        with path.open("rb") as f:
-            head = f.read(64)
-    except OSError:
-        return False
-    if len(head) < 16:
-        return False
-    # 常见: IR version protobuf + producer_name "onnx..." / "onnx.quantize"
-    return b"onnx" in head
-
-
-def _file_ok(path: Path, *, min_bytes: int = 1, expected_sha256: str | None = None) -> bool:
-    if not path.is_file():
-        return False
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return False
-    if size < min_bytes:
-        return False
-    if expected_sha256 and not matches_sha256(path, expected_sha256):
-        return False
-    return not (path.suffix == ".onnx" and not _looks_like_onnx(path))
-
-
-def _purge_model_files(info: dict[str, Any], cache_dir: Path) -> None:
-    """删除缓存中的模型文件 (含 .part), 以便强制重下."""
-    for fname in info.get("files", {}).values():
-        for candidate in (cache_dir / fname, cache_dir / f"{fname}.part"):
-            try:
-                if candidate.exists():
-                    candidate.unlink()
-                    logger.info(f"已删除损坏/不完整 ASR 文件: {candidate}")
-            except OSError as exc:
-                logger.warning(f"无法删除 {candidate}: {exc}")
+def _manifest(model_id: str) -> RepoManifest:
+    return SHERPA_ASR[model_id]
 
 
 # ---- 流式模型注册表 -------------------------------------------------------
@@ -207,7 +116,7 @@ def model_slug(model_id: str) -> str:
 
 
 def sherpa_cache_dir(model_id: str) -> Path:
-    return _CACHE_ROOT / model_slug(model_id)
+    return model_resource_root() / "asr" / model_slug(model_id)
 
 
 def list_local_asr_model_ids() -> list[str]:
@@ -595,26 +504,14 @@ class SherpaOnnxAsr:
             return False
 
         cache_dir = sherpa_cache_dir(model_id)
-        if not self._ensure_files(info, cache_dir):
+        if not self._ensure_files(model_id, info, cache_dir):
             return False
 
-        provider = self._resolve_provider()
-
-        # 加载失败且像损坏模型时, 清缓存重下一次再试
-        for attempt in range(2):
-            ok, exc = self._init_recognizer(lang_key, info, cache_dir, provider)
-            if ok:
-                return True
-            corrupt = exc is not None and _is_corrupt_model_error(exc)
-            if attempt == 0 and corrupt and self._auto_download:
-                logger.warning(f"sherpa-onnx 模型疑似损坏 ({lang_key}): {exc}；将重新下载")
-                _purge_model_files(info, cache_dir)
-                if not self._download_model(info, cache_dir):
-                    return False
-                continue
+        # Files already passed the pinned SHA-256 check; re-downloading cannot help.
+        ok, exc = self._init_recognizer(lang_key, info, cache_dir, self._resolve_provider())
+        if not ok:
             logger.warning(f"sherpa-onnx Recognizer 初始化失败 ({lang_key}): {exc}")
-            return False
-        return False
+        return ok
 
     def _init_recognizer(
         self,
@@ -725,110 +622,21 @@ class SherpaOnnxAsr:
             logger.warning("用户选择了 CUDA 但 onnxruntime 无 CUDA provider，回退 CPU")
         return "cpu"
 
-    def _ensure_files(self, info: dict[str, Any], cache_dir: Path) -> bool:
-        if self._files_ready(info, cache_dir):
+    def _ensure_files(self, model_id: str, info: dict[str, Any], cache_dir: Path) -> bool:
+        manifest = _manifest(model_id)
+        if manifest.ready(cache_dir):
             return True
         if not self._auto_download:
             logger.warning(f"本地 ASR 模型缺失且禁用下载: {cache_dir}")
             return False
-        # Files that fail the size/SHA check are replaced one by one; .part files resume.
-        return self._download_model(info, cache_dir)
-
-    def _files_ready(self, info: dict[str, Any], cache_dir: Path) -> bool:
-        if not cache_dir.is_dir():
+        try:
+            # Files failing the size/SHA check are replaced one by one; .part files resume.
+            manifest.fetch(
+                cache_dir,
+                label=str(info.get("title") or model_id),
+                key=f"asr:{model_id}",
+            )
+        except Exception as exc:
+            logger.warning(f"本地 ASR 模型下载失败（{model_id}）: {exc}")
             return False
-        mins = _MIN_FILE_BYTES.get(cache_dir.name, {})
-        hashes = _FILE_SHA256.get(cache_dir.name, {})
-        for fname in info["files"].values():
-            path = cache_dir / fname
-            min_bytes = mins.get(fname, 1)
-            if not _file_ok(path, min_bytes=min_bytes, expected_sha256=hashes.get(fname)):
-                return False
         return True
-
-    def _download_model(self, info: dict[str, Any], cache_dir: Path) -> bool:
-        from src.utils.proxy_env import prepare_model_download_env, use_proxy_for_downloads
-
-        prepare_model_download_env()
-        trust_env = use_proxy_for_downloads()
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        repo = info["repo"]
-        files = info["files"]
-        mins = _MIN_FILE_BYTES.get(cache_dir.name, {})
-        hashes = _FILE_SHA256.get(cache_dir.name, {})
-
-        for role, fname in files.items():
-            target = cache_dir / fname
-            min_bytes = mins.get(fname, 1)
-            expected_sha256 = hashes.get(fname)
-            if _file_ok(target, min_bytes=min_bytes, expected_sha256=expected_sha256):
-                continue
-            key = f"asr:{cache_dir.name}:{fname}"
-            title = str(info.get("title") or cache_dir.name)
-            download_progress.begin(key, f"{title} · {fname}", dest=target)
-            if target.exists():
-                with suppress(OSError):
-                    target.unlink()
-            last_exc: Exception | None = None
-            for url in _hf_urls(repo, fname):
-                try:
-                    logger.info(f"正在下载本地 ASR: {url}")
-                    download_progress.set_source(key, url)
-                    self._download_url(
-                        url,
-                        target,
-                        min_bytes=min_bytes,
-                        expected_sha256=expected_sha256,
-                        progress_key=key,
-                        trust_env=trust_env,
-                    )
-                    last_exc = None
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    logger.warning(f"本地 ASR 镜像失败（{url}）: {exc}")
-                    # The .part file is kept: the next mirror resumes the same bytes.
-                    with suppress(OSError):
-                        target.unlink(missing_ok=True)
-            download_progress.finish(key, ok=last_exc is None, error=str(last_exc or ""))
-            if last_exc is not None:
-                logger.warning(f"本地 ASR 文件下载失败: {role}={fname}: {last_exc}")
-                return False
-        if not self._files_ready(info, cache_dir):
-            logger.warning(f"本地 ASR 下载后校验未通过: {cache_dir}")
-            return False
-        logger.info(f"本地 ASR 模型已保存: {cache_dir}")
-        return True
-
-    @staticmethod
-    def _download_url(
-        url: str,
-        target: Path,
-        *,
-        min_bytes: int = 1,
-        expected_sha256: str | None = None,
-        progress_key: str | None = None,
-        trust_env: bool = True,
-    ) -> None:
-        """断点续传下载，并校验最小体积 / SHA-256 / ONNX 头."""
-        tmp = target.with_suffix(target.suffix + ".part")
-        fetch_resumable(url, tmp, progress_key=progress_key, trust_env=trust_env)
-        if not _file_ok(tmp, min_bytes=min_bytes, expected_sha256=expected_sha256):
-            size = tmp.stat().st_size if tmp.exists() else 0
-            tmp.unlink(missing_ok=True)
-            raise URLError(f"下载文件校验失败: size={size} min={min_bytes} path={tmp.name}")
-        tmp.replace(target)
-
-
-def _is_corrupt_model_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    keys = (
-        "protobuf parsing failed",
-        "invalid_protobuf",
-        "failed to load",
-        "load model from",
-        "onnxruntime",
-        "invalid model",
-        "corrupt",
-    )
-    return any(k in msg for k in keys)

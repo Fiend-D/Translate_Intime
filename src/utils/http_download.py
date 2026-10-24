@@ -54,6 +54,8 @@ def fetch_resumable(
     *,
     attempts: int = 4,
     progress_key: str | None = None,
+    progress_offset: int = 0,
+    progress_total: int | None = None,
     trust_env: bool = True,
 ) -> None:
     """Download ``url`` into ``dest``, resuming with Range after dropped connections.
@@ -61,7 +63,8 @@ def fetch_resumable(
     A partial ``dest`` left by an earlier call (or another mirror of the same asset)
     is continued rather than restarted. Server errors (5xx/429) and short bodies are
     retried; a non-file answer (other 4xx, HTML error page) raises without touching
-    the partial file.
+    the partial file. ``progress_offset``/``progress_total`` report this file as part
+    of a larger multi-file download.
     """
     for attempt in range(1, attempts + 1):
         offset = dest.stat().st_size if dest.exists() else 0
@@ -101,7 +104,11 @@ def fetch_resumable(
                         fh.write(chunk)
                         written += len(chunk)
                         if progress_key:
-                            download_progress.update(progress_key, written, total)
+                            download_progress.update(
+                                progress_key,
+                                progress_offset + written,
+                                progress_total or total,
+                            )
                 if total is not None and written < total:
                     raise _RetryableError(f"连接提前结束（{written}/{total}）")
             return

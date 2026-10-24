@@ -9,14 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from src.engines.pipeline.model_catalog import nllb_option_by_id
-from src.utils import hf_download
+from src.engines.pipeline.model_manifests import NLLB
 from src.utils.logger import logger
 from src.utils.resource_paths import model_resource_root
 
 DEFAULT_NLLB_MODEL = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
 TOKENIZER_ID = "facebook/nllb-200-distilled-600M"
-# Development uses project-local resources; packaged builds use a persistent cache.
-_CACHE_ROOT = model_resource_root() / "nllb"
 _LICENSE_NOTE = "NLLB-200 许可证为 CC-BY-NC（非商业研究用途）。请仅在合规场景下使用。"
 _LANG_MAP = {
     "zh": "zho_Hans",
@@ -55,7 +53,7 @@ def model_slug(model_id: str) -> str:
 
 
 def nllb_cache_dir(model_id: str) -> Path:
-    return _CACHE_ROOT / model_slug(model_id)
+    return model_resource_root() / "nllb" / model_slug(model_id)
 
 
 class NllbCt2Mt:
@@ -318,42 +316,40 @@ class NllbCt2Mt:
         return False
 
     def _ensure_model_files(self) -> bool:
-        if self._model_files_ready():
+        manifest = NLLB.get(self._model_id)
+        if manifest is not None and manifest.ready(self._cache_dir):
             return True
-        if self._cache_dir.is_dir() and any(self._cache_dir.iterdir()):
-            logger.info("NLLB 模型不完整（缺少 model.bin），将重新下载")
-        if not self._auto_download:
-            logger.warning(f"NLLB 模型目录为空且禁用下载: {self._cache_dir}")
+        if manifest is None or not self._auto_download:
+            # A model the user placed there by hand cannot be checked against a manifest.
+            if self._model_files_ready():
+                return True
+            if manifest is None:
+                logger.warning(f"未知的 NLLB 模型 {self._model_id}，请在设置中选择列表里的模型")
+            else:
+                logger.warning(f"NLLB 模型缺失且禁用下载: {self._cache_dir}")
             return False
         return self._download_model()
 
     def _download_model(self) -> bool:
-        try:
-            import huggingface_hub  # noqa: F401
-        except ImportError:
-            logger.warning("缺少 huggingface_hub，无法下载 NLLB；请 pip install huggingface_hub")
+        manifest = NLLB.get(self._model_id)
+        if manifest is None:
+            logger.warning(f"未知的 NLLB 模型 {self._model_id}，无法下载")
             return False
         option = nllb_option_by_id(self._model_id)
         try:
-            hf_download.snapshot(
-                self._model_id,
+            manifest.fetch(
                 self._cache_dir,
                 label=f"NLLB 翻译 · {option.title if option else self._model_id}",
                 key=f"mt:{self._model_id}",
-                total_mb=option.download_mb if option else 0,
             )
         except Exception as exc:
+            logger.warning(f"NLLB 模型下载失败: {exc}")
             err = str(exc).lower()
             if "socks" in err or "proxy" in err:
                 logger.warning(
                     "代理相关失败提示: 请改用 Clash HTTP 端口 "
-                    "(http://127.0.0.1:7890)，或 pip install PySocks"
-                    "；或取消 TRANSLATOR_INTIME_USE_PROXY 以直连下载"
+                    "(http://127.0.0.1:7890)；或取消 TRANSLATOR_INTIME_USE_PROXY 以直连下载"
                 )
             # 保留用户选择的模型，等下次重试或网络恢复后重新下载。
             return False
-        if self._model_files_ready():
-            logger.info(f"NLLB 模型已保存: {self._cache_dir}")
-            return True
-        logger.warning(f"NLLB 模型下载后不完整: {self._cache_dir}")
-        return False
+        return True

@@ -18,20 +18,24 @@ import numpy as np
 from src.utils import download_progress
 from src.utils.file_integrity import matches_sha256
 from src.utils.logger import logger
+from src.utils.model_fetch import github_urls, ordered_urls
 from src.utils.resource_paths import bundled_path, model_resource_root
 
-SILERO_VAD_URLS = [
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
-    "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
-    "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
-]
-SILERO_VAD_URL = SILERO_VAD_URLS[0]
+SILERO_VAD_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+)
 SILERO_VAD_SHA256 = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
 _BUNDLED_MODEL_PATH = bundled_path("resource", "vad", "silero_vad.onnx")
-_PERSISTENT_MODEL_PATH = model_resource_root() / "vad" / "silero_vad.onnx"
-DEFAULT_MODEL_PATH = (
-    _BUNDLED_MODEL_PATH if _BUNDLED_MODEL_PATH.is_file() else _PERSISTENT_MODEL_PATH
-)
+
+
+def silero_vad_urls() -> list[str]:
+    return ordered_urls(github_urls(SILERO_VAD_URL))
+
+
+def default_model_path() -> Path:
+    if _BUNDLED_MODEL_PATH.is_file():
+        return _BUNDLED_MODEL_PATH
+    return model_resource_root() / "vad" / "silero_vad.onnx"
 
 
 _DOWNLOAD_TIMEOUT_SECONDS = 30
@@ -58,7 +62,7 @@ class SileroVadEngine:
         sample_rate: int = 16000,
         download_url: str = SILERO_VAD_URL,
     ) -> None:
-        self.model_path = Path(model_path) if model_path is not None else DEFAULT_MODEL_PATH
+        self.model_path = Path(model_path) if model_path is not None else default_model_path()
         self.sample_rate = sample_rate
         self.download_url = download_url
         self._session: Any | None = None
@@ -160,7 +164,7 @@ class SileroVadEngine:
         def _hook(blocks: int, block_size: int, total: int) -> None:
             download_progress.update(key, blocks * block_size, total if total > 0 else None)
 
-        for url in SILERO_VAD_URLS:
+        for url in silero_vad_urls():
             try:
                 logger.info(f"Silero VAD 模型缺失，尝试下载: {url}")
                 download_progress.set_source(key, url)

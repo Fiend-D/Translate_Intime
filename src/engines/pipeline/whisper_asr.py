@@ -6,7 +6,7 @@ faster-whisper 是基于 CTranslate2 的 Whisper 实现, 比原版快 4 倍以�
 - 多语言: 中英文准确识别, 不会误识别为韩文等
 - int8 量化: CPU 上 5 秒音频约 1-2 秒处理
 
-模型缓存在项目内 resource/asr/whisper/, 复用 huggingface_hub 下载.
+模型缓存在项目内 resource/asr/whisper/, 按 model_manifests 中固定的文件清单多源下载.
 """
 
 from __future__ import annotations
@@ -18,21 +18,11 @@ from typing import Any
 
 import numpy as np
 
-from src.utils import hf_download
+from src.engines.pipeline.model_manifests import WHISPER
 from src.utils.logger import logger
 from src.utils.resource_paths import model_resource_root
 
-_CACHE_ROOT = model_resource_root() / "asr" / "whisper"
 _LOG_INTERVAL_SEC = 30.0
-
-# Files faster-whisper needs from a Systran/faster-whisper-* repo
-_WHISPER_FILES = [
-    "config.json",
-    "preprocessor_config.json",
-    "model.bin",
-    "tokenizer.json",
-    "vocabulary.*",
-]
 
 # 模型注册表: model_id → whisper 模型大小 + 元信息
 # faster-whisper 模型大小: tiny / base / small / medium / large-v3
@@ -61,7 +51,7 @@ _MODEL_REGISTRY: dict[str, dict[str, Any]] = {
 def whisper_cache_dir(model_id: str) -> Path:
     info = _MODEL_REGISTRY.get(model_id)
     size = info["whisper_size"] if info else "medium"
-    return _CACHE_ROOT / size
+    return model_resource_root() / "asr" / "whisper" / size
 
 
 def list_whisper_model_ids() -> list[str]:
@@ -264,7 +254,8 @@ class FasterWhisperAsr:
             f"compute={compute_type} cache={cache_dir}"
         )
         local_dir = cache_dir / f"faster-whisper-{self._whisper_size}"
-        if not (local_dir / "model.bin").is_file():
+        manifest = WHISPER[self._whisper_size]
+        if not manifest.ready(local_dir):
             try:
                 # Caches made by older versions used faster-whisper's own HF cache layout
                 self._model = WhisperModel(
@@ -276,13 +267,10 @@ class FasterWhisperAsr:
                 )
             except Exception:
                 info = _MODEL_REGISTRY.get(self._model_id, {})
-                hf_download.snapshot(
-                    f"Systran/faster-whisper-{self._whisper_size}",
+                manifest.fetch(
                     local_dir,
                     label=str(info.get("title") or self._model_id),
                     key=f"asr:{self._model_id}",
-                    total_mb=int(info.get("download_mb", 0)),
-                    allow_patterns=_WHISPER_FILES,
                 )
         if self._model is None:
             self._model = WhisperModel(str(local_dir), device=device, compute_type=compute_type)

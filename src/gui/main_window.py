@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib.util
 import shutil
 import sys
 import threading
@@ -25,6 +26,7 @@ from PyQt6.QtGui import (
     QIcon,
     QPainter,
     QPixmap,
+    QStandardItemModel,
     QTextCursor,
 )
 from PyQt6.QtWidgets import (
@@ -91,6 +93,7 @@ from src.engines.pipeline.model_sources import (
     silero_source,
     source_tooltip,
 )
+from src.engines.pipeline.qwen_asr import QWEN_ASR_MODELS
 from src.gui.music_sidebar import MusicSidebarOverlay
 from src.gui.phrase_overlay import PhraseOverlay
 from src.gui.settings_dirty import wire_dirty_tracking
@@ -207,6 +210,17 @@ _PAGE_TRANSCRIPTS = 5
 _PAGE_PHRASES = 6
 
 
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _missing_runtime(name: str) -> str:
+    return f"安装版未包含 {name}" if getattr(sys, "frozen", False) else f"未安装 {name}"
+
+
 class MainWindow(QMainWindow):
     """Control panel: config only; lyrics overlays carry live subtitles."""
 
@@ -223,6 +237,7 @@ class MainWindow(QMainWindow):
             logger.error(f"Configuration load failed; preserving stored credentials: {exc}")
             self._config = AppConfigModel()
             self._config_load_error = str(exc)
+        self._apply_model_storage()
 
         self._theme: ThemeKey = self._config.theme_mode
         self._active_theme = resolve_theme(self._theme)
@@ -1019,6 +1034,42 @@ class MainWindow(QMainWindow):
     def _asr_combo_source(combo: QComboBox) -> ModelSource | None:
         return asr_source(str(combo.currentData() or ""))
 
+    def _on_browse_model_dir(self) -> None:
+        from src.utils.resource_paths import model_resource_root
+
+        start = self._txt_model_dir.text().strip() or str(model_resource_root())
+        folder = QFileDialog.getExistingDirectory(self, "选择模型目录", start)
+        if folder:
+            self._txt_model_dir.setText(str(Path(folder)))
+
+    def _model_dir_draft(self) -> str:
+        if not hasattr(self, "_txt_model_dir"):
+            return self._config.model_dir
+        return self._txt_model_dir.text().strip()
+
+    @staticmethod
+    def _check_model_dir(value: str) -> None:
+        """Reject a model folder that cannot be created or written before it is saved."""
+        if not value:
+            return
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise ValueError(f"模型目录请填写完整路径：{value}")
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".soundferry-write-test"
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError as exc:
+            raise ValueError(f"模型目录无法写入：{path}（{exc}）") from exc
+
+    def _apply_model_storage(self) -> None:
+        from src.utils.model_fetch import set_mirror_preference
+        from src.utils.resource_paths import set_model_dir
+
+        set_model_dir(self._config.model_dir)
+        set_mirror_preference(self._config.model_mirror)
+
     def _open_model_folder(self, path: Path) -> None:
         # Not downloaded yet: open the nearest existing parent so the user sees where it goes.
         target = path if path.is_dir() else path.parent
@@ -1245,6 +1296,8 @@ class MainWindow(QMainWindow):
             "Hy-MT2：腾讯混元翻译 GGUF，型号（1.8B / 7B）在「本地模型」页选，需 pip install llama-cpp-python。\n"
             "保存后重新开启通道生效。"
         )
+        if not _module_available("llama_cpp"):
+            self._disable_combo_item(self._cmb_mt_backend, "hymt", _missing_runtime("llama.cpp"))
         self._cmb_mt_backend.currentIndexChanged.connect(self._refresh_settings_usage)
         self._form_row(eco, "翻译", self._cmb_mt_backend)
 
@@ -1636,15 +1689,41 @@ class MainWindow(QMainWindow):
             format_kokoro_info,
             format_option_label,
         )
-        from src.utils.resource_paths import model_resource_root
+        from src.utils.resource_paths import default_model_resource_root
 
-        tip = QLabel(
-            f"离线运行，首次使用时自动下载到 {model_resource_root()}。"
-            "识别和翻译模型更改后点「保存」生效（运行中会停止通道）。"
+        layout = self._settings_card(
+            page,
+            "模型存储与下载",
+            kind="local",
+            desc="本地模型离线运行，首次使用时自动下载。每个文件都按固定的 SHA-256 校验，"
+            "某个下载源连不上或内容不符时自动换下一个。"
+            "识别和翻译模型更改后点「保存」生效（运行中会停止通道）。",
         )
-        tip.setObjectName("fieldLabel")
-        tip.setWordWrap(True)
-        page.addWidget(tip)
+        self._txt_model_dir = QLineEdit()
+        self._txt_model_dir.setPlaceholderText(f"默认：{default_model_resource_root()}")
+        self._txt_model_dir.setToolTip(
+            "模型下载和读取的位置，留空使用默认目录。\n"
+            "可以选空间大的磁盘；改目录后已下载的模型不会自动搬过去，"
+            "可把旧目录里的 asr / nllb / mt / tts 文件夹整体复制过去，免得重新下载。"
+        )
+        browse = QPushButton("选择…")
+        browse.setObjectName("ghostButton")
+        browse.clicked.connect(self._on_browse_model_dir)
+        reset = QPushButton("默认")
+        reset.setObjectName("ghostButton")
+        reset.setToolTip("清空，恢复默认目录")
+        reset.clicked.connect(self._txt_model_dir.clear)
+        self._form_row(layout, "模型目录", self._txt_model_dir, browse, reset)
+        self._cmb_model_mirror = QComboBox()
+        self._prep_combo(self._cmb_model_mirror)
+        self._cmb_model_mirror.addItem("国内优先：ModelScope 魔搭 / 国内加速", "china")
+        self._cmb_model_mirror.addItem("海外优先：Hugging Face / GitHub", "global")
+        self._cmb_model_mirror.setToolTip(
+            "决定先试哪个下载源，其余的仍作为备用自动尝试。\n"
+            "国内网络选「国内优先」；能直连 Hugging Face / GitHub 时选「海外优先」更快。\n"
+            "NLLB 翻译和英文 Zipformer 没有国内源，只能从 Hugging Face 下载。"
+        )
+        self._form_row(layout, "下载源", self._cmb_model_mirror)
 
         self._download_card = self._card()
         self._download_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
@@ -1685,6 +1764,9 @@ class MainWindow(QMainWindow):
             for opt in ASR_OPTIONS:
                 if opt.id != "windows-live-captions":
                     combo.addItem(format_option_label(opt), opt.id)
+            if not _module_available("torch"):
+                for qwen_id in QWEN_ASR_MODELS:
+                    self._disable_combo_item(combo, qwen_id, _missing_runtime("PyTorch"))
             combo.setToolTip(tip_text)
             self._form_row(layout, label_text, combo)
             self._model_source_row(layout, functools.partial(self._asr_combo_source, combo))
@@ -1954,6 +2036,19 @@ class MainWindow(QMainWindow):
         frame.setObjectName("card")
         frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         return frame
+
+    @staticmethod
+    def _disable_combo_item(combo: QComboBox, value: str, reason: str) -> None:
+        """Grey out an option whose runtime is missing, saying why instead of failing later."""
+        index = combo.findData(value)
+        if index < 0:
+            return
+        model = combo.model()
+        item = model.item(index) if isinstance(model, QStandardItemModel) else None
+        if item is not None:
+            item.setEnabled(False)
+        combo.setItemText(index, f"{combo.itemText(index)}（{reason}）")
+        combo.setItemData(index, reason, Qt.ItemDataRole.ToolTipRole)
 
     @staticmethod
     def _prep_combo(combo: QComboBox) -> None:
@@ -2473,6 +2568,9 @@ class MainWindow(QMainWindow):
                 getattr(cfg, "device_preference", "auto") or "auto",
             )
             self._cmb_device_pref.blockSignals(False)
+        if hasattr(self, "_txt_model_dir"):
+            self._txt_model_dir.setText(cfg.model_dir)
+            self._select_combo_data(self._cmb_model_mirror, cfg.model_mirror)
         if hasattr(self, "_cmb_nllb_model"):
             self._cmb_nllb_model.blockSignals(True)
             self._select_combo_data(
@@ -2656,6 +2754,8 @@ class MainWindow(QMainWindow):
         previous = self._config
         try:
             updated = self._collect_config_from_ui()
+            if updated.model_dir != previous.model_dir:
+                self._check_model_dir(updated.model_dir)
             if persist:
                 cleared = {
                     field
@@ -2683,6 +2783,7 @@ class MainWindow(QMainWindow):
             "economy_asr_mic_model",
             "economy_asr_game_model",
             "device_preference",
+            "model_dir",
         }
     )
     _OVERLAY_LOOK_FIELDS = frozenset(
@@ -2709,6 +2810,16 @@ class MainWindow(QMainWindow):
             self._theme = cfg.theme_mode
             self._apply_theme()
             self._append_log(f"主题已切换为「{self._cmb_theme.currentText()}」")
+        if changed & {"model_dir", "model_mirror"}:
+            self._apply_model_storage()
+            self._refresh_model_sources()
+        if "model_dir" in changed:
+            from src.utils.resource_paths import model_resource_root
+
+            self._append_log(
+                f"模型目录已改为 {model_resource_root()}；"
+                "已下载的模型不会自动搬过去，可把旧目录内容复制过来以免重新下载"
+            )
         engine = {name: getattr(cfg, name) for name in changed & self._ENGINE_RELOAD_FIELDS}
         if "translation_mode" in changed:
             self._apply_translation_mode({**engine, "translation_mode": cfg.translation_mode})
@@ -2860,6 +2971,12 @@ class MainWindow(QMainWindow):
                     and self._cmb_nllb_model.currentData()
                     and self._cmb_nllb_model.currentData() != self._config.economy_nllb_model
                 )
+            ),
+            model_dir=self._model_dir_draft(),
+            model_mirror=(
+                self._cmb_model_mirror.currentData()
+                if hasattr(self, "_cmb_model_mirror")
+                else self._config.model_mirror
             ),
             economy_sentence_min_chars=int(
                 getattr(self._config, "economy_sentence_min_chars", 4) or 4

@@ -39,6 +39,12 @@ def cached_sha256(path: Path) -> str:
     return digest
 
 
+def remember_sha256(path: Path, digest: str) -> None:
+    """Record an already-verified digest so the next check skips re-hashing ``path``."""
+    with contextlib.suppress(OSError):
+        _sidecar(path).write_text(f"{_stamp(path)} {digest}\n", encoding="ascii")
+
+
 def matches_sha256(path: Path, expected: str | Collection[str], *, cache: bool = True) -> bool:
     if not path.is_file():
         return False

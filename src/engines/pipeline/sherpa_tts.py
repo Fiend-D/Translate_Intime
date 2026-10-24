@@ -19,6 +19,7 @@ from src.utils.file_integrity import matches_sha256
 from src.utils.http_download import DownloadError
 from src.utils.http_download import fetch_resumable as _fetch_resumable
 from src.utils.logger import logger
+from src.utils.model_fetch import github_urls, ordered_urls
 from src.utils.proxy_env import use_proxy_for_downloads
 from src.utils.resource_paths import model_resource_root
 
@@ -26,7 +27,6 @@ _TARGET_SR = 16000
 _LOG_INTERVAL_SEC = 30.0
 MELO_MODEL = "vits-melo-tts-zh_en"
 _RELEASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models"
-_MIRRORS = ("https://gh-proxy.com/", "", "https://ghfast.top/")
 _RULE_FSTS = ("phone.fst", "date.fst", "number.fst")
 _ARCHIVE_SHA256 = {
     MELO_MODEL: "e58351ed7149f290a54534538badd4077cdbe6fddc964b24d0bee870415d1514",
@@ -68,8 +68,7 @@ def _download_archive(name: str, root: Path) -> bool:
     root.mkdir(parents=True, exist_ok=True)
     key = f"tts:{name}"
     download_progress.begin(key, f"MeloTTS · {name}", dest=root / name)
-    for mirror in _MIRRORS:
-        url = f"{mirror}{_RELEASE}/{name}.tar.bz2"
+    for url in ordered_urls(github_urls(f"{_RELEASE}/{name}.tar.bz2")):
         keep_partial = False
         try:
             logger.info(f"下载 TTS 模型: {url}")

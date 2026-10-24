@@ -21,7 +21,8 @@ from src.utils.audio_utils import float32_to_pcm16, resample
 from src.utils.file_integrity import matches_sha256
 from src.utils.http_download import fetch_resumable
 from src.utils.logger import logger
-from src.utils.resource_paths import model_resource_root
+from src.utils.model_fetch import github_urls, huggingface_urls, modelscope_url, ordered_urls
+from src.utils.resource_paths import default_model_resource_root, model_resource_root
 
 _TARGET_SR = 16000
 _LEGACY_CACHE_ROOT = Path.home() / ".cache" / "translator_intime" / "kokoro"
@@ -29,12 +30,13 @@ _LEGACY_CACHE_ROOT = Path.home() / ".cache" / "translator_intime" / "kokoro"
 
 def kokoro_cache_root() -> Path:
     """``resource/tts/kokoro`` like other models; keep using a completed legacy cache."""
-    if (_LEGACY_CACHE_ROOT / "kokoro-v1.0.onnx").is_file():
+    root = model_resource_root()
+    legacy_ok = root == default_model_resource_root()
+    if legacy_ok and (_LEGACY_CACHE_ROOT / "kokoro-v1.0.onnx").is_file():
         return _LEGACY_CACHE_ROOT
-    return model_resource_root() / "tts" / "kokoro"
+    return root / "tts" / "kokoro"
 
 
-_CACHE_ROOT = kokoro_cache_root()
 _LOG_INTERVAL_SEC = 30.0
 _INTER_SENTENCE_SILENCE_MS = 120
 _DOWNLOAD_CHUNK_BYTES = 1024 * 256
@@ -51,49 +53,51 @@ _FILE_SHA256: dict[str, str | tuple[str, ...]] = {
     "config-v1.1-zh.json": "bc333efa5ce4ceff433c8c8e5d027a1eca0166001e4e4a62bea2d26ff7a46890",
 }
 
-_GH_MIRRORS = (
-    "https://gh-proxy.com/https://github.com",
-    "https://github.com",
-    # Has cut transfers off mid-file and blacklists some release assets.
-    "https://ghfast.top/https://github.com",
-)
-
-
-def _mirror(url: str) -> list[str]:
-    """Return mirrored download URLs for GitHub release assets."""
-    marker = "https://github.com"
-    if not url.startswith(marker):
-        return [url]
-    suffix = url[len(marker) :]
-    out: list[str] = []
-    for m in _GH_MIRRORS:
-        out.append(m.rstrip("/") + suffix)
-    return out
-
-
-# English / multilingual v1.0
-_EN_MODEL_URLS = _mirror(
-    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
-    "model-files-v1.0/kokoro-v1.0.onnx"
-)
-_EN_VOICES_URLS = _mirror(
-    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
-)
-# Chinese v1.1-zh
-_ZH_MODEL_URLS = _mirror(
-    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
-    "model-files-v1.1/kokoro-v1.1-zh.onnx"
-)
-_ZH_VOICES_URLS = _mirror(
-    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
-    "model-files-v1.1/voices-v1.1-zh.bin"
-)
+_RELEASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download"
 # The zh model's zhuyin vocab; kokoro-onnx's built-in v1.0 vocab drops nearly every phoneme.
+_ZH_VOCAB_REPO = "hexgrad/Kokoro-82M-v1.1-zh"
 _ZH_VOCAB_REVISION = "01e7505bd6a7a2ac4975463114c3a7650a9f7218"
-_ZH_VOCAB_URLS = [
-    f"{host}/hexgrad/Kokoro-82M-v1.1-zh/resolve/{_ZH_VOCAB_REVISION}/config.json"
-    for host in ("https://hf-mirror.com", "https://huggingface.co")
-]
+
+
+def _release_urls(asset: str, *modelscope: tuple[str, str]) -> list[str]:
+    """A GitHub release asset plus byte-identical ModelScope copies (repo, path)."""
+    return ordered_urls(
+        [
+            *(modelscope_url(repo, path) for repo, path in modelscope),
+            *github_urls(f"{_RELEASE}/{asset}"),
+        ]
+    )
+
+
+def _en_model_urls() -> list[str]:
+    return _release_urls(
+        "model-files-v1.0/kokoro-v1.0.onnx", ("aistoy/kokoro-onnx-v_1_0", "kokoro-v1.0.onnx")
+    )
+
+
+def _en_voices_urls() -> list[str]:
+    return _release_urls(
+        "model-files-v1.0/voices-v1.0.bin", ("aistoy/kokoro-onnx-v_1_0", "voices-v1.0.bin")
+    )
+
+
+def _zh_model_urls() -> list[str]:
+    return _release_urls("model-files-v1.1/kokoro-v1.1-zh.onnx")
+
+
+def _zh_voices_urls() -> list[str]:
+    return _release_urls("model-files-v1.1/voices-v1.1-zh.bin")
+
+
+def _zh_vocab_urls() -> list[str]:
+    return ordered_urls(
+        [
+            modelscope_url(_ZH_VOCAB_REPO, "config.json"),
+            modelscope_url("AI-ModelScope/Kokoro-82M-v1.1-zh", "config.json"),
+            *huggingface_urls(_ZH_VOCAB_REPO, "config.json", _ZH_VOCAB_REVISION),
+        ]
+    )
+
 
 DEFAULT_VOICE_EN = "af_bella"
 DEFAULT_VOICE_ZH = "zf_001"
@@ -122,7 +126,7 @@ class KokoroOnnxTts:
         auto_download: bool = True,
         device_preference: str = "auto",
     ) -> None:
-        self._cache_dir = Path(cache_dir) if cache_dir else _CACHE_ROOT
+        self._cache_dir = Path(cache_dir) if cache_dir else kokoro_cache_root()
         self._voice_en = (voice_en or DEFAULT_VOICE_EN).strip() or DEFAULT_VOICE_EN
         self._voice_zh = (voice_zh or DEFAULT_VOICE_ZH).strip() or DEFAULT_VOICE_ZH
         self._speed = float(max(0.7, min(1.3, speed)))
@@ -318,15 +322,15 @@ class KokoroOnnxTts:
             zh_voices = self._cache_dir / "voices-v1.1-zh.bin"
             zh_vocab = self._cache_dir / "config-v1.1-zh.json"
 
-            if not self._ensure_file(en_model, _EN_MODEL_URLS):
+            if not self._ensure_file(en_model, _en_model_urls()):
                 return False
-            if not self._ensure_file(en_voices, _EN_VOICES_URLS):
+            if not self._ensure_file(en_voices, _en_voices_urls()):
                 return False
 
             # Best-effort Chinese assets (optional).
-            zh_ok = self._ensure_file(zh_model, _ZH_MODEL_URLS, required=False)
-            zh_ok = zh_ok and self._ensure_file(zh_voices, _ZH_VOICES_URLS, required=False)
-            zh_ok = zh_ok and self._ensure_file(zh_vocab, _ZH_VOCAB_URLS, required=False)
+            zh_ok = self._ensure_file(zh_model, _zh_model_urls(), required=False)
+            zh_ok = zh_ok and self._ensure_file(zh_voices, _zh_voices_urls(), required=False)
+            zh_ok = zh_ok and self._ensure_file(zh_vocab, _zh_vocab_urls(), required=False)
 
             try:
                 kokoro_en = Kokoro(str(en_model), str(en_voices))
@@ -442,10 +446,9 @@ class KokoroOnnxTts:
                 expected_sha256 and not matches_sha256(tmp, expected_sha256, cache=False)
             ):
                 tmp.unlink(missing_ok=True)
-                # Mirrors proxy the same asset; another full download would fail the same way.
                 last_exc = URLError(f"SHA-256 mismatch for {path.name}")
-                logger.warning(f"Kokoro 校验失败（{url}），不再尝试其他镜像")
-                break
+                logger.warning(f"Kokoro 校验失败（{url}），换下一个下载源")
+                continue
             tmp.replace(path)
             logger.info(f"Kokoro 已保存: {path}")
             download_progress.finish(key, ok=True)

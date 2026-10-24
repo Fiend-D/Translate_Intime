@@ -93,7 +93,7 @@ def test_partial_download_continues_on_next_mirror(tmp_path, monkeypatch) -> Non
     assert not (tmp_path / "voices-v1.0.bin.part").exists()
 
 
-def test_hash_mismatch_does_not_redownload_from_every_mirror(tmp_path, monkeypatch) -> None:
+def test_hash_mismatch_tries_the_next_source(tmp_path, monkeypatch) -> None:
     monkeypatch.setitem(kokoro_tts._FILE_SHA256, "voices-v1.0.bin", "0" * 64)
     urls: list[str] = []
 
@@ -105,7 +105,8 @@ def test_hash_mismatch_does_not_redownload_from_every_mirror(tmp_path, monkeypat
     tts = kokoro_tts.KokoroOnnxTts(cache_dir=tmp_path)
 
     assert tts._ensure_file(tmp_path / "voices-v1.0.bin", ["https://a/v", "https://b/v"]) is False
-    assert urls == ["https://a/v"]
+    assert urls == ["https://a/v", "https://b/v"]
+    assert not (tmp_path / "voices-v1.0.bin").exists()
 
 
 def test_unverified_file_is_kept_when_downloads_are_disabled(tmp_path, monkeypatch) -> None:

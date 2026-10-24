@@ -107,3 +107,37 @@ def test_overlay_wheel_tweaks_save_at_once(window) -> None:
     assert window._config.subtitle_font_size == 31
     assert window._spn_font.value() == 31
     assert not window._is_dirty()
+
+
+def test_model_dir_and_mirror_apply_on_save(window, tmp_path) -> None:
+    from src.utils import model_fetch, resource_paths
+
+    models = tmp_path / "models"
+    window._txt_model_dir.setText(str(models))
+    window._cmb_model_mirror.setCurrentIndex(window._cmb_model_mirror.findData("global"))
+    assert resource_paths.model_resource_root() != models
+    assert window._is_dirty()
+    try:
+        window._on_save()
+        assert resource_paths.model_resource_root() == models
+        assert model_fetch.mirror_preference() == "global"
+        assert _saved().model_dir == str(models) and _saved().model_mirror == "global"
+        assert models.is_dir()
+    finally:
+        resource_paths.set_model_dir(None)
+        model_fetch.set_mirror_preference("china")
+
+
+def test_unwritable_model_dir_is_rejected(window, tmp_path, monkeypatch) -> None:
+    from src.gui import main_window as mw
+
+    blocker = tmp_path / "file"
+    blocker.write_text("not a folder")
+    errors: list[str] = []
+    monkeypatch.setattr(mw.QMessageBox, "critical", lambda _p, _t, text: errors.append(text))
+    window._txt_model_dir.setText(str(blocker / "models"))
+
+    window._on_save()
+
+    assert errors and "模型目录无法写入" in errors[0]
+    assert window._config.model_dir == ""

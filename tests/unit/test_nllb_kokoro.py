@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.engines.base import EngineCallbacks
@@ -102,12 +100,17 @@ def test_nllb_translate_none_while_not_ready(tmp_path) -> None:
     mt.stop()
 
 
-def test_nllb_download_restores_hf_endpoint(tmp_path, monkeypatch) -> None:
+def test_nllb_download_failure_tries_user_endpoint_first(tmp_path, monkeypatch) -> None:
+    from src.utils import model_fetch
+
     monkeypatch.setenv("HF_ENDPOINT", "https://user-endpoint.example")
-    fake_hub = SimpleNamespace(
-        snapshot_download=MagicMock(side_effect=RuntimeError("download failed"))
-    )
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    urls: list[str] = []
+
+    def fail(url, _dest, **_kw):
+        urls.append(url)
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(model_fetch, "fetch_resumable", fail)
     mt = NllbCt2Mt(
         model_id=DEFAULT_NLLB_MODEL,
         cache_dir=tmp_path / "nllb",
@@ -115,6 +118,7 @@ def test_nllb_download_restores_hf_endpoint(tmp_path, monkeypatch) -> None:
     )
 
     assert mt._download_model() is False
+    assert urls[0].startswith("https://user-endpoint.example/JustFrederik/")
     assert os.environ["HF_ENDPOINT"] == "https://user-endpoint.example"
 
 
